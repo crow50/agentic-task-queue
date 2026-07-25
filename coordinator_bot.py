@@ -12,8 +12,10 @@ Run as a daemon (see coordinator/claude-coordinator.service), not from cron:
     python3 coordinator_bot.py
 
 Built-in commands (answered instantly, no API cost):
-    /new     start a fresh coordinator conversation
-    /status  queue counts straight from the tasks/ directories
+    /new               start a fresh coordinator conversation
+    /status            queue counts straight from the tasks/ directories
+    /cancel <task-id>  archive a pending task (or recurring template) to
+                       tasks/cancelled/
 
 Only messages from TELEGRAM_CHAT_ID are answered; everything else is
 logged and ignored — the bot is publicly addressable, this is the boundary.
@@ -105,8 +107,13 @@ def save_state(state):
 
 def default_allowed_tools():
     tasks = BASE / "tasks"
+    memory = COORD_DIR / "memory"
     # A leading extra slash makes an absolute-path permission pattern (//root/...).
-    return f"Read,Glob,Grep,Write(/{tasks}/**),Edit(/{tasks}/**)"
+    return (
+        f"Read,Glob,Grep,Write(/{tasks}/**),Edit(/{tasks}/**),"
+        f"Write(/{memory}/**),Edit(/{memory}/**),"
+        f"Bash(python3 {BASE}/dispatcher.py cancel:*)"
+    )
 
 
 def extract_session_id(stdout):
@@ -192,6 +199,7 @@ def queue_status():
         ("done", dispatcher.DONE),
         ("failed", dispatcher.FAILED),
         ("recurring", dispatcher.RECURRING),
+        ("cancelled", dispatcher.CANCELLED),
     ):
         names = sorted(p.stem for p in directory.glob("*.md"))
         line = f"{label}: {len(names)}"
@@ -219,6 +227,18 @@ def handle_update(update, state):
         return
     if text == "/status":
         send_replies([queue_status()])
+        return
+    if text == "/cancel" or text.startswith("/cancel "):
+        target = text[len("/cancel"):].strip()
+        if not target:
+            pending = sorted(p.stem for p in dispatcher.PENDING.glob("*.md"))
+            send_replies([
+                "Usage: /cancel <task-id>\nPending: "
+                + (", ".join(pending) if pending else "(none)")
+            ])
+            return
+        ok, result = dispatcher.cancel_task(target)
+        send_replies([("🗑 " if ok else "⚠️ ") + result])
         return
     try:
         api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, timeout=10)

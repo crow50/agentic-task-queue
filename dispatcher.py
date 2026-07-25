@@ -11,7 +11,8 @@ Telegram. Templates in tasks/recurring/ with a "schedule" frontmatter key
 spawn one-shot instances into pending/ whenever they come due.
 Stdlib only — no pip installs needed.
 
-Usage: python3 dispatcher.py   (typically from cron every 15 minutes)
+Usage: python3 dispatcher.py                   (typically from cron every 15 minutes)
+       python3 dispatcher.py cancel <task-id>  (archive a queued task to tasks/cancelled/)
 """
 
 import fcntl
@@ -37,6 +38,7 @@ ACTIVE = TASKS / "active"
 DONE = TASKS / "done"
 FAILED = TASKS / "failed"
 RECURRING = TASKS / "recurring"
+CANCELLED = TASKS / "cancelled"
 LOGS = BASE / "logs"
 LOCKFILE = BASE / "dispatcher.lock"
 
@@ -388,6 +390,90 @@ def recover_stale():
         log.warning("Recovered stale active task %s back to pending (previous run died?)", stale.name)
 
 
+def cancel_task(stem):
+    """Archive a queued task (and/or recurring template) to tasks/cancelled/.
+
+    Returns (ok, message). Holds the dispatcher lock while moving files so a
+    cancel can never race pick_task() moving the same task into active/.
+    Cancels, in one call: the pending task <stem>.md, any queued recurring
+    instances <stem>-<timestamp>.md, and the recurring template <stem>.md.
+    """
+    stem = stem.strip()
+    if stem.endswith(".md"):
+        stem = stem[:-3]
+    if not stem or "/" in stem:
+        return False, "Give a task id (the file stem, e.g. 'fetch-data')."
+
+    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    def archive(path):
+        dest = CANCELLED / path.name
+        if dest.exists():  # e.g. template and an old pending copy share a name
+            dest = CANCELLED / f"{path.stem}.cancelled-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+        shutil.move(str(path), str(dest))
+
+    lock = open(LOCKFILE, "w")
+    deadline = time.time() + 10
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.time() >= deadline:
+                lock.close()
+                return False, (
+                    f"The dispatcher is mid-run; could not cancel '{stem}' safely. "
+                    f"Try again in a moment."
+                )
+            time.sleep(0.5)
+    try:
+        note = (
+            f"\n\n## Cancelled ({now_iso()})\n\n"
+            f"Removed from the queue before running. Move this file back to "
+            f"tasks/pending/ to requeue it.\n"
+        )
+        lines = []
+        instances = sorted(PENDING.glob(f"{stem}-[0-9]*.md"))
+        for path in ([PENDING / f"{stem}.md"] if (PENDING / f"{stem}.md").exists() else []) + instances:
+            meta, body = parse_task(path)
+            write_task(path, meta or {}, body.rstrip("\n") + note)
+            archive(path)
+            lines.append(f"Cancelled {path.name} (was pending).")
+        template = RECURRING / f"{stem}.md"
+        if template.exists():
+            archive(template)
+            lines.append(f"Cancelled recurring template {template.name}; no further instances will spawn.")
+
+        if not lines:
+            running = [ACTIVE / f"{stem}.md"] + sorted(ACTIVE.glob(f"{stem}-[0-9]*.md"))
+            running = [p for p in running if p.exists()]
+            if running:
+                return False, (
+                    f"'{running[0].name}' is running right now and can't be cancelled "
+                    f"mid-attempt. If it fails review and requeues, cancel it then."
+                )
+            for label, directory in (("done", DONE), ("failed", FAILED), ("cancelled", CANCELLED)):
+                if (directory / f"{stem}.md").exists():
+                    return False, f"'{stem}' is not queued — it is already in tasks/{label}/."
+            return False, f"No task named '{stem}' in pending/, active/, or recurring/."
+
+        # Warn about tasks left waiting on the stem we just cancelled.
+        dependents = sorted(
+            p.name for p in PENDING.glob("*.md") if stem in dep_names(parse_task(p)[0])
+        )
+        if dependents:
+            lines.append(
+                f"Warning: still pending and depending on '{stem}' (they will never "
+                f"run unless it is restored or they are cancelled too): {', '.join(dependents)}."
+            )
+        log.info("cancel_task(%s): %s", stem, " ".join(lines))
+        return True, "\n".join(lines)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
 def dep_names(meta):
     """Parse depends_on into a list of task stems (trailing .md tolerated)."""
     names = []
@@ -401,7 +487,7 @@ def dep_names(meta):
 
 
 def dep_state(dep):
-    """Where a dependency currently lives: done, failed, waiting, or missing.
+    """Where a dependency lives: done, failed, cancelled, waiting, or missing.
 
     Matches the task itself (<dep>.md) or any recurring instance of it
     (<dep>-<timestamp>.md). done/ is checked first so one successful
@@ -414,6 +500,8 @@ def dep_state(dep):
         return "done"
     if present(FAILED):
         return "failed"
+    if present(CANCELLED):
+        return "cancelled"
     if present(PENDING) or present(ACTIVE) or present(RECURRING):
         return "waiting"
     return "missing"
@@ -449,6 +537,14 @@ def pick_task():
             if state == "failed":
                 cascade_dependency_failure(src, dep)
                 blocked = "failed"
+                break
+            if state == "cancelled":
+                log.warning(
+                    "Task %s is waiting on dependency %r, which was cancelled — it "
+                    "will never run; cancel it too, or move the dependency back to "
+                    "pending/", src.name, dep,
+                )
+                blocked = "waiting"
                 break
             if state == "missing":
                 log.warning(
@@ -606,7 +702,7 @@ def process_task(path):
 
 
 def main():
-    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, LOGS):
+    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED, LOGS):
         directory.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
@@ -635,4 +731,15 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "cancel" and len(sys.argv) == 3:
+            ok, message = cancel_task(sys.argv[2])
+            print(message)
+            sys.exit(0 if ok else 1)
+        print(
+            "Usage: dispatcher.py                   run one queue cycle\n"
+            "       dispatcher.py cancel <task-id>  archive a queued task to tasks/cancelled/",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     sys.exit(main())

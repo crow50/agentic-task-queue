@@ -32,6 +32,15 @@ tasks/pending/ ──► tasks/active/ ──► worker (claude -p, task model)
   `escalation_model` (falling back to `model` if unset).
 - A run killed mid-task leaves its file in `tasks/active/`; the next run
   recovers it back to `pending/` automatically.
+- A queued task can be **cancelled** before it runs: it is archived to
+  `tasks/cancelled/` with a timestamped note (move it back to `pending/` to
+  requeue). Cancel via `/cancel <task-id>` in the Telegram chat, by asking
+  the coordinator, or with `python3 dispatcher.py cancel <task-id>` on the
+  box. Cancelling a name that is also a recurring template archives the
+  template too, so no further instances spawn. A task already in `active/`
+  can't be cancelled mid-attempt. Pending tasks that `depends_on` a
+  cancelled task will wait forever (the cancel report warns about them) —
+  cancel them too or restore the dependency.
 - Rate limits are retried in-process with exponential backoff
   (`30s · 2^n` + jitter, capped at 10 min). If the limit persists through all
   retries, the task returns to `pending/` **without consuming an attempt** and
@@ -224,12 +233,26 @@ cron dispatcher picks them up. It never implements anything itself.
   to a fresh one automatically.
 - **Built-in commands** (instant, no API cost): `/new` resets the
   conversation; `/status` reports queue counts and task names straight from
-  the `tasks/` directories.
+  the `tasks/` directories; `/cancel <task-id>` archives a pending task or
+  recurring template to `tasks/cancelled/`. You can also just tell the
+  coordinator to drop a task — it runs the same cancel command after
+  confirming (allowed via a narrow `Bash(python3 …/dispatcher.py cancel …)`
+  pattern, not general shell access).
+- **Long-term memory**: the coordinator keeps a curated
+  `coordinator/memory/MEMORY.md` — imported into every session via its
+  CLAUDE.md — where it records durable facts: your preferences, project
+  state, decisions, lessons from failed tasks. Unlike `--resume`
+  continuity, it survives `/new` and unresumable sessions, so the system
+  accumulates context over time. It's a plain markdown file: edit or prune
+  it by hand whenever you like.
 - **Security**: only messages from `TELEGRAM_CHAT_ID` are answered — anyone
   else who finds the bot is logged and ignored. The coordinator itself runs
-  with `Read,Glob,Grep` plus `Write`/`Edit` scoped to `tasks/` (override
-  with `COORDINATOR_ALLOWED_TOOLS` in `.env`), so it can plan and queue but
-  can't touch the dispatcher or anything else on the box.
+  with `Read,Glob,Grep` plus `Write`/`Edit` scoped to `tasks/` and
+  `coordinator/memory/`, and the scoped cancel command (override with
+  `COORDINATOR_ALLOWED_TOOLS` in `.env` — note a custom value must include
+  the memory and cancel entries or those features silently stop working),
+  so it can plan and queue but can't touch the dispatcher or anything else
+  on the box.
 - Notifications and chat share the bot without conflict: the dispatcher only
   ever sends messages, and the bridge is the only `getUpdates` consumer
   (enforced by its own lockfile). Long coordinator replies are split across
@@ -312,6 +335,10 @@ credentials).
 ## Operations
 
 - **Watch the queue**: `ls tasks/pending tasks/active tasks/done tasks/failed`
+- **Remove a queued task**: `/cancel <task-id>` in the Telegram chat, ask
+  the coordinator, or `python3 dispatcher.py cancel <task-id>` — the task
+  is archived to `tasks/cancelled/`. Undo by moving the file back to
+  `tasks/pending/`.
 - **Read a task's history**: the task file itself accumulates feedback and
   results; raw transcripts are in `logs/<task>.attempt-<N>.log`.
 - **Retry a failed task**: fix it up, reset `attempts: 0`, and move it back
