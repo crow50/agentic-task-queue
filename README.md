@@ -221,7 +221,7 @@ cron dispatcher picks them up. It never implements anything itself.
 
   ```bash
   cp coordinator/claude-coordinator.service /etc/systemd/system/
-  # edit the paths in the unit if the queue doesn't live at /root/claude-task-queue
+  # edit the paths in the unit if the queue doesn't live at /root/agentic-task-queue
   systemctl daemon-reload
   systemctl enable --now claude-coordinator
   journalctl -u claude-coordinator -f     # watch it (also logs/coordinator.log)
@@ -268,10 +268,10 @@ interactively to log in, or use `claude setup-token` for long-lived headless
 credentials).
 
 1. **Get the code onto the droplet** (clone this repo or copy the
-   `claude-task-queue/` directory) and enter it:
+   `agentic-task-queue/` directory) and enter it:
 
    ```bash
-   cd claude-task-queue
+   cd agentic-task-queue
    ```
 
 2. **Create a Telegram bot**: message [@BotFather](https://t.me/BotFather),
@@ -314,7 +314,7 @@ credentials).
 6. **Install the cron job** (`crontab -e`):
 
    ```cron
-   */15 * * * * /usr/bin/python3 /home/you/claude-task-queue/dispatcher.py >> /home/you/claude-task-queue/logs/cron.log 2>&1
+   */15 * * * * /usr/bin/python3 /home/you/agentic-task-queue/dispatcher.py >> /home/you/agentic-task-queue/logs/cron.log 2>&1
    ```
 
    Overlap is safe: the in-script lockfile makes a second invocation exit

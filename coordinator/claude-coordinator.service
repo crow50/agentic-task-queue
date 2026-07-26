@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/claude-task-queue
-ExecStart=/usr/bin/python3 /root/claude-task-queue/coordinator_bot.py
+WorkingDirectory=/root/agentic-task-queue
+ExecStart=/usr/bin/python3 /root/agentic-task-queue/coordinator_bot.py
 Restart=on-failure
 RestartSec=10
 
