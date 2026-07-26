@@ -13,9 +13,11 @@ Stdlib only — no pip installs needed.
 
 Usage: python3 dispatcher.py                   (typically from cron every 15 minutes)
        python3 dispatcher.py cancel <task-id>  (archive a queued task to tasks/cancelled/)
+       python3 dispatcher.py retry <task-id>   (requeue a failed/cancelled task, attempts reset)
 """
 
 import fcntl
+import html
 import json
 import logging
 import os
@@ -26,8 +28,10 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -275,6 +279,40 @@ def run_claude(cmd, prompt, timeout_s, cwd, transcript, label):
 TELEGRAM_MAX = 4096
 
 
+def md_to_telegram_html(text):
+    """Convert common markdown to Telegram HTML (for parse_mode=HTML).
+
+    Handles code fences (unclosed ones run to the end), inline code, bold,
+    italic, links, headers, and bullets. Everything else is HTML-escaped, so
+    the worst case is a literal character — never a rejected message; senders
+    still fall back to plain text if Telegram returns 400.
+    """
+    stashed = []
+
+    def stash(tag, content):
+        stashed.append(f"<{tag}>{html.escape(content)}</{tag}>")
+        return f"\x00{len(stashed) - 1}\x00"
+
+    text = re.sub(
+        r"```[^\n`]*\n?(.*?)(?:```|\Z)",
+        lambda m: stash("pre", m.group(1).rstrip("\n")),
+        text, flags=re.S,
+    )
+    text = re.sub(r"`([^`\n]+)`", lambda m: stash("code", m.group(1)), text)
+
+    text = html.escape(text, quote=False)
+
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.M)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.S)
+    text = re.sub(r"(?<![\w*])\*(\S(?:[^*\n]*\S)?)\*(?![\w*])", r"<i>\1</i>", text)
+    text = re.sub(r"(?<![\w_])_(\S(?:[^_\n]*\S)?)_(?![\w_])", r"<i>\1</i>", text)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s\"]+)\)", r'<a href="\2">\1</a>', text)
+    text = re.sub(r"^(\s*)[-*]\s+", r"\1• ", text, flags=re.M)
+
+    return re.sub(r"\x00(\d+)\x00", lambda m: stashed[int(m.group(1))], text)
+
+
 def truncate_for_telegram(text):
     """Fit text into one Telegram message, cutting on a line break with a marker."""
     if len(text) <= TELEGRAM_MAX:
@@ -293,14 +331,28 @@ def send_telegram(text):
     if not token or not chat_id:
         log.warning("Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID); skipping notification")
         return
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": truncate_for_telegram(text)}).encode()
-    try:
-        urllib.request.urlopen(
-            f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=30
-        )
-        log.info("Telegram notification sent")
-    except Exception as exc:  # notification failure must never fail the task
-        log.warning("Telegram notification failed: %s", exc)
+    raw = truncate_for_telegram(text)
+    variants = (
+        {"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"},
+        {"chat_id": chat_id, "text": raw},
+    )
+    for formatted, params in zip((True, False), variants):
+        data = urllib.parse.urlencode(params).encode()
+        try:
+            urllib.request.urlopen(
+                f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=30
+            )
+            log.info("Telegram notification sent")
+            return
+        except urllib.error.HTTPError as exc:
+            if formatted and exc.code == 400:  # bad entities — resend unformatted
+                log.warning("Telegram rejected HTML formatting; resending as plain text")
+                continue
+            log.warning("Telegram notification failed: %s", exc)
+            return
+        except Exception as exc:  # notification failure must never fail the task
+            log.warning("Telegram notification failed: %s", exc)
+            return
 
 
 # ---------------------------------------------------------------- recurring
@@ -390,6 +442,28 @@ def recover_stale():
         log.warning("Recovered stale active task %s back to pending (previous run died?)", stale.name)
 
 
+@contextmanager
+def hold_queue_lock(timeout=10.0):
+    """Yield True with the dispatcher lock held, or False if it stayed busy."""
+    lock = open(LOCKFILE, "w")
+    acquired = False
+    deadline = time.time() + timeout
+    try:
+        while not acquired:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                if time.time() >= deadline:
+                    break
+                time.sleep(0.5)
+        yield acquired
+    finally:
+        if acquired:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
 def cancel_task(stem):
     """Archive a queued task (and/or recurring template) to tasks/cancelled/.
 
@@ -413,21 +487,12 @@ def cancel_task(stem):
             dest = CANCELLED / f"{path.stem}.cancelled-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
         shutil.move(str(path), str(dest))
 
-    lock = open(LOCKFILE, "w")
-    deadline = time.time() + 10
-    while True:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            if time.time() >= deadline:
-                lock.close()
-                return False, (
-                    f"The dispatcher is mid-run; could not cancel '{stem}' safely. "
-                    f"Try again in a moment."
-                )
-            time.sleep(0.5)
-    try:
+    with hold_queue_lock() as held:
+        if not held:
+            return False, (
+                f"The dispatcher is mid-run; could not cancel '{stem}' safely. "
+                f"Try again in a moment."
+            )
         note = (
             f"\n\n## Cancelled ({now_iso()})\n\n"
             f"Removed from the queue before running. Move this file back to "
@@ -469,9 +534,50 @@ def cancel_task(stem):
             )
         log.info("cancel_task(%s): %s", stem, " ".join(lines))
         return True, "\n".join(lines)
-    finally:
-        fcntl.flock(lock, fcntl.LOCK_UN)
-        lock.close()
+
+
+def retry_task(stem):
+    """Move a failed or cancelled task back to pending/ with attempts reset.
+
+    Returns (ok, message), holding the dispatcher lock like cancel_task().
+    """
+    stem = stem.strip()
+    if stem.endswith(".md"):
+        stem = stem[:-3]
+    if not stem or "/" in stem:
+        return False, "Give a task id (the file stem, e.g. 'fetch-data')."
+
+    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    with hold_queue_lock() as held:
+        if not held:
+            return False, (
+                f"The dispatcher is mid-run; could not retry '{stem}' safely. "
+                f"Try again in a moment."
+            )
+        for label, directory in (("failed", FAILED), ("cancelled", CANCELLED)):
+            path = directory / f"{stem}.md"
+            if path.exists():
+                meta, body = parse_task(path)
+                meta = meta or {}
+                meta["attempts"] = "0"
+                write_task(path, meta, body)
+                shutil.move(str(path), str(PENDING / path.name))
+                log.info("retry_task(%s): requeued from tasks/%s/", stem, label)
+                return True, (
+                    f"Requeued {path.name} from tasks/{label}/ with attempts reset "
+                    f"to 0. The next dispatcher run picks it up."
+                )
+        if (PENDING / f"{stem}.md").exists():
+            return False, f"'{stem}' is already pending."
+        if (ACTIVE / f"{stem}.md").exists():
+            return False, f"'{stem}' is running right now."
+        if (DONE / f"{stem}.md").exists():
+            return False, f"'{stem}' already completed — it is in tasks/done/."
+        if (RECURRING / f"{stem}.md").exists():
+            return False, f"'{stem}' is a recurring template; it spawns on its own schedule."
+        return False, f"No task named '{stem}' in failed/ or cancelled/."
 
 
 def dep_names(meta):
@@ -732,13 +838,15 @@ def main():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        if sys.argv[1] == "cancel" and len(sys.argv) == 3:
-            ok, message = cancel_task(sys.argv[2])
+        actions = {"cancel": cancel_task, "retry": retry_task}
+        if sys.argv[1] in actions and len(sys.argv) == 3:
+            ok, message = actions[sys.argv[1]](sys.argv[2])
             print(message)
             sys.exit(0 if ok else 1)
         print(
             "Usage: dispatcher.py                   run one queue cycle\n"
-            "       dispatcher.py cancel <task-id>  archive a queued task to tasks/cancelled/",
+            "       dispatcher.py cancel <task-id>  archive a queued task to tasks/cancelled/\n"
+            "       dispatcher.py retry <task-id>   requeue a failed/cancelled task, attempts reset",
             file=sys.stderr,
         )
         sys.exit(2)

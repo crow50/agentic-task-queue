@@ -16,6 +16,12 @@ Built-in commands (answered instantly, no API cost):
     /status            queue counts straight from the tasks/ directories
     /cancel <task-id>  archive a pending task (or recurring template) to
                        tasks/cancelled/
+    /retry <task-id>   requeue a failed/cancelled task with attempts reset
+
+Replies are rendered with Telegram HTML formatting (markdown converted via
+dispatcher.md_to_telegram_html, plain-text fallback on rejection). Reacting
+👍 to a coordinator message approves what it proposed, 👎 rejects it — the
+bridge forwards the reaction to the coordinator as a "[Reaction]" turn.
 
 Only messages from TELEGRAM_CHAT_ID are answered; everything else is
 logged and ignored — the bot is publicly addressable, this is the boundary.
@@ -33,7 +39,14 @@ import urllib.parse
 import urllib.request
 
 import dispatcher
-from dispatcher import RATE_LIMIT_RE, TELEGRAM_MAX, cfg, extract_result, resolve_claude_bin
+from dispatcher import (
+    RATE_LIMIT_RE,
+    TELEGRAM_MAX,
+    cfg,
+    extract_result,
+    md_to_telegram_html,
+    resolve_claude_bin,
+)
 
 BASE = dispatcher.BASE
 COORD_DIR = BASE / "coordinator"
@@ -78,14 +91,33 @@ def chunk_message(text, limit=TELEGRAM_MAX):
     return chunks
 
 
-def send_replies(texts):
+def send_replies(texts, state=None):
+    """Send texts as formatted Telegram messages, plain-text fallback per chunk.
+
+    When state is given, each sent message is recorded in
+    state["sent_messages"] as [message_id, snippet] so a later reaction to it
+    can be traced back to what it said (caller persists via save_state).
+    """
     chat_id = cfg("TELEGRAM_CHAT_ID")
     for text in texts:
         for chunk in chunk_message(text):
             try:
-                api("sendMessage", {"chat_id": chat_id, "text": chunk}, timeout=30)
+                sent = api(
+                    "sendMessage",
+                    {"chat_id": chat_id, "text": md_to_telegram_html(chunk), "parse_mode": "HTML"},
+                    timeout=30,
+                )
             except Exception as exc:
-                log.error("sendMessage failed: %s", exc)
+                log.warning("Formatted send failed (%s); retrying as plain text", exc)
+                try:
+                    sent = api("sendMessage", {"chat_id": chat_id, "text": chunk}, timeout=30)
+                except Exception as exc:
+                    log.error("sendMessage failed: %s", exc)
+                    continue
+            if state is not None and isinstance(sent, dict) and sent.get("message_id"):
+                record = state.setdefault("sent_messages", [])
+                record.append([sent["message_id"], chunk[:200]])
+                del record[:-20]
 
 
 # ---------------------------------------------------------------- state
@@ -112,7 +144,8 @@ def default_allowed_tools():
     return (
         f"Read,Glob,Grep,Write(/{tasks}/**),Edit(/{tasks}/**),"
         f"Write(/{memory}/**),Edit(/{memory}/**),"
-        f"Bash(python3 {BASE}/dispatcher.py cancel:*)"
+        f"Bash(python3 {BASE}/dispatcher.py cancel:*),"
+        f"Bash(python3 {BASE}/dispatcher.py retry:*)"
     )
 
 
@@ -209,7 +242,44 @@ def queue_status():
     return "\n".join(lines)
 
 
+REACTION_MEANINGS = {
+    "👍": "Treat this as approval of what that message proposed: go ahead.",
+    "👎": ("Treat this as a rejection of what that message proposed: do not "
+           "proceed, and ask what should change if it is unclear."),
+}
+
+
+def handle_reaction(reaction, state):
+    """Turn a 👍/👎 on a bot message into an approval/rejection coordinator turn."""
+    chat_id = str((reaction.get("chat") or {}).get("id", ""))
+    if chat_id != str(cfg("TELEGRAM_CHAT_ID")):
+        log.warning("Ignoring reaction from unauthorized chat %s", chat_id or "(unknown)")
+        return
+    emojis = [r.get("emoji") for r in reaction.get("new_reaction") or [] if r.get("type") == "emoji"]
+    emoji = next((e for e in emojis if e in REACTION_MEANINGS), None)
+    if emoji is None:
+        return  # reaction removed, or an emoji we give no meaning to
+    snippet = next(
+        (s for mid, s in reversed(state.get("sent_messages", []))
+         if mid == reaction.get("message_id")),
+        None,
+    )
+    target = f'your message: "{snippet}"' if snippet else "one of your recent messages"
+    prompt = f"[Reaction] The human reacted {emoji} to {target}. {REACTION_MEANINGS[emoji]}"
+    log.info("Reaction %s on message %s", emoji, reaction.get("message_id"))
+    try:
+        api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, timeout=10)
+    except Exception:
+        pass  # cosmetic only
+    reply = ask_coordinator(prompt, state)
+    log.info("Replying: %s", reply[:300])
+    send_replies([reply], state)
+
+
 def handle_update(update, state):
+    if update.get("message_reaction"):
+        handle_reaction(update["message_reaction"], state)
+        return
     msg = update.get("message") or {}
     chat_id = str((msg.get("chat") or {}).get("id", ""))
     if chat_id != str(cfg("TELEGRAM_CHAT_ID")):
@@ -218,15 +288,15 @@ def handle_update(update, state):
         return
     text = (msg.get("text") or "").strip()
     if not text:
-        send_replies(["I can only read text messages."])
+        send_replies(["I can only read text messages."], state)
         return
     log.info("Received: %s", text[:300])
     if text == "/new":
         state["session_id"] = None
-        send_replies(["Starting a fresh conversation."])
+        send_replies(["Starting a fresh conversation."], state)
         return
     if text == "/status":
-        send_replies([queue_status()])
+        send_replies([queue_status()], state)
         return
     if text == "/cancel" or text.startswith("/cancel "):
         target = text[len("/cancel"):].strip()
@@ -235,18 +305,40 @@ def handle_update(update, state):
             send_replies([
                 "Usage: /cancel <task-id>\nPending: "
                 + (", ".join(pending) if pending else "(none)")
-            ])
+            ], state)
             return
         ok, result = dispatcher.cancel_task(target)
-        send_replies([("🗑 " if ok else "⚠️ ") + result])
+        send_replies([("🗑 " if ok else "⚠️ ") + result], state)
         return
-    try:
-        api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, timeout=10)
-    except Exception:
-        pass  # cosmetic only
+    if text == "/retry" or text.startswith("/retry "):
+        target = text[len("/retry"):].strip()
+        if not target:
+            failed = sorted(p.stem for p in dispatcher.FAILED.glob("*.md"))
+            cancelled = sorted(p.stem for p in dispatcher.CANCELLED.glob("*.md"))
+            send_replies([
+                "Usage: /retry <task-id>"
+                + "\nFailed: " + (", ".join(failed) if failed else "(none)")
+                + "\nCancelled: " + (", ".join(cancelled) if cancelled else "(none)")
+            ], state)
+            return
+        ok, result = dispatcher.retry_task(target)
+        send_replies([("🔁 " if ok else "⚠️ ") + result], state)
+        return
+    # 👀 on the message plus a typing indicator while the coordinator runs.
+    for method, params in (
+        ("setMessageReaction", {
+            "chat_id": chat_id, "message_id": msg.get("message_id"),
+            "reaction": json.dumps([{"type": "emoji", "emoji": "👀"}]),
+        }),
+        ("sendChatAction", {"chat_id": chat_id, "action": "typing"}),
+    ):
+        try:
+            api(method, params, timeout=10)
+        except Exception:
+            pass  # cosmetic only
     reply = ask_coordinator(text, state)
     log.info("Replying: %s", reply[:300])
-    send_replies([reply])
+    send_replies([reply], state)
 
 
 # ---------------------------------------------------------------- main loop
@@ -283,6 +375,16 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
+    try:  # register the / command menu; cosmetic, never fatal
+        api("setMyCommands", {"commands": json.dumps([
+            {"command": "status", "description": "Queue counts and task names"},
+            {"command": "cancel", "description": "Archive a pending task: /cancel <task-id>"},
+            {"command": "retry", "description": "Requeue a failed/cancelled task: /retry <task-id>"},
+            {"command": "new", "description": "Start a fresh coordinator conversation"},
+        ])}, timeout=30)
+    except Exception as exc:
+        log.warning("setMyCommands failed: %s", exc)
+
     state = load_state()
     log.info("Coordinator bridge started (chat %s)", cfg("TELEGRAM_CHAT_ID"))
     backoff = 5
@@ -290,7 +392,11 @@ def main():
         try:
             updates = api(
                 "getUpdates",
-                {"timeout": 50, "offset": state.get("offset", 0) + 1},
+                {
+                    "timeout": 50,
+                    "offset": state.get("offset", 0) + 1,
+                    "allowed_updates": json.dumps(["message", "message_reaction"]),
+                },
                 timeout=70,
             )
             backoff = 5

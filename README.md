@@ -234,10 +234,24 @@ cron dispatcher picks them up. It never implements anything itself.
 - **Built-in commands** (instant, no API cost): `/new` resets the
   conversation; `/status` reports queue counts and task names straight from
   the `tasks/` directories; `/cancel <task-id>` archives a pending task or
-  recurring template to `tasks/cancelled/`. You can also just tell the
-  coordinator to drop a task — it runs the same cancel command after
-  confirming (allowed via a narrow `Bash(python3 …/dispatcher.py cancel …)`
-  pattern, not general shell access).
+  recurring template to `tasks/cancelled/`; `/retry <task-id>` requeues a
+  failed or cancelled task with its attempts reset. You can also just tell
+  the coordinator to drop or retry a task — it runs the same commands after
+  confirming (allowed via narrow `Bash(python3 …/dispatcher.py cancel|retry …)`
+  patterns, not general shell access). The bridge registers these with
+  Telegram at startup, so typing `/` pops the autocomplete menu.
+- **Formatted replies**: coordinator replies and dispatcher notifications
+  are converted from markdown to Telegram HTML (bold, italic, code, fences,
+  links, bullets render properly). Anything Telegram rejects is
+  automatically resent as plain text, so formatting can never eat a
+  message.
+- **React to steer**: reacting 👍 to a coordinator message approves
+  whatever it proposed (e.g. a shown task list — the coordinator proceeds
+  to write the files); 👎 rejects it. Works from the lock screen, no
+  typing. Telegram's reaction set is fixed (✅ isn't available — use 👍).
+  The bridge also reacts 👀 to your message while the coordinator is
+  thinking, so the long silences are visibly "working" rather than dead
+  air.
 - **Long-term memory**: the coordinator keeps a curated
   `coordinator/memory/MEMORY.md` — imported into every session via its
   CLAUDE.md — where it records durable facts: your preferences, project
@@ -341,8 +355,10 @@ credentials).
   `tasks/pending/`.
 - **Read a task's history**: the task file itself accumulates feedback and
   results; raw transcripts are in `logs/<task>.attempt-<N>.log`.
-- **Retry a failed task**: fix it up, reset `attempts: 0`, and move it back
-  to `tasks/pending/`.
+- **Retry a failed task**: `/retry <task-id>` in the Telegram chat or
+  `python3 dispatcher.py retry <task-id>` — moves it back to `pending/`
+  with `attempts: 0` (also restores tasks from `cancelled/`). Fix up the
+  task file first if the failure needs it.
 - **Pause the queue**: comment out the cron line, or move pending tasks
   aside — the dispatcher exits cleanly on an empty queue.
 - **Stop a recurring task**: move its template out of `tasks/recurring/`.
