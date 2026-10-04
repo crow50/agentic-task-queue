@@ -1,0 +1,14 @@
+#!/bin/sh
+# Blocks a commit whose staged changes contain a secret (gitleaks).
+# Enable once per clone:  git config core.hooksPath .githooks
+# Install gitleaks:       https://github.com/gitleaks/gitleaks#installing
+# Bypass for one commit:  git commit --no-verify   (CI scans every pull request)
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "pre-commit: gitleaks is not installed, so the staged changes were NOT scanned." >&2
+    echo "  Install it (https://github.com/gitleaks/gitleaks#installing)," >&2
+    echo "  or skip this check once with: git commit --no-verify" >&2
+    exit 1
+fi
+
+exec gitleaks git --pre-commit --staged --redact --no-banner --verbose

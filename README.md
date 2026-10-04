@@ -363,3 +363,16 @@ credentials).
   aside — the dispatcher exits cleanly on an empty queue.
 - **Stop a recurring task**: move its template out of `tasks/recurring/`.
   Completed instances accumulate in `done/`; prune them occasionally.
+
+## Development
+
+- **Tests**: `python3 -m unittest discover -s tests -v` (stdlib only). They run
+  in a temp copy of the queue with a fake `claude` and a fake Telegram, so they
+  never touch your `.env`, `tasks/` or `logs/`.
+- **Secret scanning**: enable the pre-commit hook once per clone with
+  `git config core.hooksPath .githooks`. It runs
+  [gitleaks](https://github.com/gitleaks/gitleaks#installing) on staged
+  changes and blocks the commit if a secret is found or gitleaks is missing.
+  CI scans every pull request as well.
+- **New settings**: every setting read through `cfg("NAME")` must be listed in
+  `.env.example`; a test enforces it.

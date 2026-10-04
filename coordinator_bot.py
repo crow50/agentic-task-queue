@@ -62,11 +62,8 @@ RUNNING = True
 
 
 def tg_api(method, params=None, timeout=60):
-    token = cfg("TELEGRAM_BOT_TOKEN")
     data = urllib.parse.urlencode(params or {}).encode()
-    with urllib.request.urlopen(
-        f"https://api.telegram.org/bot{token}/{method}", data, timeout=timeout
-    ) as resp:
+    with urllib.request.urlopen(dispatcher.telegram_url(method), data, timeout=timeout) as resp:
         payload = json.load(resp)
     if not payload.get("ok"):
         raise RuntimeError(f"Telegram API {method} returned {payload}")
