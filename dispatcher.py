@@ -325,6 +325,12 @@ def truncate_for_telegram(text):
     return text + marker
 
 
+def telegram_url(method):
+    """Bot API URL for a method. TELEGRAM_API_BASE lets tests point at a local fake."""
+    base = cfg("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+    return f"{base}/bot{cfg('TELEGRAM_BOT_TOKEN')}/{method}"
+
+
 def send_telegram(text):
     token = cfg("TELEGRAM_BOT_TOKEN")
     chat_id = cfg("TELEGRAM_CHAT_ID")
@@ -339,9 +345,7 @@ def send_telegram(text):
     for formatted, params in zip((True, False), variants):
         data = urllib.parse.urlencode(params).encode()
         try:
-            urllib.request.urlopen(
-                f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=30
-            )
+            urllib.request.urlopen(telegram_url("sendMessage"), data, timeout=30)
             log.info("Telegram notification sent")
             return
         except urllib.error.HTTPError as exc:
