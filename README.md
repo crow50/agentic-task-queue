@@ -316,7 +316,7 @@ cron dispatcher picks them up. It never implements anything itself.
 
 ## Setup
 
-Prerequisites: Ubuntu with Python 3.10+, and the Claude Code CLI installed
+Prerequisites: Ubuntu with Python 3.11+, and the Claude Code CLI installed
 and authenticated for the user that will run cron (run `claude` once
 interactively to log in, or use `claude setup-token` for long-lived headless
 credentials).
