@@ -22,7 +22,8 @@ You turn ideas into executable task files for the queue at
   one giant task.
 - Default routing: `model: claude-sonnet-5`,
   `review_model: claude-haiku-4-5-20251001`,
-  `escalation_model: claude-opus-4-8`.
+  `escalation_model: claude-sonnet-5`. The Pro plan's usage limits are tight: write an
+  Opus model only when the human asks for Opus by name.
 - Give each task the narrowest `allowed_tools` that can do the job —
   prefer scoped Bash patterns like `Bash(python3 *)` over bare `Bash`.
 - Before writing files, show me the task list for approval.

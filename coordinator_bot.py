@@ -23,8 +23,15 @@ dispatcher.md_to_telegram_html, plain-text fallback on rejection). Reacting
 👍 to a coordinator message approves what it proposed, 👎 rejects it — the
 bridge forwards the reaction to the coordinator as a "[Reaction]" turn.
 
-Only messages from TELEGRAM_CHAT_ID are answered; everything else is
-logged and ignored — the bot is publicly addressable, this is the boundary.
+Only messages from TELEGRAM_CHAT_ID *and* sent by TELEGRAM_USER_ID are
+answered (in a private chat the user id defaults to the chat id); everything
+else is logged and ignored — the bot is publicly addressable, this is the
+boundary, and a group chat alone must not let other members in.
+
+The bridge shares the dispatcher's state files: while the queue is paused for
+a usage limit (state/paused_until) or the login is expired (state/auth_failed)
+it says so instead of calling claude, keeps the message in coordinator/state.json
+("held"), and answers it once the queue is back.
 """
 
 import fcntl
@@ -40,7 +47,6 @@ import urllib.request
 
 import dispatcher
 from dispatcher import (
-    RATE_LIMIT_RE,
     TELEGRAM_MAX,
     cfg,
     extract_result,
@@ -56,6 +62,37 @@ LOCKFILE = BASE / "coordinator.lock"
 log = logging.getLogger("coordinator")
 
 RUNNING = True
+
+
+class CoordinatorBlocked(Exception):
+    """The coordinator can't run: a usage limit or an expired login. The shared state files say which."""
+
+
+# ---------------------------------------------------------------- who may talk to the bot
+
+
+def allowed_user_id():
+    """The one Telegram user id allowed to command the bot, or None if it can't be told safely.
+
+    TELEGRAM_USER_ID wins. Without it, a private chat's id *is* its user's id,
+    so TELEGRAM_CHAT_ID serves; a group chat id (negative) does not identify
+    anyone, so nobody is allowed until TELEGRAM_USER_ID is set.
+    """
+    configured = str(cfg("TELEGRAM_USER_ID")).strip()
+    if configured:
+        return configured
+    chat = str(cfg("TELEGRAM_CHAT_ID")).strip()
+    return chat if chat and not chat.startswith("-") else None
+
+
+def is_authorized(chat_id, sender_id):
+    user = allowed_user_id()
+    return (
+        user is not None
+        and str(chat_id) == str(cfg("TELEGRAM_CHAT_ID"))
+        and sender_id is not None
+        and str(sender_id) == user
+    )
 
 
 # ---------------------------------------------------------------- telegram
@@ -178,16 +215,44 @@ def run_coordinator(prompt, session_id):
     )
 
 
+def coordinator_call(text, session_id):
+    """One coordinator call with usage logging, retried with backoff on a transient rate limit.
+
+    Returns (proc, status, message) as classify_call judged it. Retries used
+    up, the last result is returned for the caller to treat as a limit.
+    """
+    model = cfg("COORDINATOR_MODEL", "claude-sonnet-5")
+
+    def attempt():
+        proc = run_coordinator(text, session_id)
+        out, err = proc.stdout or "", proc.stderr or ""
+        status, message = dispatcher.classify_call(proc.returncode, out, err)
+        dispatcher.log_usage("coordinator", model, proc.returncode, status, dispatcher.parse_envelope(out))
+        if status != "ok":
+            dispatcher.log_failed_call("coordinator", proc.returncode, out, err)
+        result = (proc, status, message)
+        if status == "rate_limited" and dispatcher.parse_reset_time(message) is None:
+            raise dispatcher.TransientLimit(message, result)
+        return result
+
+    try:
+        return dispatcher.rate_limit_retrying("coordinator")(attempt)
+    except dispatcher.TransientLimit as exc:
+        return exc.payload
+
+
 def ask_coordinator(text, state):
-    """Run the coordinator, handling resume failure and rate limits. Returns reply."""
-    max_retries = int(cfg("MAX_RATE_LIMIT_RETRIES", "5"))
-    base_delay = float(cfg("RATE_LIMIT_BASE_DELAY", "30"))
+    """Run the coordinator, handling resume failure and rate limits. Returns the reply.
+
+    Raises CoordinatorBlocked, after writing the shared pause or auth-failed
+    file, when a usage limit or an expired login means nothing can run: the
+    caller keeps the message instead of losing it.
+    """
     session_id = state.get("session_id")
     tried_fresh = False
-    retry = 0
     while True:
         try:
-            proc = run_coordinator(text, session_id)
+            proc, status, message = coordinator_call(text, session_id)
         except subprocess.TimeoutExpired:
             log.error("Coordinator call timed out")
             return "⚠️ The coordinator timed out. Try again, or /new for a fresh session."
@@ -195,6 +260,12 @@ def ask_coordinator(text, state):
             log.error("Coordinator call failed to start: %s", exc)
             return f"⚠️ Coordinator could not run: {exc}"
         out, err = proc.stdout or "", proc.stderr or ""
+        if status == "auth":
+            dispatcher.mark_auth_failed(message, notify=False)  # the reply to the user is the notice
+            raise CoordinatorBlocked("auth")
+        if status == "rate_limited":
+            dispatcher.pause_queue(dispatcher.usage_limit_until(message), "usage limit", notify=False)
+            raise CoordinatorBlocked("paused")
         if proc.returncode == 0:
             sid = extract_session_id(out)
             if sid:
@@ -207,15 +278,61 @@ def ask_coordinator(text, state):
             state["session_id"] = None
             tried_fresh = True
             continue
-        if RATE_LIMIT_RE.search(combined) and retry < max_retries:
-            delay = min(base_delay * 2**retry, 600)
-            retry += 1
-            log.warning("Coordinator rate limited; backing off %.0fs (retry %d/%d)", delay, retry, max_retries)
-            time.sleep(delay)
-            continue
         message = extract_result(out).strip() or combined.strip()
         log.error("Coordinator call failed (exit %d): %s", proc.returncode, message[:2000])
         return f"⚠️ Coordinator error: {message[:500]}"
+
+
+def stop_text(stop):
+    """What to tell the user while the queue is stopped. `stop` is dispatcher.current_stop()."""
+    if stop and stop[0] == "auth":
+        return ("🔑 Claude login expired, so I can't run anything until it is renewed. "
+                "I kept your message and will answer it once the queue is back.")
+    if stop:
+        return (f"⏸ Queue paused until {dispatcher.format_when(stop[1])} ({stop[2]}). "
+                "I kept your message and will answer it then.")
+    return "⏸ The queue is stopped. I kept your message and will answer it once it is back."
+
+
+def converse(prompt, state):
+    """One coordinator turn: run it and send the reply, or keep the prompt while the queue is stopped.
+
+    A held prompt waits in state["held"] and replay_held() answers it after
+    the pause or the expired login clears. Returns True when the turn ran.
+    """
+    stop = dispatcher.current_stop()
+    if stop is None:
+        try:
+            reply = ask_coordinator(prompt, state)
+        except CoordinatorBlocked:
+            stop = dispatcher.current_stop()
+        else:
+            log.info("Replying: %s", reply[:300])
+            send_replies([reply], state)
+            return True
+    state.setdefault("held", []).append({"text": prompt})
+    log.info("Queue stopped (%s); holding the message until it is back", stop[0] if stop else "unknown")
+    send_replies([stop_text(stop)], state)
+    return False
+
+
+def replay_held(state):
+    """Answer held messages, oldest first, once nothing stops the queue.
+
+    Stops at the first one that is blocked again; it stays at the head of the line.
+    """
+    held = state.get("held") or []
+    while held and dispatcher.current_stop() is None:
+        text = held[0]["text"]
+        try:
+            reply = ask_coordinator(text, state)
+        except CoordinatorBlocked:
+            return
+        held.pop(0)
+        snippet = " ".join(text.split())[:60]
+        log.info("Replaying held message: %s", snippet)
+        send_replies([f"↩️ Re: “{snippet}”\n\n{reply}"], state)
+        save_state(state)
 
 
 # ---------------------------------------------------------------- handlers
@@ -249,8 +366,8 @@ REACTION_MEANINGS = {
 def handle_reaction(reaction, state):
     """Turn a 👍/👎 on a bot message into an approval/rejection coordinator turn."""
     chat_id = str((reaction.get("chat") or {}).get("id", ""))
-    if chat_id != str(cfg("TELEGRAM_CHAT_ID")):
-        log.warning("Ignoring reaction from unauthorized chat %s", chat_id or "(unknown)")
+    if not is_authorized(chat_id, (reaction.get("user") or {}).get("id")):  # anonymous reactions have no user
+        log.warning("Ignoring reaction from unauthorized chat %s or user", chat_id or "(unknown)")
         return
     emojis = [r.get("emoji") for r in reaction.get("new_reaction") or [] if r.get("type") == "emoji"]
     emoji = next((e for e in emojis if e in REACTION_MEANINGS), None)
@@ -264,13 +381,12 @@ def handle_reaction(reaction, state):
     target = f'your message: "{snippet}"' if snippet else "one of your recent messages"
     prompt = f"[Reaction] The human reacted {emoji} to {target}. {REACTION_MEANINGS[emoji]}"
     log.info("Reaction %s on message %s", emoji, reaction.get("message_id"))
-    try:
-        api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, timeout=10)
-    except Exception:
-        pass  # cosmetic only
-    reply = ask_coordinator(prompt, state)
-    log.info("Replying: %s", reply[:300])
-    send_replies([reply], state)
+    if dispatcher.current_stop() is None:
+        try:
+            api("sendChatAction", {"chat_id": chat_id, "action": "typing"}, timeout=10)
+        except Exception:
+            pass  # cosmetic only
+    converse(prompt, state)
 
 
 def handle_update(update, state):
@@ -279,9 +395,9 @@ def handle_update(update, state):
         return
     msg = update.get("message") or {}
     chat_id = str((msg.get("chat") or {}).get("id", ""))
-    if chat_id != str(cfg("TELEGRAM_CHAT_ID")):
+    if not is_authorized(chat_id, (msg.get("from") or {}).get("id")):
         if msg:
-            log.warning("Ignoring message from unauthorized chat %s", chat_id or "(unknown)")
+            log.warning("Ignoring message from unauthorized chat %s or sender", chat_id or "(unknown)")
         return
     text = (msg.get("text") or "").strip()
     if not text:
@@ -322,20 +438,19 @@ def handle_update(update, state):
         send_replies([("🔁 " if ok else "⚠️ ") + result], state)
         return
     # 👀 on the message plus a typing indicator while the coordinator runs.
-    for method, params in (
-        ("setMessageReaction", {
-            "chat_id": chat_id, "message_id": msg.get("message_id"),
-            "reaction": json.dumps([{"type": "emoji", "emoji": "👀"}]),
-        }),
-        ("sendChatAction", {"chat_id": chat_id, "action": "typing"}),
-    ):
-        try:
-            api(method, params, timeout=10)
-        except Exception:
-            pass  # cosmetic only
-    reply = ask_coordinator(text, state)
-    log.info("Replying: %s", reply[:300])
-    send_replies([reply], state)
+    if dispatcher.current_stop() is None:
+        for method, params in (
+            ("setMessageReaction", {
+                "chat_id": chat_id, "message_id": msg.get("message_id"),
+                "reaction": json.dumps([{"type": "emoji", "emoji": "👀"}]),
+            }),
+            ("sendChatAction", {"chat_id": chat_id, "action": "typing"}),
+        ):
+            try:
+                api(method, params, timeout=10)
+            except Exception:
+                pass  # cosmetic only
+    converse(text, state)
 
 
 # ---------------------------------------------------------------- main loop
@@ -360,6 +475,13 @@ def main():
     )
     if not cfg("TELEGRAM_BOT_TOKEN") or not cfg("TELEGRAM_CHAT_ID"):
         log.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env")
+        return 1
+    if allowed_user_id() is None:
+        log.error(
+            "TELEGRAM_CHAT_ID %s is a group chat, which does not say who is talking. Set "
+            "TELEGRAM_USER_ID to the one Telegram user id allowed to command the bot.",
+            cfg("TELEGRAM_CHAT_ID"),
+        )
         return 1
 
     lock = open(LOCKFILE, "w")
@@ -386,6 +508,7 @@ def main():
     log.info("Coordinator bridge started (chat %s)", cfg("TELEGRAM_CHAT_ID"))
     backoff = 5
     while RUNNING:
+        replay_held(state)  # messages kept while the queue was paused or the login expired
         try:
             updates = api(
                 "getUpdates",

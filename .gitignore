@@ -16,3 +16,5 @@ workspace/
 *.lock
 
 PLAN.md
+.venv/
+__pycache__/

@@ -8,9 +8,10 @@ model review the result against the task's acceptance criteria, retries with
 feedback (escalating to a stronger model) when the review fails, and pings you
 on Telegram when the task lands in `done/` or `failed/`.
 
-One script (`dispatcher.py`, Python standard library only), one config file
-(`.env`). No frameworks, no pip installs. Recurring tasks are supported via
-schedule templates in `tasks/recurring/` (see below).
+One script (`dispatcher.py`), one config file (`.env`), two small pinned
+libraries (`tenacity` for retries, `filelock` for the shared logs) installed
+into a venv (see Setup). Recurring tasks are supported via schedule templates
+in `tasks/recurring/` (see below).
 
 ## Task lifecycle
 
@@ -29,7 +30,9 @@ tasks/pending/ ──► tasks/active/ ──► worker (claude -p, task model)
 - One task per cron run; a lockfile (`flock`) guarantees runs never overlap
   even when a task outlives the 15-minute interval.
 - Attempt 1 uses `model`; every retry after a failed review uses
-  `escalation_model` (falling back to `model` if unset).
+  `escalation_model`. If a task has none, retries use `DEFAULT_ESCALATION_MODEL`
+  (Sonnet), except that a task already on an Opus model stays on it. Opus is
+  only ever used when a task names it.
 - A run killed mid-task leaves its file in `tasks/active/`; the next run
   recovers it back to `pending/` automatically.
 - A queued task can be **cancelled** before it runs: it is archived to
@@ -41,10 +44,40 @@ tasks/pending/ ──► tasks/active/ ──► worker (claude -p, task model)
   can't be cancelled mid-attempt. Pending tasks that `depends_on` a
   cancelled task will wait forever (the cancel report warns about them) —
   cancel them too or restore the dependency.
-- Rate limits are retried in-process with exponential backoff
-  (`30s · 2^n` + jitter, capped at 10 min). If the limit persists through all
-  retries, the task returns to `pending/` **without consuming an attempt** and
-  the next cron run tries again.
+- A transient rate limit (429, overloaded) is retried in-process twice
+  (`MAX_RATE_LIMIT_RETRIES`) with exponential backoff (`30s · 2^n` + jitter).
+- A **usage limit** pauses the whole queue. When the retries run out, or the
+  CLI message names a reset time (no point waiting minutes for an hours-long
+  reset), the task returns to `pending/` **without consuming an attempt**,
+  `state/paused_until` is written (the reset time from the message, else
+  `USAGE_LIMIT_COOLDOWN_MINUTES`), and Telegram gets one "paused until" notice.
+  Runs during the pause exit at once with one log line and no `claude` call;
+  the first run after it sends one "resumed" notice. `MAX_ATTEMPTS_PER_DAY`
+  (default 12) pauses the queue until midnight the same way. Remove
+  `state/paused_until` to resume by hand.
+- An **expired login** stops the queue instead of burning attempts. It is
+  detected on failed calls only (never in a report that merely mentions OAuth),
+  writes `state/auth_failed`, and sends one Telegram message. Each later run
+  makes a single cheap `claude -p` call (`PROBE_MODEL`) and exits until it
+  works; then the queue resumes with a "login restored" notice. Renew with
+  `claude` (sign in again) or `claude setup-token`.
+- A **review that cannot run** (limit, login, timeout, error) no longer throws
+  away the worker's finished report. It is saved to
+  `logs/<task>.attempt-<N>.worker.txt`, the task gets `pending_review: <path>`
+  and goes back to `pending/` with no attempt charged, and the next run does
+  only the review. A review that errors or times out three times in a row is
+  charged as a failed attempt so it can't loop forever.
+- Problems that would repeat every cycle are reported **once**
+  (`state/seen.json`): an unreadable recurring schedule, a dependency on a
+  cancelled task, an expired login. They are reported again if the condition
+  changes or goes away and returns.
+- `logs/usage.jsonl` gets one line per `claude` call (time, label, model, exit
+  code, cost, turns, duration, token usage, per-model usage, permission denials).
+  `python3 dispatcher.py usage` prints calls, errors, cost, turns and web
+  searches by day and model. When a worker had permission denials, the Telegram
+  report names the denied commands. Every failed call's full stdout, stderr and
+  exit code goes to `logs/failed-calls.log`, which is where the exact wording of
+  the next usage limit will show up.
 - Each worker run is bounded by its `timeout_minutes`: on expiry the whole
   process group is killed and the attempt fails with timeout feedback, so
   nothing can hang the dispatcher.
@@ -59,7 +92,7 @@ A task is a markdown file with flat YAML frontmatter and a mandatory
 ```markdown
 ---
 model: claude-sonnet-5                        # required: worker model, attempt 1
-escalation_model: claude-opus-4-8             # optional: model for attempts ≥ 2
+escalation_model: claude-sonnet-5             # optional: model for attempts ≥ 2 (default: DEFAULT_ESCALATION_MODEL)
 review_model: claude-haiku-4-5-20251001       # required: cheap reviewer model
 max_attempts: 3                               # required
 timeout_minutes: 20                           # optional (default from .env)
@@ -270,13 +303,20 @@ cron dispatcher picks them up. It never implements anything itself.
 - Notifications and chat share the bot without conflict: the dispatcher only
   ever sends messages, and the bridge is the only `getUpdates` consumer
   (enforced by its own lockfile). Long coordinator replies are split across
-  messages rather than truncated. Rate limits get the same exponential
-  backoff as the dispatcher; a coordinator run is capped at
-  `COORDINATOR_TIMEOUT_MINUTES` so the chat can't hang.
+  messages rather than truncated. Rate limits get the same retries as the
+  dispatcher; a coordinator run is capped at `COORDINATOR_TIMEOUT_MINUTES` so
+  the chat can't hang.
+- It answers only messages from `TELEGRAM_CHAT_ID` **sent by**
+  `TELEGRAM_USER_ID` (in a private chat the user id defaults to the chat id; a
+  group chat requires `TELEGRAM_USER_ID` or the bot refuses to start).
+- It shares the pause: while the queue is paused or the login expired it
+  replies "queue paused until HH:MM" or "login expired" instead of calling
+  `claude`, keeps your message in `coordinator/state.json`, and answers it
+  when the queue is back. `/status`, `/cancel`, `/retry` and `/new` still work.
 
 ## Setup
 
-Prerequisites: Ubuntu with Python 3.10+, and the Claude Code CLI installed
+Prerequisites: Ubuntu with Python 3.11+, and the Claude Code CLI installed
 and authenticated for the user that will run cron (run `claude` once
 interactively to log in, or use `claude setup-token` for long-lived headless
 credentials).
@@ -296,7 +336,16 @@ credentials).
    curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates"
    ```
 
-3. **Configure**:
+3. **Install the libraries** into a venv (pinned, with hashes):
+
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/pip install --require-hashes -r requirements.txt
+   ```
+
+   Run everything below with `.venv/bin/python3` (or activate the venv).
+
+4. **Configure**:
 
    ```bash
    cp .env.example .env
@@ -311,24 +360,24 @@ credentials).
    `/usr/local/bin/claude`; if none exist it logs an error and requeues the
    task without consuming an attempt.
 
-4. **Smoke-test** (creates the `tasks/` and `logs/` directories):
+5. **Smoke-test** (creates the `tasks/`, `logs/` and `state/` directories):
 
    ```bash
-   python3 dispatcher.py        # should log "Queue empty; nothing to do"
+   .venv/bin/python3 dispatcher.py        # should log "Queue empty; nothing to do"
    ```
 
-5. **Queue the example task and run once manually**:
+6. **Queue the example task and run once manually**:
 
    ```bash
    cp tasks/examples/example-task.md tasks/pending/
-   python3 dispatcher.py
+   .venv/bin/python3 dispatcher.py
    tail -f logs/dispatcher.log
    ```
 
-6. **Install the cron job** (`crontab -e`):
+7. **Install the cron job** (`crontab -e`):
 
    ```cron
-   */15 * * * * /usr/bin/python3 /home/you/agentic-task-queue/dispatcher.py >> /home/you/agentic-task-queue/logs/cron.log 2>&1
+   */15 * * * * /home/you/agentic-task-queue/.venv/bin/python3 /home/you/agentic-task-queue/dispatcher.py >> /home/you/agentic-task-queue/logs/cron.log 2>&1
    ```
 
    Overlap is safe: the in-script lockfile makes a second invocation exit
@@ -360,15 +409,21 @@ credentials).
   with `attempts: 0` (also restores tasks from `cancelled/`). Fix up the
   task file first if the failure needs it.
 - **Pause the queue**: comment out the cron line, or move pending tasks
-  aside — the dispatcher exits cleanly on an empty queue.
+  aside — the dispatcher exits cleanly on an empty queue. Or pause until a
+  chosen time: `date -u -d '+3 hours' +%FT%TZ > state/paused_until`. Delete
+  that file to resume at once.
+- **See where the limit goes**: `python3 dispatcher.py usage`.
+- **Login expired**: after the Telegram notice, run `claude` on the queue
+  host and sign in (or `claude setup-token`); the next cron run resumes.
 - **Stop a recurring task**: move its template out of `tasks/recurring/`.
   Completed instances accumulate in `done/`; prune them occasionally.
 
 ## Development
 
-- **Tests**: `python3 -m unittest discover -s tests -v` (stdlib only). They run
-  in a temp copy of the queue with a fake `claude` and a fake Telegram, so they
-  never touch your `.env`, `tasks/` or `logs/`.
+- **Tests**: `python3 -m unittest discover -s tests -v` from the venv (the
+  tests themselves are stdlib only, but they run `dispatcher.py`, which needs
+  the libraries). They run in a temp copy of the queue with a fake `claude` and
+  a fake Telegram, so they never touch your `.env`, `tasks/` or `logs/`.
 - **Secret scanning**: enable the pre-commit hook once per clone with
   `git config core.hooksPath .githooks`. It runs
   [gitleaks](https://github.com/gitleaks/gitleaks#installing) on staged
