@@ -1,15 +1,17 @@
-coordinator/memory/*
-logs/*
+coordinator/memory/
+logs/
 
-tasks/active/*
-tasks/cancelled/*
-tasks/done/*
-tasks/failed/*
-tasks/pending/*
-tasks/recurring/*
+tasks/active/
+tasks/cancelled/
+tasks/done/
+tasks/failed/
+tasks/pending/
+tasks/recurring/
 
-workspace/*
+workspace/
 
 .env
 
 *.lock
+
+PLAN.md
