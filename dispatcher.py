@@ -9,11 +9,17 @@ requeues the task with feedback (up to max_attempts, escalating the model
 after the first failure) or moves it to tasks/done/ and notifies via
 Telegram. Templates in tasks/recurring/ with a "schedule" frontmatter key
 spawn one-shot instances into pending/ whenever they come due.
-Stdlib only — no pip installs needed.
+
+A usage limit pauses the whole queue (state/paused_until), an expired login
+stops it (state/auth_failed) until a cheap probe call works again, and a
+review that cannot run keeps the worker's finished report instead of
+discarding it. Libraries: tenacity (retries) and filelock (shared logs);
+install them with `pip install --require-hashes -r requirements.txt` in a venv.
 
 Usage: python3 dispatcher.py                   (typically from cron every 15 minutes)
        python3 dispatcher.py cancel <task-id>  (archive a queued task to tasks/cancelled/)
        python3 dispatcher.py retry <task-id>   (requeue a failed/cancelled task, attempts reset)
+       python3 dispatcher.py usage             (claude calls, cost and turns by day and model)
 """
 
 import fcntl
@@ -21,7 +27,6 @@ import html
 import json
 import logging
 import os
-import random
 import re
 import shutil
 import signal
@@ -34,6 +39,18 @@ import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
+from zoneinfo import ZoneInfo
+
+try:
+    import filelock
+    import tenacity
+except ImportError as exc:  # cron has no terminal: say what to do in the one place it will be seen
+    sys.exit(
+        f"dispatcher.py needs the libraries in requirements.txt ({exc}).\n"
+        "Install them in a venv and run the queue with that venv's python:\n"
+        "  python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements.txt"
+    )
 
 BASE = Path(__file__).resolve().parent
 TASKS = BASE / "tasks"
@@ -44,10 +61,25 @@ FAILED = TASKS / "failed"
 RECURRING = TASKS / "recurring"
 CANCELLED = TASKS / "cancelled"
 LOGS = BASE / "logs"
+STATE = BASE / "state"
 LOCKFILE = BASE / "dispatcher.lock"
+PAUSED_FILE = STATE / "paused_until"  # first line: ISO UTC time; second line: why
+AUTH_FAILED_FILE = STATE / "auth_failed"  # present while the claude login is known to be expired
+SEEN_FILE = STATE / "seen.json"  # problems already reported, so each is said once
+USAGE_LOG = LOGS / "usage.jsonl"
+FAILED_CALLS_LOG = LOGS / "failed-calls.log"
 
 RATE_LIMIT_RE = re.compile(r"rate.?limit|\b429\b|overloaded|usage limit|quota", re.I)
-AUTH_ERROR_RE = re.compile(r"not logged in|please run /login|invalid api key|authentication", re.I)
+# Applied only to failed calls (non-zero exit or an error envelope), never to a
+# successful report that happens to mention authentication.
+AUTH_ERROR_RE = re.compile(
+    r"not logged in|please run /login|invalid api key|authenticat|oauth|session expired|unauthorized",
+    re.I,
+)
+PAUSE_BUFFER_S = 60  # past a stated reset time, so we don't wake up a moment early
+MAX_RESET_WAIT = timedelta(days=8)  # a "reset time" further out than the weekly window is not one
+MAX_REVIEW_RETRIES = 3  # reviews that error or time out are retried this often, then charged
+PROBE_PROMPT = "Reply with the single word OK."
 
 WORKER_PREAMBLE = """\
 You are running unattended inside an automated task queue. Complete the task \
@@ -81,7 +113,20 @@ log = logging.getLogger("dispatcher")
 
 
 class RateLimited(Exception):
-    """Rate limit persisted through all backoff retries."""
+    """Rate limit persisted through all backoff retries; the message is what the CLI said."""
+
+
+class TransientLimit(Exception):
+    """One claude call hit a rate limit that is worth retrying shortly (internal)."""
+
+    def __init__(self, message, payload=None):
+        super().__init__(message)
+        self.payload = payload
+
+
+class ClaudeReply(NamedTuple):
+    text: str  # the worker's or reviewer's report
+    envelope: dict  # the JSON envelope claude printed ({} when stdout was not JSON)
 
 
 class CallTimeout(Exception):
@@ -203,7 +248,35 @@ def tail(text, limit=2000):
     return text if len(text) <= limit else "…" + text[-limit:]
 
 
+# ---------------------------------------------------------------- shared files
+
+
+ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def write_atomic(path, text):
+    """Replace a small state file in one step, so the coordinator never reads half of it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def append_locked(path, text):
+    """Append to a log that both the dispatcher and the coordinator bridge write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with filelock.FileLock(f"{path}.lock"):
+        with open(path, "a") as fh:
+            fh.write(text)
+
+
 # ---------------------------------------------------------------- claude calls
+
+
+USAGE_FIELDS = (
+    "total_cost_usd", "num_turns", "duration_ms", "usage", "modelUsage",
+    "permission_denials", "terminal_reason",
+)
 
 
 def append_transcript(transcript, text):
@@ -211,66 +284,168 @@ def append_transcript(transcript, text):
         fh.write(text.rstrip("\n") + "\n")
 
 
-def extract_result(stdout):
-    """Pull the 'result' field out of --output-format json; fall back to raw."""
+def parse_envelope(stdout):
+    """The JSON envelope `claude -p --output-format json` prints, or None."""
     try:
         data = json.loads(stdout)
-        if isinstance(data, dict) and "result" in data:
-            return str(data["result"])
     except (json.JSONDecodeError, TypeError):
-        pass
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def extract_result(stdout):
+    """Pull the 'result' field out of --output-format json; fall back to raw."""
+    data = parse_envelope(stdout)
+    if data is not None and "result" in data:
+        return str(data["result"])
     return stdout
 
 
-def run_claude(cmd, prompt, timeout_s, cwd, transcript, label):
-    """Run one claude -p invocation with exponential backoff on rate limits."""
-    max_retries = int(cfg("MAX_RATE_LIMIT_RETRIES", "5"))
+def classify_call(returncode, out, err):
+    """Judge one finished claude call as (status, message).
+
+    status is "ok", "rate_limited", "auth" or "error". The rate-limit and login
+    patterns only ever see a failed call (non-zero exit, or an envelope with
+    is_error set), so a report that merely mentions OAuth is never taken for an
+    expired login. An error envelope on exit 0 that matches neither pattern is
+    "error" too, but callers still treat its text as the report.
+    """
+    envelope = parse_envelope(out)
+    if returncode == 0 and not (envelope and envelope.get("is_error")):
+        return "ok", ""
+    if envelope is not None:
+        text = str(envelope.get("result") or "").strip()
+        evidence = f"{text}\n{err}\n{envelope.get('api_error_status') or ''}"
+    else:
+        text = out.strip()
+        evidence = f"{out}\n{err}"
+    message = text or f"{out}\n{err}".strip()
+    if RATE_LIMIT_RE.search(evidence):
+        return "rate_limited", f"{message}\n{err}".strip()  # a reset time may be on either stream
+    if AUTH_ERROR_RE.search(evidence):
+        return "auth", message
+    return "error", message
+
+
+def model_of(cmd):
+    return cmd[cmd.index("--model") + 1] if "--model" in cmd[:-1] else None
+
+
+def log_usage(label, model, exit_code, status, envelope=None):
+    """Append one line per claude call to logs/usage.jsonl (read by `usage` and the daily cap)."""
+    envelope = envelope or {}
+    record = {
+        "time": now_iso(),
+        "label": label,  # worker, review, probe or coordinator
+        "model": model,
+        "exit": exit_code,
+        "status": status,  # ok, error, rate_limited, auth or timeout
+        **{key: envelope.get(key) for key in USAGE_FIELDS},
+        "is_error": envelope["is_error"] if "is_error" in envelope else exit_code != 0,
+    }
+    try:
+        append_locked(USAGE_LOG, json.dumps(record) + "\n")
+    except OSError as exc:  # bookkeeping must never fail a task
+        log.warning("Could not write %s: %s", USAGE_LOG.name, exc)
+
+
+def log_failed_call(label, exit_code, out, err, command=""):
+    """Keep everything a failed call printed. The real usage-limit wording is not known yet; this is where it shows up."""
+    entry = f"=== {now_iso()} {label} exit={exit_code} ===\n"
+    if command:
+        entry += f"$ {command}\n"
+    entry += f"--- stdout\n{out}\n--- stderr\n{err}\n\n"
+    try:
+        append_locked(FAILED_CALLS_LOG, entry)
+    except OSError as exc:
+        log.warning("Could not write %s: %s", FAILED_CALLS_LOG.name, exc)
+
+
+def rate_limit_retrying(label, retries=None):
+    """tenacity policy for a transient rate limit: `retries` more tries, exponential wait plus jitter."""
+    if retries is None:
+        retries = int(cfg("MAX_RATE_LIMIT_RETRIES", "2"))
     base_delay = float(cfg("RATE_LIMIT_BASE_DELAY", "30"))
-    for retry in range(max_retries + 1):
-        append_transcript(transcript, f"\n=== {label} @ {now_iso()} ===\n$ {' '.join(cmd)}")
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=cwd,
-                text=True,
-                start_new_session=True,
-            )
-        except OSError as exc:  # binary vanished or isn't executable
-            raise ClaudeError(f"cannot execute {cmd[0]!r}: {exc}")
-        try:
-            out, err = proc.communicate(prompt, timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
-            append_transcript(transcript, f"[{label}] TIMED OUT after {timeout_s:.0f}s")
-            raise CallTimeout(timeout_s)
-        append_transcript(
-            transcript,
-            f"[{label} stdout]\n{out}\n[{label} stderr]\n{err}\n[{label} exit {proc.returncode}]",
+
+    def announce(state):
+        log.warning(
+            "%s: rate limited; backing off %.1fs (retry %d/%d)",
+            label, state.next_action.sleep, state.attempt_number, retries,
         )
-        if proc.returncode == 0:
-            return extract_result(out)
-        if RATE_LIMIT_RE.search(out + err):
-            if retry < max_retries:
-                delay = min(base_delay * 2**retry + random.uniform(0, base_delay / 3), 600)
-                log.warning(
-                    "%s: rate limited (exit %d); backing off %.1fs (retry %d/%d)",
-                    label, proc.returncode, delay, retry + 1, max_retries,
-                )
-                time.sleep(delay)
-                continue
-            raise RateLimited()
-        # Prefer the concise "result" message from the JSON envelope over the raw blob.
-        message = extract_result(out).strip() or (out + "\n" + err).strip()
-        if AUTH_ERROR_RE.search(message) or AUTH_ERROR_RE.search(err):
-            raise AuthError(message)
-        raise ClaudeError(message)
+
+    return tenacity.Retrying(
+        retry=tenacity.retry_if_exception_type(TransientLimit),
+        stop=tenacity.stop_after_attempt(retries + 1),
+        wait=tenacity.wait_exponential_jitter(initial=base_delay, max=600, jitter=base_delay / 3),
+        before_sleep=announce,
+        reraise=True,
+    )
+
+
+def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label):
+    """One claude -p invocation: a ClaudeReply, or an exception. Never sleeps."""
+    model = model_of(cmd)
+    command = " ".join(cmd)
+    append_transcript(transcript, f"\n=== {label} @ {now_iso()} ===\n$ {command}")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as exc:  # binary vanished or isn't executable
+        raise ClaudeError(f"cannot execute {cmd[0]!r}: {exc}")
+    try:
+        out, err = proc.communicate(prompt, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        append_transcript(transcript, f"[{label}] TIMED OUT after {timeout_s:.0f}s")
+        log_usage(label, model, None, "timeout")
+        log_failed_call(label, "timeout", "", "", command)
+        raise CallTimeout(timeout_s)
+    append_transcript(
+        transcript,
+        f"[{label} stdout]\n{out}\n[{label} stderr]\n{err}\n[{label} exit {proc.returncode}]",
+    )
+    envelope = parse_envelope(out)
+    status, message = classify_call(proc.returncode, out, err)
+    log_usage(label, model, proc.returncode, status, envelope)
+    if status != "ok":
+        log_failed_call(label, proc.returncode, out, err, command)
+    reply = ClaudeReply(extract_result(out), envelope or {})
+    if status == "ok":
+        return reply
+    if status == "rate_limited":
+        if parse_reset_time(message) is not None:
+            raise RateLimited(message)  # the reset is hours away; waiting a few minutes is pointless
+        raise TransientLimit(message)
+    if status == "auth":
+        raise AuthError(message)
+    if proc.returncode == 0:  # an error envelope on exit 0: the reviewer judges the text, as before
+        return reply
+    raise ClaudeError(message)
+
+
+def run_claude(cmd, prompt, timeout_s, cwd, transcript, label, retries=None):
+    """Run one claude -p invocation, retrying a transient rate limit with backoff.
+
+    Raises RateLimited when the limit outlasts the retries (or names a reset
+    time), AuthError when the login is bad, CallTimeout, or ClaudeError.
+    """
+    try:
+        return rate_limit_retrying(label, retries)(
+            _call_claude, cmd, prompt, timeout_s, cwd, transcript, label
+        )
+    except TransientLimit as exc:
+        raise RateLimited(str(exc)) from None
 
 
 # ---------------------------------------------------------------- telegram
@@ -359,6 +534,293 @@ def send_telegram(text):
             return
 
 
+# ---------------------------------------------------------------- limits, login, once-only reports
+
+# The wording below is a best guess at what the CLI prints. logs/failed-calls.log
+# records the real text of the next limit hit; extend these patterns from it.
+_EPOCH_RE = re.compile(r"(?:limit|quota)[^|\n]*\|\s*(\d{10}|\d{13})\b", re.I)  # "...limit reached|1760000000"
+_RELATIVE_RE = re.compile(
+    r"(?:try again|retry|resets?)\s+in\s+(\d+(?:\.\d+)?)\s*"
+    r"(seconds?|secs?|minutes?|mins?|hours?|hrs?|[smh])\b", re.I,
+)
+_CLOCK_RE = re.compile(r"\bresets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)?(?:\s*\(([^)]+)\))?", re.I)
+
+
+def parse_reset_time(text, now=None):
+    """When a usage limit lifts, from the CLI's message, as an aware UTC datetime; None if it says nothing usable."""
+    now = now or datetime.now(timezone.utc)
+    result = None
+    match = _EPOCH_RE.search(text)
+    if match:
+        raw = int(match.group(1))
+        result = datetime.fromtimestamp(raw / 1000 if len(match.group(1)) == 13 else raw, timezone.utc)
+    if result is None:
+        match = _RELATIVE_RE.search(text)
+        if match:
+            seconds = {"s": 1, "m": 60, "h": 3600}[match.group(2)[0].lower()]
+            result = now + timedelta(seconds=float(match.group(1)) * seconds)
+    if result is None:
+        match = _CLOCK_RE.search(text)
+        if match and (match.group(2) or match.group(3)):  # "resets 3" alone could be anything
+            hour, minute, ampm = int(match.group(1)), int(match.group(2) or 0), (match.group(3) or "").lower()
+            if ampm:
+                hour = hour % 12 + (12 if ampm == "pm" else 0)
+            if hour < 24 and minute < 60:
+                zone = None  # the machine's own zone, unless the message names one we know
+                if match.group(4):
+                    try:
+                        zone = ZoneInfo(match.group(4).strip())
+                    except Exception:
+                        zone = None
+                local_now = now.astimezone(zone)
+                result = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if result <= local_now:
+                    result += timedelta(days=1)
+    if result is not None and now < result <= now + MAX_RESET_WAIT:
+        return result.astimezone(timezone.utc)
+    return None
+
+
+def usage_limit_until(message):
+    """How long to stay paused for a usage limit: the stated reset time, else the cooldown setting."""
+    reset = parse_reset_time(message)
+    if reset is not None:
+        return reset + timedelta(seconds=PAUSE_BUFFER_S)
+    return datetime.now(timezone.utc) + timedelta(minutes=float(cfg("USAGE_LIMIT_COOLDOWN_MINUTES", "60")))
+
+
+def format_when(moment):
+    """Local clock time for a message: HH:MM today, otherwise with the weekday."""
+    local = moment.astimezone()
+    return local.strftime("%H:%M" if local.date() == datetime.now().astimezone().date() else "%a %H:%M")
+
+
+class Pause(NamedTuple):
+    until: datetime
+    reason: str
+
+
+def read_pause():
+    """The pause in state/paused_until, or None. An unreadable file is deleted: it must never wedge the queue."""
+    try:
+        lines = PAUSED_FILE.read_text().splitlines()
+    except OSError:
+        return None
+    try:
+        until = datetime.strptime(lines[0].strip(), ISO_FMT).replace(tzinfo=timezone.utc)
+    except (IndexError, ValueError):
+        log.warning("Ignoring unreadable %s and removing it", PAUSED_FILE)
+        PAUSED_FILE.unlink(missing_ok=True)
+        return None
+    return Pause(until, lines[1].strip() if len(lines) > 1 else "paused")
+
+
+def pause_queue(until, reason, notify=True):
+    """Stop the queue until `until`, saying so once. No-op if it is already paused at least that long."""
+    current = read_pause()
+    if current and current.until > datetime.now(timezone.utc) and current.until >= until:
+        return
+    write_atomic(PAUSED_FILE, f"{until.astimezone(timezone.utc).strftime(ISO_FMT)}\n{reason}\n")
+    log.warning("Queue paused until %s (%s)", format_when(until), reason)
+    if notify:
+        send_telegram(f"⏸ Queue paused until {format_when(until)} ({reason}). It resumes by itself.")
+
+
+def current_stop():
+    """Why queued work cannot run now: ("auth", None, ""), ("paused", until, reason), or None."""
+    if AUTH_FAILED_FILE.exists():
+        return "auth", None, ""
+    pause = read_pause()
+    if pause and pause.until > datetime.now(timezone.utc):
+        return "paused", pause.until, pause.reason
+    return None
+
+
+AUTH_NOTICE = (
+    "🔑 Claude login expired — the queue is stopped, and nothing runs until it is renewed.\n"
+    "Fix: on the queue host run `claude` and sign in again (or `claude setup-token`). "
+    "The next cron run checks the login with one cheap call and resumes by itself."
+)
+
+
+def mark_auth_failed(message, notify=True):
+    """Record an expired login. With notify, say so once on Telegram and in the log."""
+    write_atomic(AUTH_FAILED_FILE, f"{now_iso()}\n{tail(message, 500)}\n")
+    if notify:
+        report_once(
+            "auth", "",
+            f"Claude login expired ({' '.join(message.split())[:200]}); queue stopped until `claude` works "
+            "again: run `claude` and sign in, or `claude setup-token`",
+            AUTH_NOTICE,
+            level=logging.ERROR,
+        )
+
+
+def login_works():
+    """One cheap claude call. False only if the login is still bad (or the call timed out)."""
+    claude_bin = resolve_claude_bin()
+    if claude_bin is None:
+        log.debug("login probe skipped: no claude binary")
+        return False
+    cwd = Path(cfg("DEFAULT_CWD") or BASE / "workspace")
+    cwd.mkdir(parents=True, exist_ok=True)
+    cmd = [claude_bin, "-p", "--model", cfg("PROBE_MODEL", "claude-haiku-4-5-20251001"),
+           "--output-format", "json"]
+    try:
+        run_claude(cmd, PROBE_PROMPT, 120, str(cwd), LOGS / "probe.log", "probe", retries=0)
+    except (AuthError, CallTimeout) as exc:
+        log.debug("login probe failed: %r", exc)
+        return False
+    except (RateLimited, ClaudeError):
+        pass  # whatever that was, it was not the login
+    return True
+
+
+def queue_is_stopped():
+    """True when this run must end at once: the queue is paused, or the login is still expired.
+
+    Also does the housekeeping when a stop ends: an expired pause file is
+    removed and the resume announced, and auth_failed is cleared once a probe
+    call works. While stopped it stays quiet: the first notice was the report.
+    """
+    pause = read_pause()
+    if pause:
+        if pause.until > datetime.now(timezone.utc):
+            log.info("Queue paused until %s (%s); exiting", format_when(pause.until), pause.reason)
+            return True
+        PAUSED_FILE.unlink(missing_ok=True)
+        log.info("Pause (%s) is over; resuming", pause.reason)
+        send_telegram(f"▶️ Queue resumed (it was paused: {pause.reason}).")
+    if AUTH_FAILED_FILE.exists():
+        if not login_works():
+            return True
+        AUTH_FAILED_FILE.unlink(missing_ok=True)
+        clear_reported("auth")
+        log.info("Claude login works again; resuming")
+        send_telegram("✅ Claude login restored — queue resumed.")
+    return False
+
+
+# Problems that repeat every cycle are reported once. state/seen.json maps a
+# key to the signature last reported; a key like "kind|tasks/pending/x.md"
+# is dropped when that file goes away (prune_seen), and a changed signature
+# counts as a new problem.
+
+
+def load_seen():
+    try:
+        data = json.loads(SEEN_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def report_once(key, signature, log_text, telegram_text, level=logging.WARNING):
+    """Log and send a problem unless this exact problem was already reported. True if it was said."""
+    seen = load_seen()
+    if seen.get(key) == signature:
+        return False
+    seen[key] = signature
+    write_atomic(SEEN_FILE, json.dumps(seen, indent=1))
+    log.log(level, "%s", log_text)
+    send_telegram(telegram_text)
+    return True
+
+
+def clear_reported(key):
+    """The problem is gone: forget it, so it is reported again if it comes back."""
+    seen = load_seen()
+    if key in seen:
+        del seen[key]
+        write_atomic(SEEN_FILE, json.dumps(seen, indent=1))
+
+
+def prune_seen():
+    seen = load_seen()
+    kept = {k: v for k, v in seen.items() if "|" not in k or (BASE / k.split("|", 1)[1]).exists()}
+    if kept != seen:
+        write_atomic(SEEN_FILE, json.dumps(kept, indent=1))
+
+
+def usage_records():
+    """Every parseable line of logs/usage.jsonl as (local datetime, record)."""
+    try:
+        lines = USAGE_LOG.read_text().splitlines()
+    except OSError:
+        return []
+    records = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+            when = datetime.strptime(record["time"], ISO_FMT).replace(tzinfo=timezone.utc).astimezone()
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        if isinstance(record, dict):
+            records.append((when, record))
+    return records
+
+
+def attempts_today():
+    """Worker calls today (local time) that used up an attempt; a limit or login failure doesn't."""
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).astimezone()
+    return sum(
+        1 for when, record in usage_records()
+        if record.get("label") == "worker" and when >= midnight
+        and record.get("status") not in ("rate_limited", "auth")
+    )
+
+
+def daily_cap_reached():
+    """Pause until local midnight when today's attempts hit MAX_ATTEMPTS_PER_DAY and work is waiting."""
+    cap = int(cfg("MAX_ATTEMPTS_PER_DAY", "12"))
+    if cap <= 0 or not any(PENDING.glob("*.md")) or attempts_today() < cap:
+        return False
+    midnight = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    pause_queue(midnight.astimezone(), f"daily attempt cap of {cap} reached")
+    return True
+
+
+def usage_report():
+    """Print claude calls, errors, cost, turns and web searches by day and model."""
+    records = usage_records()
+    if not records:
+        print("No usage recorded yet.")
+        return 0
+    rows = {}
+
+    def row(day, model):
+        return rows.setdefault((day, model), {"calls": 0, "errors": 0, "cost": 0.0, "turns": 0, "searches": 0})
+
+    for when, record in records:
+        day = when.strftime("%Y-%m-%d")
+        entry = row(day, record.get("model") or "unknown")
+        entry["calls"] += 1
+        entry["errors"] += bool(record.get("is_error")) or record.get("exit") not in (0, None)
+        entry["turns"] += record.get("num_turns") or 0
+        by_model = record.get("modelUsage") or {}
+        if by_model:  # one call can spend on several models (a search sub-agent, say)
+            for name, spent in by_model.items():
+                part = row(day, name)
+                part["cost"] += spent.get("costUSD") or 0
+                part["searches"] += spent.get("webSearchRequests") or 0
+        else:
+            entry["cost"] += record.get("total_cost_usd") or 0
+
+    def show(day, model, entry):
+        print(f"{day:<10}  {model:<34}  {entry['calls']:>5}  {entry['errors']:>6}  "
+              f"{entry['cost']:>9.4f}  {entry['turns']:>5}  {entry['searches']:>12}")
+
+    print(f"{'day':<10}  {'model':<34}  {'calls':>5}  {'errors':>6}  "
+          f"{'cost_usd':>9}  {'turns':>5}  {'web_searches':>12}")
+    total = {"calls": 0, "errors": 0, "cost": 0.0, "turns": 0, "searches": 0}
+    for (day, model), entry in sorted(rows.items()):
+        show(day, model, entry)
+        for key in total:
+            total[key] += entry[key]
+    show("total", "all", total)
+    return 0
+
+
 # ---------------------------------------------------------------- recurring
 
 DAY_NAMES = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -410,11 +872,20 @@ def spawn_recurring():
             except ValueError:
                 log.warning("Recurring template %s has malformed last_run %r; treating as never run",
                             template.name, meta["last_run"])
+        schedule_key = f"schedule|tasks/recurring/{template.name}"
         try:
             due = is_due(meta["schedule"], last_run, now)
         except ValueError as exc:
-            log.error("Recurring template %s: %s", template.name, exc)
+            report_once(
+                schedule_key, meta["schedule"],
+                f"Recurring template {template.name}: {exc}",
+                f"⚠️ Recurring task not scheduled: {template.name}\n{exc}\n"
+                "Supported: every 30m|6h|2d, daily at 06:30, weekly on mon at 09:00. "
+                "It will not run until the schedule line is fixed; this is the only notice.",
+                level=logging.ERROR,
+            )
             continue
+        clear_reported(schedule_key)
         if not due:
             continue
         # Don't pile up instances while an earlier one is still queued or running;
@@ -566,6 +1037,8 @@ def retry_task(stem):
                 meta, body = parse_task(path)
                 meta = meta or {}
                 meta["attempts"] = "0"
+                meta.pop("pending_review", None)  # a fresh start redoes the work too
+                meta.pop("review_failures", None)
                 write_task(path, meta, body)
                 shutil.move(str(path), str(PENDING / path.name))
                 log.info("retry_task(%s): requeued from tasks/%s/", stem, label)
@@ -636,6 +1109,7 @@ def pick_task():
     for src in candidates:
         meta, _ = parse_task(src)
         blocked = None
+        cancelled_dep = None
         for dep in dep_names(meta):
             if dep == src.stem:
                 log.warning("Task %s depends on itself and will never run", src.name)
@@ -649,11 +1123,7 @@ def pick_task():
                 blocked = "failed"
                 break
             if state == "cancelled":
-                log.warning(
-                    "Task %s is waiting on dependency %r, which was cancelled — it "
-                    "will never run; cancel it too, or move the dependency back to "
-                    "pending/", src.name, dep,
-                )
+                cancelled_dep = dep
                 blocked = "waiting"
                 break
             if state == "missing":
@@ -665,6 +1135,17 @@ def pick_task():
                 log.info("Task %s is waiting on dependency %r", src.name, dep)
             blocked = "waiting"
             break
+        cancelled_key = f"cancelled-dependency|tasks/pending/{src.name}"
+        if cancelled_dep is not None:
+            report_once(
+                cancelled_key, cancelled_dep,
+                f"Task {src.name} is waiting on dependency {cancelled_dep!r}, which was cancelled — it "
+                "will never run; cancel it too, or move the dependency back to pending/",
+                f"⚠️ {src.name} will never run: it depends on '{cancelled_dep}', which was cancelled.\n"
+                f"Cancel {src.name} too, or restore '{cancelled_dep}'. This is the only notice.",
+            )
+        else:
+            clear_reported(cancelled_key)
         if blocked is None:
             dest = ACTIVE / src.name
             shutil.move(str(src), str(dest))
@@ -699,6 +1180,80 @@ def parse_verdict(review_out):
     return match.group(1).upper(), feedback.strip() or "(no feedback given)"
 
 
+def escalation_model(meta):
+    """Model for attempts after the first: the task's own choice, else Sonnet. Opus only when a task names it."""
+    if meta.get("escalation_model"):
+        return meta["escalation_model"]
+    if "opus" in meta["model"].lower():
+        return meta["model"]  # the task already chose the strongest model; don't downgrade it
+    return cfg("DEFAULT_ESCALATION_MODEL", "claude-sonnet-5")
+
+
+def requeue_unconsumed(path, meta, body, attempts):
+    """Put the task back as if this attempt never started: a limit or a login problem costs no attempt."""
+    meta["attempts"] = str(attempts - 1)
+    write_task(path, meta, body)
+    shutil.move(str(path), str(PENDING / path.name))
+
+
+def park_report(path, meta, body, attempts, worker_out, denials):
+    """The review can't run now: keep the worker's finished report and requeue for a review-only retry."""
+    report = LOGS / f"{path.stem}.attempt-{attempts}.worker.txt"
+    write_atomic(report, worker_out)
+    sidecar = report.with_suffix(".json")
+    if denials:
+        write_atomic(sidecar, json.dumps({"permission_denials": denials}))
+    else:
+        sidecar.unlink(missing_ok=True)
+    meta["pending_review"] = str(report.relative_to(BASE))
+    requeue_unconsumed(path, meta, body, attempts)
+
+
+def load_parked_report(meta):
+    """(worker report, permission denials) saved by park_report, or None when there is nothing usable to reuse.
+
+    The path comes from the task file, which a coordinator wrote, so it is only
+    trusted inside logs/: anything else would let a task read any file and
+    have it reviewed, stored and sent to Telegram.
+    """
+    ref = meta.get("pending_review")
+    if not ref:
+        return None
+    report = BASE / ref
+    try:
+        if not report.resolve().is_relative_to(LOGS.resolve()):
+            raise OSError("outside logs/")
+        text = report.read_text()
+    except OSError as exc:
+        log.warning("pending_review %s is unusable (%s); running the worker again", ref, exc)
+        meta.pop("pending_review", None)
+        meta.pop("review_failures", None)
+        return None
+    try:
+        denials = json.loads(report.with_suffix(".json").read_text()).get("permission_denials") or []
+    except (OSError, json.JSONDecodeError, AttributeError):
+        denials = []
+    return text, denials
+
+
+def denial_notice(denials):
+    """One Telegram line naming the tool calls claude refused, so a report can't lean on commands that never ran."""
+    shown = []
+    for denial in denials or []:
+        if not isinstance(denial, dict):
+            continue
+        tool_input = denial.get("tool_input") or {}
+        detail = next((str(tool_input[k]) for k in ("command", "file_path", "path", "url", "pattern")
+                       if tool_input.get(k)), "")
+        name = denial.get("tool_name") or "tool"
+        item = detail if name == "Bash" and detail else f"{name}({detail})" if detail else name
+        shown.append("`" + " ".join(item.replace("`", "'").split())[:120] + "`")
+    if not shown:
+        return ""
+    more = f" and {len(shown) - 5} more" if len(shown) > 5 else ""
+    return f"⚠️ Permission denied, so these never ran: {', '.join(shown[:5])}{more}"
+
+
 def process_task(path):
     name = path.name
     meta, body = parse_task(path)
@@ -728,58 +1283,58 @@ def process_task(path):
     meta["attempts"] = str(attempts)
     write_task(path, meta, body)
 
-    model = meta["model"] if attempts == 1 else (meta.get("escalation_model") or meta["model"])
-    tools = meta.get("allowed_tools") or cfg("DEFAULT_ALLOWED_TOOLS", "Read,Glob,Grep,Edit,Write")
     timeout_min = float(meta.get("timeout_minutes") or cfg("DEFAULT_TIMEOUT_MINUTES", "30"))
     cwd = meta.get("cwd") or cfg("DEFAULT_CWD") or str(BASE / "workspace")
     Path(cwd).mkdir(parents=True, exist_ok=True)
     transcript = LOGS / f"{path.stem}.attempt-{attempts}.log"
 
-    log.info(
-        "Task %s: attempt %d/%d, model=%s, tools=[%s], timeout=%.0f min, cwd=%s",
-        name, attempts, max_attempts, model, tools, timeout_min, cwd,
-    )
-
-    worker_cmd = [
-        claude_bin, "-p",
-        "--model", model,
-        "--allowedTools", tools,
-        "--output-format", "json",
-    ]
-    mcp = mcp_config_path(meta)
-    if mcp is not None:
-        worker_cmd += ["--mcp-config", str(mcp)]
-        log.info("Task %s: MCP servers from %s", name, mcp)
-    try:
-        worker_out = run_claude(
-            worker_cmd, WORKER_PREAMBLE + "\n\n" + body, timeout_min * 60, cwd, transcript, "worker"
+    parked = load_parked_report(meta)
+    if parked is not None:
+        worker_out, denials = parked
+        log.info("Task %s: attempt %d/%d reuses the saved worker report and runs only the review",
+                 name, attempts, max_attempts)
+    else:
+        model = meta["model"] if attempts == 1 else escalation_model(meta)
+        tools = meta.get("allowed_tools") or cfg("DEFAULT_ALLOWED_TOOLS", "Read,Glob,Grep,Edit,Write")
+        log.info(
+            "Task %s: attempt %d/%d, model=%s, tools=[%s], timeout=%.0f min, cwd=%s",
+            name, attempts, max_attempts, model, tools, timeout_min, cwd,
         )
-    except RateLimited:
-        meta["attempts"] = str(attempts - 1)  # rate limit doesn't consume an attempt
-        write_task(path, meta, body)
-        shutil.move(str(path), str(PENDING / name))
-        log.warning("Task %s: rate limit persisted through backoff; requeued without consuming an attempt", name)
-        return
-    except AuthError as exc:
-        meta["attempts"] = str(attempts - 1)  # config problem, not a task failure
-        write_task(path, meta, body)
-        shutil.move(str(path), str(PENDING / name))
-        log.error(
-            "Task %s: Claude CLI is not authenticated (%s). Run 'claude' once "
-            "interactively (or 'claude setup-token') as the cron user. "
-            "Task requeued without consuming an attempt.", name, exc,
-        )
-        return
-    except CallTimeout:
-        handle_failure(
-            path, meta, body, attempts, max_attempts,
-            f"Worker timed out after {timeout_min:g} minutes without completing. "
-            f"Finish faster or the task may need a larger timeout_minutes.",
-        )
-        return
-    except ClaudeError as exc:
-        handle_failure(path, meta, body, attempts, max_attempts, f"Worker invocation failed:\n{tail(str(exc))}")
-        return
+        worker_cmd = [
+            claude_bin, "-p",
+            "--model", model,
+            "--allowedTools", tools,
+            "--output-format", "json",
+        ]
+        mcp = mcp_config_path(meta)
+        if mcp is not None:
+            worker_cmd += ["--mcp-config", str(mcp)]
+            log.info("Task %s: MCP servers from %s", name, mcp)
+        try:
+            reply = run_claude(
+                worker_cmd, WORKER_PREAMBLE + "\n\n" + body, timeout_min * 60, cwd, transcript, "worker"
+            )
+        except RateLimited as exc:
+            requeue_unconsumed(path, meta, body, attempts)
+            log.warning("Task %s: usage limit; requeued without consuming an attempt", name)
+            pause_queue(usage_limit_until(str(exc)), "usage limit")
+            return
+        except AuthError as exc:
+            requeue_unconsumed(path, meta, body, attempts)
+            log.warning("Task %s: requeued without consuming an attempt", name)
+            mark_auth_failed(str(exc))
+            return
+        except CallTimeout:
+            handle_failure(
+                path, meta, body, attempts, max_attempts,
+                f"Worker timed out after {timeout_min:g} minutes without completing. "
+                f"Finish faster or the task may need a larger timeout_minutes.",
+            )
+            return
+        except ClaudeError as exc:
+            handle_failure(path, meta, body, attempts, max_attempts, f"Worker invocation failed:\n{tail(str(exc))}")
+            return
+        worker_out, denials = reply.text, reply.envelope.get("permission_denials") or []
 
     review_cmd = [
         claude_bin, "-p",
@@ -790,20 +1345,48 @@ def process_task(path):
     review_prompt = REVIEW_TEMPLATE.format(criteria=extract_criteria(body), output=tail(worker_out, 20000))
     review_timeout = float(cfg("REVIEW_TIMEOUT_MINUTES", "10")) * 60
     try:
-        review_out = run_claude(review_cmd, review_prompt, review_timeout, cwd, transcript, "review")
-    except (RateLimited, AuthError, CallTimeout, ClaudeError) as exc:
-        review_out = (
-            f"VERDICT: FAIL\nReview could not be completed ({type(exc).__name__}). "
-            f"Worker output is preserved in logs/{transcript.name}."
-        )
+        review_out = run_claude(review_cmd, review_prompt, review_timeout, cwd, transcript, "review").text
+    except RateLimited as exc:
+        park_report(path, meta, body, attempts, worker_out, denials)
+        log.warning("Task %s: usage limit during review; worker report saved, no attempt used", name)
+        pause_queue(usage_limit_until(str(exc)), "usage limit")
+        return
+    except AuthError as exc:
+        park_report(path, meta, body, attempts, worker_out, denials)
+        log.warning("Task %s: review could not run; worker report saved, no attempt used", name)
+        mark_auth_failed(str(exc))
+        return
+    except (CallTimeout, ClaudeError) as exc:
+        failures = int(meta.get("review_failures") or 0) + 1
+        if failures < MAX_REVIEW_RETRIES:
+            meta["review_failures"] = str(failures)
+            park_report(path, meta, body, attempts, worker_out, denials)
+            log.warning("Task %s: review failed (%s), try %d/%d; worker report saved, no attempt used",
+                        name, type(exc).__name__, failures, MAX_REVIEW_RETRIES)
+        else:  # a review that never works must not loop forever: charge the attempt as before
+            meta.pop("pending_review", None)
+            meta.pop("review_failures", None)
+            handle_failure(
+                path, meta, body, attempts, max_attempts,
+                f"Review could not be completed after {failures} tries ({type(exc).__name__}: "
+                f"{tail(str(exc), 300) or 'timed out'}).",
+            )
+        return
 
+    meta.pop("pending_review", None)
+    meta.pop("review_failures", None)
     verdict, feedback = parse_verdict(review_out)
     if verdict == "PASS":
         body = body.rstrip("\n") + f"\n\n## Result (attempt {attempts}, {now_iso()})\n\n{worker_out.strip()}\n"
         write_task(path, meta, body)
         shutil.move(str(path), str(DONE / name))
         log.info("Task %s PASSED review on attempt %d/%d; moved to done/", name, attempts, max_attempts)
-        send_telegram(f"✅ Task done: {name} (attempt {attempts}/{max_attempts})\n\n{worker_out.strip()}")
+        notice = denial_notice(denials)
+        send_telegram(
+            f"✅ Task done: {name} (attempt {attempts}/{max_attempts})"
+            + (f"\n{notice}" if notice else "")
+            + f"\n\n{worker_out.strip()}"
+        )
     else:
         handle_failure(path, meta, body, attempts, max_attempts, feedback)
 
@@ -812,7 +1395,7 @@ def process_task(path):
 
 
 def main():
-    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED, LOGS):
+    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED, LOGS, STATE):
         directory.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
@@ -830,8 +1413,13 @@ def main():
     lock.write(str(os.getpid()))
     lock.flush()
 
+    if queue_is_stopped():  # a usage-limit pause, or a login that still fails its probe
+        return 0
+    prune_seen()
     recover_stale()
     spawn_recurring()
+    if daily_cap_reached():
+        return 0
     task = pick_task()
     if task is None:
         log.info("Queue empty; nothing to do")
@@ -847,10 +1435,13 @@ if __name__ == "__main__":
             ok, message = actions[sys.argv[1]](sys.argv[2])
             print(message)
             sys.exit(0 if ok else 1)
+        if sys.argv[1] == "usage" and len(sys.argv) == 2:
+            sys.exit(usage_report())
         print(
             "Usage: dispatcher.py                   run one queue cycle\n"
             "       dispatcher.py cancel <task-id>  archive a queued task to tasks/cancelled/\n"
-            "       dispatcher.py retry <task-id>   requeue a failed/cancelled task, attempts reset",
+            "       dispatcher.py retry <task-id>   requeue a failed/cancelled task, attempts reset\n"
+            "       dispatcher.py usage             claude calls, cost and turns by day and model",
             file=sys.stderr,
         )
         sys.exit(2)

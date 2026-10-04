@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/root/agentic-task-queue
-ExecStart=/usr/bin/python3 /root/agentic-task-queue/coordinator_bot.py
+ExecStart=/root/agentic-task-queue/.venv/bin/python3 /root/agentic-task-queue/coordinator_bot.py
 Restart=on-failure
 RestartSec=10
 

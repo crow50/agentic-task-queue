@@ -1,6 +1,6 @@
 ---
 model: claude-sonnet-5
-escalation_model: claude-opus-4-8
+escalation_model: claude-sonnet-5
 review_model: claude-haiku-4-5-20251001
 max_attempts: 3
 timeout_minutes: 20

@@ -1,0 +1,13 @@
+# Runtime libraries for dispatcher.py and coordinator_bot.py, each pinned to one
+# version with every published file hash (PLAN.md, Phase 4 "Use libraries").
+# Install in a venv:
+#   python3 -m venv .venv
+#   .venv/bin/pip install --require-hashes -r requirements.txt
+# To bump one: change the version, then replace its hashes with the sha256 of
+# every file listed under "urls" at https://pypi.org/pypi/<name>/<version>/json
+tenacity==9.1.4 \
+    --hash=sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55 \
+    --hash=sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a
+filelock==4.0.10 \
+    --hash=sha256:698048d158dc3c9e18cc5e88b3efdd4bd0e77d76686b22adb4511cc4b2c2f0db \
+    --hash=sha256:00d6a81f976a6332551c2c10f39e12b4abb7e01c64d4c497b81a615bc9186f1f

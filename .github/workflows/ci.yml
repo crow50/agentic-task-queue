@@ -31,6 +31,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install runtime libraries (pinned, hashed)
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
       - name: Compile
         run: python -m py_compile dispatcher.py coordinator_bot.py
       - name: Unit tests
