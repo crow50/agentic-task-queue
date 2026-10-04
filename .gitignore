@@ -1,4 +1,5 @@
 coordinator/memory/
+coordinator/state.json
 logs/
 
 tasks/active/
