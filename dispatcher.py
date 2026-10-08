@@ -15,21 +15,28 @@ stops it (state/auth_failed) until a cheap probe call works again, and a
 review that cannot run keeps the worker's finished report instead of
 discarding it. Reports too long for one message go out as a preview plus the
 full text as an attachment, and a task's `deliver:` files are sent as documents.
+A task's `verify:` command is run by the dispatcher itself (no shell, scrubbed
+environment, allowlisted prefixes) between the worker and the reviewer: a
+non-zero exit fails the attempt without a review call, and with `review: skip`
+a zero exit ends the task.
 Libraries: tenacity (retries), filelock (shared logs) and httpx (uploads);
 install them with `pip install --require-hashes -r requirements.txt` in a venv.
 
 Usage: python3 dispatcher.py                   (typically from cron every 15 minutes)
        python3 dispatcher.py cancel <task-id>  (archive a queued task to tasks/cancelled/)
        python3 dispatcher.py retry <task-id>   (requeue a failed/cancelled task, attempts reset)
+       python3 dispatcher.py check <file>      (validate a task or recurring template file)
        python3 dispatcher.py usage             (claude calls, cost and turns by day and model)
 """
 
+import difflib
 import fcntl
 import html
 import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -96,6 +103,15 @@ previous failed attempts; address every point before finishing.
 created or changed (with paths), and how each acceptance criterion is met.
 - The reader sees only Telegram. Never write "see file X" unless X is listed in \
 the task's `deliver:` line, and paste what matters inline in your report.
+- The reviewer has no shell, no GitHub CLI and no network. It sees only your \
+report and the files in the working directory, so it cannot run anything to \
+check your claims.
+- For every verification step (tests, builds, lookups), paste the raw output \
+verbatim in your report. Do not summarise it or say that it passed.
+- For any issue or pull request you create, paste its URL and its rendered \
+body (for example the output of `gh issue view`).
+- Run Bash commands one at a time. A command chained with `&&`, `;`, a pipe or \
+`2>&1` is denied, and its output never existed.
 """
 
 REVIEW_TEMPLATE = """\
@@ -104,6 +120,11 @@ worker's output satisfies every acceptance criterion below. You may use \
 Read/Glob/Grep on the current directory to verify files the worker claims to \
 have created.
 
+Raw command output pasted in the worker's report, and the dispatcher's own \
+verification below, is evidence: you cannot run commands yourself, so do not \
+fail a criterion because you could not re-run something. Fail a criterion \
+only when the evidence for it is missing or contradictory.
+
 The first line of your reply must be exactly "VERDICT: PASS" or \
 "VERDICT: FAIL" (nothing else on that line). If FAIL, follow with concise \
 bullet points telling the worker exactly what is missing or wrong so it can \
@@ -111,7 +132,7 @@ fix it on the next attempt.
 
 ## Acceptance Criteria
 {criteria}
-
+{verification}
 ## Worker Report
 {output}
 """
@@ -189,6 +210,13 @@ def resolve_claude_bin():
 # ---------------------------------------------------------------- task files
 
 
+def unquote(value):
+    """Drop one pair of matching quotes around a frontmatter value; a lone quote is part of the value."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
 def parse_task(path):
     """Split a task file into (frontmatter dict, body). Flat key: value only."""
     text = path.read_text()
@@ -201,7 +229,7 @@ def parse_task(path):
         if not line or line.startswith("#") or ":" not in line:
             continue
         key, value = line.split(":", 1)
-        meta[key.strip()] = value.strip().strip("\"'")
+        meta[key.strip()] = unquote(value.strip())
     return meta, match.group(2)
 
 
@@ -255,18 +283,120 @@ def extract_criteria(body):
     return match.group(1).strip() if match else None
 
 
-def validate_task(meta, body):
+VALUE_CLASSES = ("deliverable", "research", "verification", "admin")
+SCHEDULE_FORMS = "every 30m|6h|2d (any number), daily at 06:30, weekly on mon at 09:00"
+
+
+def _whole_number(minimum):
+    def check(value):
+        try:
+            number = int(value)
+        except ValueError:
+            return "must be an integer"
+        return None if number >= minimum else f"must be at least {minimum}"
+    return check
+
+
+def _positive_number(value):
+    try:
+        number = float(value)
+    except ValueError:
+        return "must be a number"
+    return None if number > 0 else "must be greater than 0"
+
+
+# Every frontmatter key a task file may carry: (required, only on recurring
+# templates, rule). A rule is None (any text), a tuple of allowed values, or a
+# function returning a problem string (None when the value is fine).
+FRONTMATTER_KEYS = {
+    "model": (True, False, None),
+    "review_model": (True, False, None),
+    "max_attempts": (True, False, _whole_number(1)),
+    "escalation_model": (False, False, None),
+    "attempts": (False, False, _whole_number(0)),  # managed by the dispatcher
+    "timeout_minutes": (False, False, _positive_number),
+    "allowed_tools": (False, False, None),
+    "mcp_config": (False, False, None),
+    "depends_on": (False, False, None),
+    "cwd": (False, False, None),
+    "deliver": (False, False, None),
+    "verify": (False, False, None),  # checked by verify_problem()
+    "review": (False, False, ("skip",)),
+    "value_class": (False, False, VALUE_CLASSES),  # may be absent: older files read as untagged
+    "pending_review": (False, False, None),  # managed by the dispatcher
+    "review_failures": (False, False, None),  # managed by the dispatcher
+    "schedule": (False, True, None),  # checked by check_schedule()
+    "last_run": (False, True, None),  # managed by the dispatcher
+}
+
+
+def verify_prefixes():
+    raw = cfg("VERIFY_ALLOWED_PREFIXES", "python3 -m unittest,pytest,bash scripts/verify-")
+    return [prefix.strip() for prefix in raw.split(",") if prefix.strip()]
+
+
+def verify_problem(command):
+    """Why a `verify:` command may not run (None when it may). No shell is involved: the command is split with shlex.
+
+    An allowed prefix is compared token by token. Its last token must match
+    exactly, unless it ends in "-" or "/": then it is the start of a token
+    (so `scripts/verify-` allows `scripts/verify-x.sh`, but `pytest` does not
+    allow `pytest-evil`).
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError as exc:
+        return f"verify command cannot be parsed ({exc})"
+    if not tokens:
+        return "verify command is empty"
+    for prefix in verify_prefixes():
+        head = shlex.split(prefix)
+        if len(tokens) < len(head) or tokens[:len(head) - 1] != head[:-1]:
+            continue
+        last, wanted = tokens[len(head) - 1], head[-1]
+        if last == wanted or (wanted.endswith(("-", "/")) and last.startswith(wanted)):
+            return None
+    return (
+        f"verify command {command!r} does not start with an allowed prefix "
+        f"(VERIFY_ALLOWED_PREFIXES: {', '.join(verify_prefixes()) or 'none'})"
+    )
+
+
+def check_schedule(spec):
+    """Raise ValueError unless `spec` is a schedule is_due() understands."""
+    is_due(spec, None, datetime.now())
+
+
+def frontmatter_problems(meta, template):
+    problems = []
+    for key, value in meta.items():
+        if key not in FRONTMATTER_KEYS:
+            hint = difflib.get_close_matches(key, FRONTMATTER_KEYS, n=1)
+            problems.append(
+                f"unknown frontmatter key '{key}'" + (f" (did you mean '{hint[0]}'?)" if hint else "")
+            )
+            continue
+        required, template_only, rule = FRONTMATTER_KEYS[key]
+        if template_only and not template:
+            problems.append(f"'{key}' only belongs in tasks/recurring/ templates")
+        if not value or rule is None:
+            continue
+        if isinstance(rule, tuple):
+            if value not in rule:
+                problems.append(f"{key} must be one of {', '.join(rule)} (got '{value}')")
+        elif (message := rule(value)) is not None:
+            problems.append(f"{key} {message}")
+    for key, (required, template_only, _) in FRONTMATTER_KEYS.items():
+        if required and not meta.get(key):
+            problems.append(f"frontmatter is missing required key '{key}'")
+    return problems
+
+
+def validate_task(meta, body, template=False):
     problems = []
     if meta is None:
         return ["missing YAML frontmatter (--- block at top of file)"]
-    for key in ("model", "review_model", "max_attempts"):
-        if not meta.get(key):
-            problems.append(f"frontmatter is missing required key '{key}'")
-    if meta.get("max_attempts"):
-        try:
-            int(meta["max_attempts"])
-        except ValueError:
-            problems.append("max_attempts must be an integer")
+    problems += frontmatter_problems(meta, template)
     if extract_criteria(body) is None:
         problems.append("no '## Acceptance Criteria' section in task body")
     mcp = mcp_config_path(meta)
@@ -276,6 +406,18 @@ def validate_task(meta, body):
     for ref in deliver_refs(meta):  # a clear reject before any claude call; symlinks are checked on delivery
         if not Path(os.path.normpath(os.path.join(cwd, ref))).is_relative_to(cwd):
             problems.append(f"deliver path '{ref}' is outside the task's cwd")
+    if meta.get("verify") and (problem := verify_problem(meta["verify"])):
+        problems.append(problem)
+    if meta.get("review") == "skip" and not meta.get("verify"):
+        problems.append("review: skip needs a verify command; nothing else would check the result")
+    if template:
+        if not meta.get("schedule"):
+            problems.append("recurring template has no 'schedule' key")
+        else:
+            try:
+                check_schedule(meta["schedule"])
+            except ValueError as exc:
+                problems.append(f"{exc}; supported: {SCHEDULE_FORMS}")
     return problems
 
 
@@ -926,7 +1068,8 @@ def is_due(spec, last_run, now):
     """True when a recurring schedule should fire. All times are server-local.
 
     Supported specs: "every 30m|6h|2d", "daily at 06:30",
-    "weekly on mon at 09:00". Raises ValueError on anything else.
+    "weekly on mon at 09:00" (see SCHEDULE_FORMS). Raises ValueError on anything
+    else, which is how check_schedule() tells a template's schedule is bad.
     """
     spec = spec.strip()
     match = re.fullmatch(r"every\s+(\d+)\s*(m|h|d)", spec, re.I)
@@ -957,8 +1100,17 @@ def spawn_recurring():
     now = datetime.now()
     for template in sorted(RECURRING.glob("*.md")):
         meta, body = parse_task(template)
-        if meta is None or not meta.get("schedule"):
-            log.warning("Recurring template %s has no 'schedule' key; skipping", template.name)
+        schedule_key = f"schedule|tasks/recurring/{template.name}"
+        problems = validate_task(meta, body, template=True)
+        if problems:  # said once per distinct set of problems; the template stays put so it can be fixed in place
+            report_once(
+                schedule_key, "\n".join(problems),
+                f"Recurring template {template.name} is invalid: {'; '.join(problems)}",
+                f"⚠️ Recurring task not scheduled: {template.name}\n"
+                + "\n".join(f"- {problem}" for problem in problems)
+                + "\nIt will not run until the template is fixed; this is the only notice.",
+                level=logging.ERROR,
+            )
             continue
         last_run = None
         if meta.get("last_run"):
@@ -967,19 +1119,7 @@ def spawn_recurring():
             except ValueError:
                 log.warning("Recurring template %s has malformed last_run %r; treating as never run",
                             template.name, meta["last_run"])
-        schedule_key = f"schedule|tasks/recurring/{template.name}"
-        try:
-            due = is_due(meta["schedule"], last_run, now)
-        except ValueError as exc:
-            report_once(
-                schedule_key, meta["schedule"],
-                f"Recurring template {template.name}: {exc}",
-                f"⚠️ Recurring task not scheduled: {template.name}\n{exc}\n"
-                "Supported: every 30m|6h|2d, daily at 06:30, weekly on mon at 09:00. "
-                "It will not run until the schedule line is fixed; this is the only notice.",
-                level=logging.ERROR,
-            )
-            continue
+        due = is_due(meta["schedule"], last_run, now)
         clear_reported(schedule_key)
         if not due:
             continue
@@ -1353,6 +1493,114 @@ def denial_notice(denials):
     return f"⚠️ Permission denied, so these never ran: {', '.join(shown[:5])}{more}"
 
 
+VERIFY_TAIL_CHARS = 3000  # how much of a verify command's output goes to feedback and the reviewer
+VERIFY_READ_BYTES = 64 * 1024  # and how much of its log file is read back to find that tail
+
+VERIFICATION_BLOCK = """
+## Mechanical Verification
+After the worker finished, the dispatcher itself ran `{command}` in the working \
+directory. It exited 0. The end of its output:
+```
+{output}
+```
+"""
+
+
+class VerifyResult(NamedTuple):
+    command: str
+    exit_code: int | None  # None when the command never started or was stopped
+    output: str  # the tail of what it printed (stdout and stderr together)
+    problem: str  # empty when it exited 0; otherwise why the attempt fails
+
+
+def verify_env(cwd):
+    """The only environment a verify command sees: no tokens, no inherited variables."""
+    path = os.pathsep.join([str(Path(sys.executable).parent), "/usr/local/bin", "/usr/bin", "/bin"])
+    return {"PATH": path, "HOME": cwd, "LC_ALL": "C.UTF-8"}
+
+
+def run_verify(command, cwd, timeout_s, output_path, transcript):
+    """Run a task's `verify:` command the way validate_task allowed it: split with shlex, no shell, scrubbed env.
+
+    The output is written to `output_path`, and only its tail is read back.
+    """
+    refusal = verify_problem(command)  # validate_task checked already; a file edited since must not slip through
+    if refusal:
+        return VerifyResult(command, None, "", f"Verification not run: {refusal}.")
+    append_transcript(transcript, f"\n=== verify @ {now_iso()} ===\n$ {command}")
+    timed_out = False
+    with open(output_path, "wb") as out:
+        try:
+            proc = subprocess.Popen(
+                shlex.split(command), cwd=cwd, env=verify_env(cwd), stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+            )
+        except OSError as exc:
+            return VerifyResult(command, None, "", f"Verification could not start `{command}`: {exc}.")
+        try:
+            code = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            code = proc.wait()
+    with open(output_path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, fh.tell() - VERIFY_READ_BYTES))
+        output = tail(fh.read().decode(errors="replace"), VERIFY_TAIL_CHARS)
+    append_transcript(transcript, f"[verify output]\n{output}\n[verify {'TIMED OUT' if timed_out else f'exit {code}'}]")
+    if timed_out:
+        problem = f"Verification stopped: `{command}` did not finish within {timeout_s / 60:g} minutes."
+    elif code != 0:
+        problem = f"Verification failed: the dispatcher ran `{command}` after your attempt and it exited {code}."
+    else:
+        problem = ""
+    return VerifyResult(command, None if timed_out else code, output, problem)
+
+
+def verify_feedback(result):
+    return f"{result.problem}\nFix what it reports. The end of its output:\n```\n{result.output or '(no output)'}\n```"
+
+
+def check_file(arg):
+    """Validate one task or recurring template file. Returns (ok, message); the coordinator runs this after writing a file."""
+    path = Path(arg)
+    if not path.is_file():
+        return False, f"{arg}: no such file"
+    meta, body = parse_task(path)
+    problems = validate_task(meta, body, template=path.resolve().parent.name == "recurring")
+    if problems:
+        return False, f"{path.name} is invalid:\n" + "\n".join(f"- {p}" for p in problems)
+    return True, f"{path.name}: OK"
+
+
+def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False):
+    """A task passed: record the result, move it to done/ and tell the user."""
+    name = path.name
+    result = worker_out.strip()
+    if verified:
+        result += (
+            f"\n\nVerified by the dispatcher: `{verified.command}` exited 0.\n"
+            f"```\n{verified.output or '(no output)'}\n```"
+        )
+    body = body.rstrip("\n") + f"\n\n## Result (attempt {attempts}, {now_iso()})\n\n{result}\n"
+    write_task(path, meta, body)
+    shutil.move(str(path), str(DONE / name))
+    log.info("Task %s PASSED%s on attempt %d/%d; moved to done/", name,
+             " verification (review skipped)" if skipped else " review", attempts, max_attempts)
+    lines = [f"✅ Task done: {name} (attempt {attempts}/{max_attempts})"]
+    if verified:
+        lines.append(f"Verified by `{verified.command}` (exit 0)" + ("; review skipped" if skipped else ""))
+    if notice := denial_notice(denials):
+        lines.append(notice)
+    files, notes = collect_deliverables(meta, cwd)
+    send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem)
+    if notes:
+        send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
+
+
 def process_task(path):
     name = path.name
     meta, body = parse_task(path)
@@ -1435,13 +1683,33 @@ def process_task(path):
             return
         worker_out, denials = reply.text, reply.envelope.get("permission_denials") or []
 
+    verified, verification = None, ""
+    if meta.get("verify"):
+        verify_timeout = float(cfg("VERIFY_TIMEOUT_MINUTES", "10")) * 60
+        verified = run_verify(
+            meta["verify"], cwd, verify_timeout, LOGS / f"{path.stem}.attempt-{attempts}.verify.log", transcript
+        )
+        if verified.problem:  # a bad attempt costs the worker call only: no review call is made
+            meta.pop("pending_review", None)
+            meta.pop("review_failures", None)
+            handle_failure(path, meta, body, attempts, max_attempts, verify_feedback(verified))
+            return
+        if meta.get("review") == "skip":
+            meta.pop("pending_review", None)
+            meta.pop("review_failures", None)
+            finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped=True)
+            return
+        verification = VERIFICATION_BLOCK.format(command=verified.command, output=verified.output or "(no output)")
+
     review_cmd = [
         claude_bin, "-p",
         "--model", meta["review_model"],
         "--allowedTools", "Read,Glob,Grep",
         "--output-format", "json",
     ]
-    review_prompt = REVIEW_TEMPLATE.format(criteria=extract_criteria(body), output=tail(worker_out, 20000))
+    review_prompt = REVIEW_TEMPLATE.format(
+        criteria=extract_criteria(body), verification=verification, output=tail(worker_out, 20000)
+    )
     review_timeout = float(cfg("REVIEW_TIMEOUT_MINUTES", "10")) * 60
     try:
         review_out = run_claude(review_cmd, review_prompt, review_timeout, cwd, transcript, "review").text
@@ -1476,18 +1744,7 @@ def process_task(path):
     meta.pop("review_failures", None)
     verdict, feedback = parse_verdict(review_out)
     if verdict == "PASS":
-        body = body.rstrip("\n") + f"\n\n## Result (attempt {attempts}, {now_iso()})\n\n{worker_out.strip()}\n"
-        write_task(path, meta, body)
-        shutil.move(str(path), str(DONE / name))
-        log.info("Task %s PASSED review on attempt %d/%d; moved to done/", name, attempts, max_attempts)
-        notice = denial_notice(denials)
-        files, notes = collect_deliverables(meta, cwd)
-        send_report(
-            f"✅ Task done: {name} (attempt {attempts}/{max_attempts})" + (f"\n{notice}" if notice else ""),
-            worker_out.strip(), files=files, task_id=path.stem,
-        )
-        if notes:
-            send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
+        finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified)
     else:
         handle_failure(path, meta, body, attempts, max_attempts, feedback)
 
@@ -1533,7 +1790,7 @@ def main():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        actions = {"cancel": cancel_task, "retry": retry_task}
+        actions = {"cancel": cancel_task, "retry": retry_task, "check": check_file}
         if sys.argv[1] in actions and len(sys.argv) == 3:
             ok, message = actions[sys.argv[1]](sys.argv[2])
             print(message)
@@ -1544,6 +1801,7 @@ if __name__ == "__main__":
             "Usage: dispatcher.py                   run one queue cycle\n"
             "       dispatcher.py cancel <task-id>  archive a queued task to tasks/cancelled/\n"
             "       dispatcher.py retry <task-id>   requeue a failed/cancelled task, attempts reset\n"
+            "       dispatcher.py check <file>      validate a task or recurring template file\n"
             "       dispatcher.py usage             claude calls, cost and turns by day and model",
             file=sys.stderr,
         )

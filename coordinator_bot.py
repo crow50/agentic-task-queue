@@ -179,7 +179,8 @@ def default_allowed_tools():
         f"Read,Glob,Grep,Write(/{tasks}/**),Edit(/{tasks}/**),"
         f"Write(/{memory}/**),Edit(/{memory}/**),"
         f"Bash(python3 {BASE}/dispatcher.py cancel:*),"
-        f"Bash(python3 {BASE}/dispatcher.py retry:*)"
+        f"Bash(python3 {BASE}/dispatcher.py retry:*),"
+        f"Bash(python3 {BASE}/dispatcher.py check:*)"
     )
 
 
