@@ -13,7 +13,9 @@ spawn one-shot instances into pending/ whenever they come due.
 A usage limit pauses the whole queue (state/paused_until), an expired login
 stops it (state/auth_failed) until a cheap probe call works again, and a
 review that cannot run keeps the worker's finished report instead of
-discarding it. Libraries: tenacity (retries) and filelock (shared logs);
+discarding it. Reports too long for one message go out as a preview plus the
+full text as an attachment, and a task's `deliver:` files are sent as documents.
+Libraries: tenacity (retries), filelock (shared logs) and httpx (uploads);
 install them with `pip install --require-hashes -r requirements.txt` in a venv.
 
 Usage: python3 dispatcher.py                   (typically from cron every 15 minutes)
@@ -36,7 +38,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -44,6 +46,7 @@ from zoneinfo import ZoneInfo
 
 try:
     import filelock
+    import httpx
     import tenacity
 except ImportError as exc:  # cron has no terminal: say what to do in the one place it will be seen
     sys.exit(
@@ -80,6 +83,8 @@ PAUSE_BUFFER_S = 60  # past a stated reset time, so we don't wake up a moment ea
 MAX_RESET_WAIT = timedelta(days=8)  # a "reset time" further out than the weekly window is not one
 MAX_REVIEW_RETRIES = 3  # reviews that error or time out are retried this often, then charged
 PROBE_PROMPT = "Reply with the single word OK."
+REPORT_INLINE_MAX = 3500  # a longer report goes out as a short preview plus an attachment
+TELEGRAM_FILE_MAX = 50 * 1024 * 1024  # the Bot API refuses uploads above 50 MB
 
 WORKER_PREAMBLE = """\
 You are running unattended inside an automated task queue. Complete the task \
@@ -89,6 +94,8 @@ previous failed attempts; address every point before finishing.
 - Work in the current directory unless the task says otherwise.
 - When you are done, print a concise report of what you did, the files you \
 created or changed (with paths), and how each acceptance criterion is met.
+- The reader sees only Telegram. Never write "see file X" unless X is listed in \
+the task's `deliver:` line, and paste what matters inline in your report.
 """
 
 REVIEW_TEMPLATE = """\
@@ -212,6 +219,35 @@ def mcp_config_path(meta):
     return path if path.is_absolute() else BASE / path
 
 
+def task_cwd(meta):
+    return meta.get("cwd") or cfg("DEFAULT_CWD") or str(BASE / "workspace")
+
+
+def deliver_refs(meta):
+    """The paths in a task's `deliver:` line (comma separated, relative to its cwd)."""
+    return [ref.strip() for ref in (meta.get("deliver") or "").split(",") if ref.strip()]
+
+
+def collect_deliverables(meta, cwd):
+    """(files to send, notes on those skipped) for a passed task's `deliver:` line.
+
+    Paths are resolved first, so a symlink or `..` cannot reach outside cwd.
+    """
+    root = Path(cwd).resolve()
+    files, notes = [], []
+    for ref in deliver_refs(meta):
+        path = (root / ref).resolve()
+        if not path.is_relative_to(root):
+            notes.append(f"{ref}: outside the working directory, not sent")
+        elif not path.is_file():
+            notes.append(f"{ref}: not found")
+        elif path.stat().st_size > TELEGRAM_FILE_MAX:
+            notes.append(f"{ref}: over Telegram's 50 MB limit, not sent")
+        elif path not in files:
+            files.append(path)
+    return files, notes
+
+
 def extract_criteria(body):
     match = re.search(
         r"^##\s*Acceptance Criteria\s*\n(.*?)(?=^##\s|\Z)", body, re.S | re.M
@@ -236,6 +272,10 @@ def validate_task(meta, body):
     mcp = mcp_config_path(meta)
     if mcp is not None and not mcp.is_file():
         problems.append(f"mcp_config file not found: {mcp}")
+    cwd = os.path.normpath(task_cwd(meta))
+    for ref in deliver_refs(meta):  # a clear reject before any claude call; symlinks are checked on delivery
+        if not Path(os.path.normpath(os.path.join(cwd, ref))).is_relative_to(cwd):
+            problems.append(f"deliver path '{ref}' is outside the task's cwd")
     return problems
 
 
@@ -488,31 +528,22 @@ def md_to_telegram_html(text):
     return re.sub(r"\x00(\d+)\x00", lambda m: stashed[int(m.group(1))], text)
 
 
-def truncate_for_telegram(text):
-    """Fit text into one Telegram message, cutting on a line break with a marker."""
-    if len(text) <= TELEGRAM_MAX:
-        return text
-    marker = "\n\n[… truncated — full report is in the task file]"
-    text = text[: TELEGRAM_MAX - len(marker)]
-    cut = text.rfind("\n")
-    if cut > TELEGRAM_MAX // 2:
-        text = text[:cut]
-    return text + marker
-
-
 def telegram_url(method):
     """Bot API URL for a method. TELEGRAM_API_BASE lets tests point at a local fake."""
     base = cfg("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
     return f"{base}/bot{cfg('TELEGRAM_BOT_TOKEN')}/{method}"
 
 
-def send_telegram(text):
-    token = cfg("TELEGRAM_BOT_TOKEN")
+def telegram_configured():
+    if cfg("TELEGRAM_BOT_TOKEN") and cfg("TELEGRAM_CHAT_ID"):
+        return True
+    log.warning("Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID); skipping notification")
+    return False
+
+
+def post_message(raw):
+    """sendMessage as HTML, or as plain text when Telegram returns 400. True once it was sent."""
     chat_id = cfg("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        log.warning("Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID); skipping notification")
-        return
-    raw = truncate_for_telegram(text)
     variants = (
         {"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"},
         {"chat_id": chat_id, "text": raw},
@@ -522,16 +553,80 @@ def send_telegram(text):
         try:
             urllib.request.urlopen(telegram_url("sendMessage"), data, timeout=30)
             log.info("Telegram notification sent")
-            return
+            return True
         except urllib.error.HTTPError as exc:
             if formatted and exc.code == 400:  # bad entities — resend unformatted
                 log.warning("Telegram rejected HTML formatting; resending as plain text")
                 continue
             log.warning("Telegram notification failed: %s", exc)
-            return
+            return False
         except Exception as exc:  # notification failure must never fail the task
             log.warning("Telegram notification failed: %s", exc)
-            return
+            return False
+    return False
+
+
+def post_document(name, source):
+    """sendDocument with `source` (bytes, or a Path streamed from disk). True once it was sent."""
+    try:
+        with ExitStack() as stack:
+            content = source if isinstance(source, bytes) else stack.enter_context(source.open("rb"))
+            reply = httpx.post(
+                telegram_url("sendDocument"), data={"chat_id": cfg("TELEGRAM_CHAT_ID")},
+                files={"document": (name, content)}, timeout=120,
+            )
+        reply.raise_for_status()
+    except (httpx.HTTPError, OSError) as exc:
+        # httpx puts the request URL, which contains the bot token, in its messages: log only the cause.
+        cause = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+        log.warning("Telegram document %s failed: %s", name, cause)
+        return False
+    log.info("Telegram document %s sent", name)
+    return True
+
+
+def fit_preview(prefix, text, suffix):
+    """prefix + the start of text + suffix, cut at a line break so the HTML form fits one message.
+
+    The raw text is cut first and converted second: HTML escaping makes it longer.
+    """
+    size = max(0, min(len(text), REPORT_INLINE_MAX - len(prefix) - len(suffix)))
+    while True:
+        piece = text[:size]
+        cut = piece.rfind("\n")
+        if cut > size // 2:
+            piece = piece[:cut]
+        message = prefix + piece.rstrip() + suffix
+        if size == 0 or len(md_to_telegram_html(message)) <= TELEGRAM_MAX:
+            return message
+        size = int(size * 0.8)
+
+
+def send_report(title, text, files=(), task_id="report"):
+    """Tell the user something. A long `text` becomes a preview plus `<task_id>.md`; `files` follow as documents.
+
+    The one way the dispatcher sends done, failed and dependency notices, so
+    nothing depends on a path only the machine running the queue can see.
+    """
+    if not telegram_configured():
+        return
+    body = f"{title}\n\n{text}" if title and text else title or text
+    attachments = []
+    if len(body) <= REPORT_INLINE_MAX and len(md_to_telegram_html(body)) <= TELEGRAM_MAX:
+        post_message(body)
+    else:
+        name = f"{task_id}.md"
+        prefix = f"{title}\n\n" if title else ""
+        post_message(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"))
+        attachments.append((f"the full report ({name})", name, text.encode()))
+    attachments += [(path.name, path.name, path) for path in map(Path, files)]
+    for label, name, source in attachments:
+        if not post_document(name, source):
+            post_message(f"⚠️ Couldn't attach {label}: Telegram refused the upload.")
+
+
+def send_telegram(text):
+    send_report("", text)
 
 
 # ---------------------------------------------------------------- limits, login, once-only reports
@@ -1100,7 +1195,10 @@ def cascade_dependency_failure(path, failed_dep):
     write_task(path, meta or {}, body)
     shutil.move(str(path), str(FAILED / path.name))
     log.error("Task %s cascaded to failed/: its dependency %s failed permanently", path.name, failed_dep)
-    send_telegram(f"❌ Task not run: {path.name}\nIts dependency '{failed_dep}' failed permanently.")
+    send_report(
+        f"❌ Task not run: {path.name}\nIts dependency '{failed_dep}' failed permanently.", "",
+        task_id=path.stem,
+    )
 
 
 def pick_task():
@@ -1163,8 +1261,9 @@ def handle_failure(path, meta, body, attempts, max_attempts, feedback):
     if attempts >= max_attempts:
         shutil.move(str(path), str(FAILED / path.name))
         log.error("Task %s FAILED permanently after %d/%d attempts", path.name, attempts, max_attempts)
-        send_telegram(
-            f"❌ Task failed: {path.name}\nExhausted {max_attempts} attempts. Last feedback:\n{feedback}"
+        send_report(
+            f"❌ Task failed: {path.name}\nExhausted {max_attempts} attempts. Last feedback:", feedback,
+            task_id=path.stem,
         )
     else:
         shutil.move(str(path), str(PENDING / path.name))
@@ -1265,7 +1364,7 @@ def process_task(path):
         body = body.rstrip("\n") + f"\n\n## Invalid Task ({now_iso()})\n\n{detail}\n"
         write_task(path, meta or {}, body)
         shutil.move(str(path), str(FAILED / name))
-        send_telegram(f"❌ Task rejected as invalid: {name}\n{detail}")
+        send_report(f"❌ Task rejected as invalid: {name}", detail, task_id=path.stem)
         return
 
     claude_bin = resolve_claude_bin()
@@ -1284,7 +1383,7 @@ def process_task(path):
     write_task(path, meta, body)
 
     timeout_min = float(meta.get("timeout_minutes") or cfg("DEFAULT_TIMEOUT_MINUTES", "30"))
-    cwd = meta.get("cwd") or cfg("DEFAULT_CWD") or str(BASE / "workspace")
+    cwd = task_cwd(meta)
     Path(cwd).mkdir(parents=True, exist_ok=True)
     transcript = LOGS / f"{path.stem}.attempt-{attempts}.log"
 
@@ -1382,11 +1481,13 @@ def process_task(path):
         shutil.move(str(path), str(DONE / name))
         log.info("Task %s PASSED review on attempt %d/%d; moved to done/", name, attempts, max_attempts)
         notice = denial_notice(denials)
-        send_telegram(
-            f"✅ Task done: {name} (attempt {attempts}/{max_attempts})"
-            + (f"\n{notice}" if notice else "")
-            + f"\n\n{worker_out.strip()}"
+        files, notes = collect_deliverables(meta, cwd)
+        send_report(
+            f"✅ Task done: {name} (attempt {attempts}/{max_attempts})" + (f"\n{notice}" if notice else ""),
+            worker_out.strip(), files=files, task_id=path.stem,
         )
+        if notes:
+            send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
     else:
         handle_failure(path, meta, body, attempts, max_attempts, feedback)
 
@@ -1403,6 +1504,8 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.FileHandler(LOGS / "dispatcher.log"), logging.StreamHandler(sys.stdout)],
     )
+    for noisy in ("httpx", "httpcore"):  # httpx logs each request URL at INFO, and Telegram's contains the bot token
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     lock = open(LOCKFILE, "w")
     try:
