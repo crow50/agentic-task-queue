@@ -173,6 +173,26 @@ class LongReportTests(DeliveryCase):
         self.assertNotIn("tasks/", texts[1])
 
 
+class TokenLeakTests(DeliveryCase):
+    """httpx logs every request URL at INFO, and the Bot API URL contains the token."""
+
+    def assert_token_not_logged(self, proc):
+        written = (self.sb.base / "logs" / "dispatcher.log").read_text() + proc.stdout + proc.stderr
+        self.assertIn("Telegram document", written)  # the upload really happened and was logged
+        self.assertNotIn("test-token", written)
+
+    def test_the_bot_token_is_not_logged_by_a_successful_upload(self):
+        self.sb.set_scenario(worker=[{"result": long_report(10_000)}], review=[PASS])
+        self.sb.add_task("t")
+        self.assert_token_not_logged(self.sb.run())
+
+    def test_the_bot_token_is_not_logged_by_a_failed_upload(self):
+        self.sb.telegram.queue_response("sendDocument", status=500)
+        self.sb.set_scenario(worker=[{"result": long_report(10_000)}], review=[PASS])
+        self.sb.add_task("t")
+        self.assert_token_not_logged(self.sb.run())
+
+
 class ShortReportTests(DeliveryCase):
     def test_a_2000_character_report_is_one_message_and_no_document(self):
         report = long_report(2_000)

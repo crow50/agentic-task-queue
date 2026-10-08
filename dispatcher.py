@@ -1504,6 +1504,8 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.FileHandler(LOGS / "dispatcher.log"), logging.StreamHandler(sys.stdout)],
     )
+    for noisy in ("httpx", "httpcore"):  # httpx logs each request URL at INFO, and Telegram's contains the bot token
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     lock = open(LOCKFILE, "w")
     try:
