@@ -102,6 +102,9 @@ mcp_config: mcp/fetch.json                    # optional MCP servers JSON (defau
 depends_on: setup-task, fetch-data            # optional: run only after these tasks are done
 cwd: /home/you/project                        # optional working dir (default: workspace/)
 deliver: reports/a.md, out/b.csv             # optional: files sent to Telegram as documents once the task passes
+verify: bash scripts/verify-a.sh              # optional: a command the dispatcher runs itself after the worker (see below)
+review: skip                                  # optional: with verify, end the task on exit 0 without a reviewer call
+value_class: deliverable                      # optional: deliverable, research, verification or admin
 attempts: 0                                   # managed by the dispatcher
 ---
 # Task title
@@ -119,7 +122,45 @@ and requeues it, so the next attempt sees exactly what the reviewer flagged.
 On success the worker's report is appended as `## Result`.
 
 Tasks missing required keys or the acceptance-criteria section are moved
-straight to `failed/` with a note explaining why.
+straight to `failed/` with a note explaining why. So are tasks with a key
+the dispatcher does not know (the note names it and suggests the nearest
+known key, which catches `valeu_class`) or a value outside its allowed set.
+`python3 dispatcher.py check <file>` runs the same validation on one task or
+recurring template file and prints what is wrong; the coordinator runs it
+after writing a file.
+
+### Verifying with a command
+
+The reviewer can only read files, so it cannot confirm what the worker ran.
+A task can name a command the dispatcher runs itself instead:
+
+```yaml
+verify: python3 -m unittest discover -s tests
+review: skip       # optional
+```
+
+After the worker finishes, the dispatcher runs the command in the task's
+`cwd`. Exit 0 is a mechanical pass, and the end of its output goes to the
+reviewer as evidence. A non-zero exit, a timeout or a command that cannot
+start fails the attempt without calling the reviewer, and the end of its
+output is the feedback for the next attempt. With `review: skip` (valid
+only together with `verify:`), exit 0 ends the task as done with no reviewer
+call, for tasks whose criteria are all mechanical. The command's output is
+kept in `logs/<task>.attempt-<N>.verify.log`.
+
+The command runs without a shell (split with `shlex`, so no `&&`, pipes or
+redirects), with a minimal environment (`PATH`, `HOME`, `LC_ALL` only) and a
+timeout (`VERIFY_TIMEOUT_MINUTES`, default 10). It must start with one of the
+prefixes in `VERIFY_ALLOWED_PREFIXES` (default `python3 -m unittest`,
+`pytest`, `bash scripts/verify-`); otherwise the task goes straight to
+`failed/` and the command never runs. See the security notes: the allowed
+commands still run files the worker may have written.
+
+The worker is also told what the reviewer can and cannot see: no shell,
+GitHub CLI or network, so it pastes raw output for each verification step
+and the URL and rendered body of any issue or PR it creates. The reviewer
+treats pasted output as evidence and fails a criterion only when the
+evidence is missing or contradictory.
 
 ### Reports and files in Telegram
 
@@ -182,6 +223,13 @@ schedule: daily at 06:30
 schedule: weekly on mon at 09:00
 ```
 
+There is no monthly form; those are the only three. A template whose
+schedule is anything else (for instance `monthly on the 1st at 08:00`), or
+that has an unknown key or any other problem a task would be rejected for,
+never spawns. The dispatcher reports it once on Telegram and in the log, and
+says nothing more until the template changes. `dispatcher.py check <file>`
+reports the same problems when the file is written.
+
 Details:
 
 - The dispatcher writes a `last_run` timestamp back into the template after
@@ -192,8 +240,8 @@ Details:
   clears, and misses in between collapse into a single catch-up instance.
 - A failed instance lands in `failed/` like any task, and the schedule keeps
   firing on its next due date regardless.
-- Templates with a missing or unparseable `schedule` are skipped with an
-  error in the log.
+- Templates that fail validation (missing or unparseable `schedule`, unknown
+  key, and so on) are skipped, with one notice as described above.
 
 ## Giving tasks MCP access
 
@@ -404,6 +452,13 @@ credentials).
   list deliberately excludes unrestricted `Bash` — grant narrow patterns per
   task (e.g. `Bash(python3 *)`, `Bash(git *)`) instead of blanket shell
   access.
+- `verify:` commands run with the dispatcher's own privileges, outside
+  claude's tool allowlist. The prefix allowlist, the missing shell, the
+  scrubbed environment and the timeout stop a task from naming an arbitrary
+  command, but `python3 -m unittest`, `pytest` and `bash scripts/verify-*`
+  execute files in the task's `cwd` that the worker may have written, and a
+  scrubbed environment does not hide files such as `.env`. Keep
+  `VERIFY_ALLOWED_PREFIXES` short, and run the queue as a dedicated user.
 - The reviewer runs with read-only tools (`Read,Glob,Grep`) in the task's
   working directory so it can verify claims against real files.
 - `.env` holds your Telegram token; it is gitignored — keep it that way and
