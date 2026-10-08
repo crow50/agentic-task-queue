@@ -8,8 +8,9 @@ model review the result against the task's acceptance criteria, retries with
 feedback (escalating to a stronger model) when the review fails, and pings you
 on Telegram when the task lands in `done/` or `failed/`.
 
-One script (`dispatcher.py`), one config file (`.env`), two small pinned
-libraries (`tenacity` for retries, `filelock` for the shared logs) installed
+One script (`dispatcher.py`), one config file (`.env`), three small pinned
+libraries (`tenacity` for retries, `filelock` for the shared logs, `httpx` for
+Telegram file uploads) installed
 into a venv (see Setup). Recurring tasks are supported via schedule templates
 in `tasks/recurring/` (see below).
 
@@ -100,6 +101,7 @@ allowed_tools: Read,Glob,Grep,Edit,Write      # optional (default from .env)
 mcp_config: mcp/fetch.json                    # optional MCP servers JSON (default from .env)
 depends_on: setup-task, fetch-data            # optional: run only after these tasks are done
 cwd: /home/you/project                        # optional working dir (default: workspace/)
+deliver: reports/a.md, out/b.csv             # optional: files sent to Telegram as documents once the task passes
 attempts: 0                                   # managed by the dispatcher
 ---
 # Task title
@@ -118,6 +120,18 @@ On success the worker's report is appended as `## Result`.
 
 Tasks missing required keys or the acceptance-criteria section are moved
 straight to `failed/` with a note explaining why.
+
+### Reports and files in Telegram
+
+Everything you read arrives in Telegram, so nothing points at a path on the
+queue's machine. A done, failed or dependency notice up to about 3,500
+characters is one message. A longer one is a short preview plus the full text
+as `<task-id>.md`. Files named in `deliver:` (comma separated, relative to the
+task's `cwd`) are sent as documents after a pass. A path that resolves outside
+`cwd`, by `..` or a symlink, is refused, and a file over Telegram's 50 MB bot
+limit is skipped with a note. Write acceptance criteria about the file ("the
+report is saved to `reports/a.md` and listed in `deliver:`"), not about the
+worker's final reply.
 
 ### Task dependencies
 

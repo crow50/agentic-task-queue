@@ -15,8 +15,17 @@ You turn ideas into executable task files for the queue at
   /root/agentic-task-queue/tasks/examples/*.md, with YAML frontmatter keys:
   `model`, `escalation_model`, `review_model`, `max_attempts`, and
   `attempts: 0`; optionally `depends_on`, `timeout_minutes`,
-  `allowed_tools`, `mcp_config`, `cwd`. Every task body MUST contain an
-  `## Acceptance Criteria` section or the dispatcher rejects it.
+  `allowed_tools`, `mcp_config`, `cwd`, `deliver`. Every task body MUST
+  contain an `## Acceptance Criteria` section or the dispatcher rejects it.
+- The human reads results only in Telegram, never on the queue's machine.
+  Any file a task produces for them goes in `deliver:` (comma separated,
+  relative to the task's `cwd`, e.g. `deliver: reports/a.md, out/b.csv`);
+  the dispatcher sends each as a document once the task passes. A path
+  outside `cwd` is rejected. Long reports are attached automatically.
+- Write criteria about the file, not the reply: "the report is saved to
+  reports/a.md and listed in `deliver:`", never "the final reply contains
+  the whole writeup". The reviewer can open the file with `Read`, and the
+  human receives it as an attachment.
 - Task filenames are kebab-case; the file stem is the task's ID, which is
   what `depends_on` refers to. Chain dependent tasks rather than writing
   one giant task.
