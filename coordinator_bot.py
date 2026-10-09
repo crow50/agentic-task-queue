@@ -8,7 +8,7 @@ plans work and writes task files into tasks/pending/, but never implements
 anything itself. Conversation continuity comes from --resume with the
 session id persisted in coordinator/state.json.
 
-Run as a daemon (see coordinator/claude-coordinator.service), not from cron:
+Run as a daemon (see coordinator/claude-coordinator.service.template), not from cron:
     python3 coordinator_bot.py
 
 Built-in commands (answered instantly, no API cost):
@@ -165,7 +165,7 @@ def load_state():
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state))
+    dispatcher.write_atomic(STATE_FILE, json.dumps(state))
 
 
 # ---------------------------------------------------------------- coordinator
@@ -212,6 +212,7 @@ def run_coordinator(prompt, session_id):
         capture_output=True,
         text=True,
         cwd=str(COORD_DIR),
+        env=dispatcher.claude_env(),
         timeout=float(cfg("COORDINATOR_TIMEOUT_MINUTES", "10")) * 60,
     )
 

@@ -1,5 +1,6 @@
 coordinator/memory/
 coordinator/state.json
+coordinator/CLAUDE.md
 logs/
 
 tasks/active/
@@ -10,6 +11,8 @@ tasks/pending/
 tasks/recurring/
 
 workspace/
+state/
+.*.tmp
 
 .env
 

@@ -304,7 +304,8 @@ teaches itself new capabilities over time.
 
 `coordinator_bot.py` turns the same Telegram chat that receives queue
 notifications into a two-way conversation with a **coordinator** agent — a
-Claude session whose role (defined in `coordinator/CLAUDE.md`) is to turn
+Claude session whose role (defined in `coordinator/CLAUDE.md.template`,
+rendered to `coordinator/CLAUDE.md` by the installer) is to turn
 your ideas into well-formed task files. Describe a project from your phone;
 the coordinator asks about constraints and scope, proposes a decomposition
 into phase-sized tasks with dependencies, shows you the task list for
@@ -312,13 +313,9 @@ approval, and only then writes the files into `tasks/pending/` — where the
 cron dispatcher picks them up. It never implements anything itself.
 
 - The bridge is a long-polling daemon (chat needs sub-second pickup, so
-  it's a systemd service, not a cron job):
+  it's a systemd service, not a cron job; the installer sets it up):
 
   ```bash
-  cp coordinator/claude-coordinator.service /etc/systemd/system/
-  # edit the paths in the unit if the queue doesn't live at /root/agentic-task-queue
-  systemctl daemon-reload
-  systemctl enable --now claude-coordinator
   journalctl -u claude-coordinator -f     # watch it (also logs/coordinator.log)
   ```
 
@@ -378,72 +375,82 @@ cron dispatcher picks them up. It never implements anything itself.
 
 ## Setup
 
-Prerequisites: Ubuntu with Python 3.11+, and the Claude Code CLI installed
-and authenticated for the user that will run cron (run `claude` once
-interactively to log in, or use `claude setup-token` for long-lived headless
-credentials).
+Prerequisites: a Debian/Ubuntu machine (a Raspberry Pi 4/5 with 64-bit Ubuntu
+24.04 and 4 GB+ works; `uname -m` prints `aarch64`) with Python 3.11+ and the
+Claude Code CLI. Check the CLI first: `claude --version` and `claude doctor`.
 
-1. **Get the code onto the droplet** (clone this repo or copy the
-   `agentic-task-queue/` directory) and enter it:
+You give the installer two things: the Telegram bot token (create a bot with
+[@BotFather](https://t.me/BotFather) and `/newbot`) and the `claude` login.
 
-   ```bash
-   cd agentic-task-queue
-   ```
+```bash
+sudo git clone <this repo> /opt/agentic-task-queue    # not under a private home directory
+cd /opt/agentic-task-queue
+sudo python3 scripts/install.py
+```
 
-2. **Create a Telegram bot**: message [@BotFather](https://t.me/BotFather),
-   send `/newbot`, and save the token. Send your new bot any message, then
-   find your chat id in the response of:
+The queue runs as a dedicated `taskq` user, so install `claude` for that user
+first (the installer prints this command when it can't find the binary):
 
-   ```bash
-   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates"
-   ```
+```bash
+sudo -u taskq -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+```
 
-3. **Install the libraries** into a venv (pinned, with hashes):
+`scripts/install.py` is idempotent: run it again after any change and it only
+does what is missing. It:
 
-   ```bash
-   python3 -m venv .venv
-   .venv/bin/pip install --require-hashes -r requirements.txt
-   ```
+1. creates `taskq`, hands it the checkout, and builds `.venv` from the pinned,
+   hashed `requirements.txt`;
+2. asks for the bot token (checked with `getMe`), then waits for your first
+   message to the bot to learn the chat id;
+3. runs `claude setup-token`, stores the one-year token in `.env` (mode 600) as
+   `CLAUDE_CODE_OAUTH_TOKEN`, and proves it with one `claude -p` call. Unlike an
+   interactive login, it does not expire after a few hours or days. The queue
+   passes it to every `claude` subprocess; it only makes model requests. It also
+   writes `state/claude-token-renewal.ics` (import it into your calendar);
+4. renders `coordinator/CLAUDE.md` and the systemd unit from their `.template`
+   files, filling in `{{BASE}}` and the user, and enables the coordinator service;
+5. installs two cron lines for `taskq`, replacing any old ones: the dispatcher
+   every 15 minutes, and a daily `install.py --check --quiet --notify`;
+6. adds permission deny rules for `.env`, `state/` and the claude credentials to
+   `~taskq/.claude/settings.json`;
+7. runs the dispatcher once on the empty queue and sends "setup complete".
 
-   Run everything below with `.venv/bin/python3` (or activate the venv).
+For scripted installs: `--non-interactive --bot-token T --chat-id ID
+--oauth-token T --claude-bin PATH` (also `--user`, `--base`).
 
-4. **Configure**:
+Then queue the example task: `sudo -u taskq cp tasks/examples/example-task.md tasks/pending/`.
 
-   ```bash
-   cp .env.example .env
-   nano .env    # set TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CLAUDE_BIN
-   ```
+### Health check
 
-   Set `CLAUDE_BIN` to the absolute path from `which claude` — cron runs with
-   a minimal `PATH` and won't find a bare `claude`. The claude.ai install
-   script (`curl -fsSL https://claude.ai/install.sh | bash`) puts it at
-   `~/.local/bin/claude`. If `CLAUDE_BIN` is empty or wrong, the dispatcher
-   falls back to `PATH`, then `~/.local/bin/claude`, then
-   `/usr/local/bin/claude`; if none exist it logs an error and requeues the
-   task without consuming an attempt.
+`python3 scripts/install.py --check` prints PASS/WARN/FAIL for the `claude`
+binary, a live `claude -p` probe, `.env` mode, `getMe`, the cron lines, the
+service (active, running as `taskq`, unit matches its template), the queue folders,
+the venv libraries, and the clock/timezone. It exits 1 on a FAIL. The daily cron
+run (`--quiet --notify`) is silent unless something fails, then messages Telegram,
+so an expired login is caught within a day. It also warns once the stored token
+is older than 11 months: rerun the installer to renew (it asks for a new login
+when the probe fails).
 
-5. **Smoke-test** (creates the `tasks/`, `logs/` and `state/` directories):
+Set `HEALTHCHECK_URL` (e.g. a healthchecks.io check with a 15 minute period) so
+the dispatcher pings it after each successful cycle. It alerts you when the
+pings stop, which covers power loss, a dead SD card and a dead cron, where the
+Pi can't message you itself. No ping is sent while the login is expired.
 
-   ```bash
-   .venv/bin/python3 dispatcher.py        # should log "Queue empty; nothing to do"
-   ```
+### Raspberry Pi notes
 
-6. **Queue the example task and run once manually**:
-
-   ```bash
-   cp tasks/examples/example-task.md tasks/pending/
-   .venv/bin/python3 dispatcher.py
-   tail -f logs/dispatcher.log
-   ```
-
-7. **Install the cron job** (`crontab -e`):
-
-   ```cron
-   */15 * * * * /home/you/agentic-task-queue/.venv/bin/python3 /home/you/agentic-task-queue/dispatcher.py >> /home/you/agentic-task-queue/logs/cron.log 2>&1
-   ```
-
-   Overlap is safe: the in-script lockfile makes a second invocation exit
-   immediately while one is running.
+- **Power cuts**: task files and the coordinator state are written to a temp
+  file and renamed into place, and an interrupted task in `active/` returns to
+  `pending/` on the next run.
+- **SD card wear**: per-attempt transcripts older than `LOG_RETENTION_DAYS`
+  (30) are deleted each run. For more, keep `logs/` and `workspace/` on a USB drive.
+- **Clock**: a Pi has no battery clock and recurring schedules use local time. The
+  installer and `--check` warn if NTP is not synchronized or the zone is UTC
+  (`timedatectl set-ntp true`, `timedatectl set-timezone Area/City`).
+- **Nothing to expose**: the coordinator long-polls Telegram (outbound only), so
+  no port forwarding is needed. Use SSH keys only (`PasswordAuthentication no`).
+- **Moving an existing install** that runs as another user: remove the old unit
+  drop-in (`/etc/systemd/system/claude-coordinator.service.d/`), then run the
+  installer from a checkout `taskq` can read.
 
 ## Security notes
 
@@ -461,8 +468,29 @@ credentials).
   `VERIFY_ALLOWED_PREFIXES` short, and run the queue as a dedicated user.
 - The reviewer runs with read-only tools (`Read,Glob,Grep`) in the task's
   working directory so it can verify claims against real files.
-- `.env` holds your Telegram token; it is gitignored — keep it that way and
-  `chmod 600 .env`.
+- `.env` holds your Telegram token and the claude login token; it is
+  gitignored and the installer keeps it mode 600. Only the two `claude`
+  credentials (`CLAUDE_CODE_OAUTH_TOKEN`, and an optional scoped `GH_TOKEN`) are
+  handed to `claude` subprocesses; the Telegram token never is.
+- A task's `allowed_tools` must match `TASK_ALLOWED_TOOLS` (default in
+  `.env.example`): `Bash(gh issue *)` and `Bash(gh pr create*)` are allowed, but
+  `Bash(gh *)`, `gh api` and bare `Bash` are rejected, so a task cannot grant
+  itself the GitHub API. `python3 dispatcher.py check <file>` shows the problem.
+- Workers run arbitrary Python (`Bash(python3 *)`) and read untrusted web pages, so
+  the queue runs as `taskq`, not root, and the Pi should be treated as exposed.
+
+### Hardening you do outside the repo
+
+- **Isolate the Pi** on its own VLAN or guest network: outbound internet, one-way
+  access to only the lab hosts and ports you want monitored, nothing inbound from the
+  lab. Keep client or NDA material out of task files and Telegram.
+- **Scope GitHub**: a fine-grained token limited to the repos the queue needs, on a
+  collaborator account, put in `.env` as `GH_TOKEN`. On `main`, add a branch ruleset
+  that requires a pull request and "Require review from Code Owners";
+  `.github/CODEOWNERS` already names `dispatcher.py`, `coordinator/CLAUDE.md.template`,
+  `scripts/`, `tests/` and `.github/`.
+- **Claude Code sandbox**: turn it on for `taskq` after confirming it works on
+  ARM64 (not yet verified here).
 
 ## Operations
 

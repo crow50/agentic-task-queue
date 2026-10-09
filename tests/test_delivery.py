@@ -344,7 +344,7 @@ class InstructionTests(DeliveryCase):
         self.assertIn("inline", prompt)
 
     def test_the_coordinator_is_taught_deliver_instead_of_a_whole_writeup_in_the_reply(self):
-        text = (REPO / "coordinator" / "CLAUDE.md").read_text()
+        text = (REPO / "coordinator" / "CLAUDE.md.template").read_text()
 
         self.assertIn("`deliver:`", text)
         self.assertRegex(text, r"(?s)saved to.*?listed in `deliver:`")

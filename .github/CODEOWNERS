@@ -2,7 +2,8 @@
 # changes to them need the owner's review. Last matching pattern wins.
 # CODEOWNERS only *requests* review; to make it mandatory, turn on "Require
 # review from Code Owners" in a branch ruleset for main.
-/dispatcher.py          @crow50
-/coordinator/CLAUDE.md  @crow50
-/tests/                 @crow50
-/.github/               @crow50
+/dispatcher.py                    @crow50
+/coordinator/CLAUDE.md.template   @crow50
+/scripts/                         @crow50
+/tests/                           @crow50
+/.github/                         @crow50
