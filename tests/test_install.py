@@ -312,7 +312,7 @@ class FailureTests(InstallCase):
         self.assertFalse((self.base / ".env").exists())
 
     def test_non_interactive_without_a_token_says_which_flag_to_pass(self):
-        code, _, err = self.run_main("--bot-token", "", defaults=False, *("--non-interactive",))
+        code, _, err = self.run_main("--non-interactive", "--claude-bin", str(self.claude), defaults=False)
 
         self.assertEqual(code, 1)
         self.assertIn("--bot-token", err)
