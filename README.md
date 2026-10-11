@@ -268,11 +268,38 @@ The queue learns from its own failures, and a human approves every change.
 4. **You review the pull request** like any other change. Nothing is applied to
    the running queue; merging and pulling is the only way a proposal takes effect.
 
-Set it up once (the host needs `git` credentials that can push, and `gh auth login`):
+### Turn it on
+
+`scripts/enable_learning_loop.py` checks what the loop needs and installs the
+weekly task; run it as the queue user from the venv. Lessons are recorded from the
+first deploy; nothing else happens until you run `install`.
 
 ```bash
-sed "s|__QUEUE_DIR__|$PWD|" tasks/examples/weekly-improver.md > tasks/recurring/weekly-improver.md
+sudo -u taskq .venv/bin/python scripts/enable_learning_loop.py status
 ```
+
+`status` prints one line per requirement and the exact fix under each ✗ (it never
+writes anything): the queue user can push a `proposal/` branch, `gh` is logged
+in, `main` is protected, `gitleaks` is on `PATH` (the commit hook needs it), and
+whether the weekly task is installed. Typical first-time setup is three commands:
+
+```bash
+# 1. as a repo admin (your own gh login): protect main and let the queue's deploy key push.
+#    It lists what it will change and asks first.
+sudo cat ~taskq/.ssh/id_ed25519.pub | .venv/bin/python scripts/enable_learning_loop.py github-setup --pubkey-file -
+
+# 2. give the queue user a fine-grained token for this repo (Pull requests: write, Contents: read)
+read -rs T && printf %s "$T" | sudo -u taskq .venv/bin/python scripts/enable_learning_loop.py login; unset T
+
+# 3. install the weekly task (refuses while status shows a ✗; --force overrides)
+sudo -u taskq .venv/bin/python scripts/enable_learning_loop.py install
+```
+
+`install` is idempotent and keeps an installed task's `last_run`. Turn the loop off
+with `scripts/enable_learning_loop.py uninstall`. `github-setup` is the only command
+that writes to GitHub, and only when an admin runs it by hand: the ruleset blocks
+force-pushes and deletion of `main` and requires a pull request plus CI, so a
+leaked push key can add `proposal/*` branches but cannot change `main`.
 
 `worker_preamble.md` holds the instructions every worker gets (it used to be a
 constant in `dispatcher.py`), so the loop can propose edits to it without ever
