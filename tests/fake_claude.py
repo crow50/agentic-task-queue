@@ -18,6 +18,11 @@ A step is a dict:
                                            exit non-zero printing exactly this
     {"fixture": "name.txt"}                print tests/fixtures/<name> verbatim
                                            (combine with "exit")
+    {"write": {"path": "p", "content": "text"}}
+                                           first write that file (path relative to
+                                           the call's cwd, parents created), then
+                                           act like the other keys say; combine
+                                           with "result" for the reply text
 
 Output is the envelope from tests/fixtures/envelope-success.json unless
 "stdout" or "fixture" is given. Every call is appended to
@@ -85,6 +90,11 @@ def main(argv):
             "prompt": prompt,
             "exit": code,
         }) + "\n")
+
+    if "write" in step:
+        target = Path(step["write"]["path"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(step["write"]["content"])
 
     if "fixture" in step:
         sys.stdout.write((FIXTURES / step["fixture"]).read_text())

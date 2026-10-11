@@ -105,6 +105,7 @@ deliver: reports/a.md, out/b.csv             # optional: files sent to Telegram 
 verify: bash scripts/verify-a.sh              # optional: a command the dispatcher runs itself after the worker (see below)
 review: skip                                  # optional: with verify, end the task on exit 0 without a reviewer call
 value_class: deliverable                      # optional: deliverable, research, verification or admin
+quiet: true                                   # optional: no "Task done" message on a pass (failures are still reported)
 attempts: 0                                   # managed by the dispatcher
 ---
 # Task title
@@ -242,6 +243,42 @@ Details:
   firing on its next due date regardless.
 - Templates that fail validation (missing or unparseable `schedule`, unknown
   key, and so on) are skipped, with one notice as described above.
+
+## Learning loop
+
+The queue learns from its own failures, and a human approves every change.
+
+1. **Lessons.** Each failed attempt (a reviewer FAIL, an unparseable verdict, a
+   worker timeout or CLI error, or a review that kept failing) appends
+   `{task, attempt, feedback, time}` to `logs/lessons.jsonl`. Usage-limit and
+   login problems cost no attempt and are not lessons.
+2. **Weekly proposal.** `tasks/examples/weekly-improver.md` is a recurring
+   task that reads the last 30 days of lessons and writes at most one patch to
+   `tasks/proposals/`, only for a cause backed by at least two lessons. It can
+   write nothing else (`Write(tasks/proposals/**)`, no `Edit`) and it is
+   `quiet: true`, so a week with nothing to propose sends no message.
+3. **Checked, then a pull request.** The task runs `scripts/open_proposal_pr.py`,
+   which refuses any patch touching more than `worker_preamble.md`,
+   `coordinator/CLAUDE.md.template`, a *new* `tests/test_*.py`, or `.claude/skills/`
+   (never `dispatcher.py`). It applies the patch in a temporary git worktree
+   cut from `origin/main`, runs the test suite there, and only if that passes
+   pushes `proposal/<name>` and runs `gh pr create`. Anything else is filed in
+   `tasks/proposals/rejected/` with a `.reason` file, silently; an opened one
+   goes to `tasks/proposals/opened/` with its `.url`.
+4. **You review the pull request** like any other change. Nothing is applied to
+   the running queue; merging and pulling is the only way a proposal takes effect.
+
+Set it up once (the host needs `git` credentials that can push, and `gh auth login`):
+
+```bash
+sed "s|__QUEUE_DIR__|$PWD|" tasks/examples/weekly-improver.md > tasks/recurring/weekly-improver.md
+```
+
+`worker_preamble.md` holds the instructions every worker gets (it used to be a
+constant in `dispatcher.py`), so the loop can propose edits to it without ever
+touching the dispatcher. The opener runs the full test suite (a minute or more),
+so the task allows a generous `timeout_minutes`. `tasks/proposals/` is
+patch-only; it is not an inbox for items that need your attention.
 
 ## Giving tasks MCP access
 
@@ -475,7 +512,9 @@ Pi can't message you itself. No ping is sent while the login is expired.
 - A task's `allowed_tools` must match `TASK_ALLOWED_TOOLS` (default in
   `.env.example`): `Bash(gh issue *)` and `Bash(gh pr create*)` are allowed, but
   `Bash(gh *)`, `gh api` and bare `Bash` are rejected, so a task cannot grant
-  itself the GitHub API. `python3 dispatcher.py check <file>` shows the problem.
+  itself the GitHub API. The default also allows the one scoped
+  `Write(tasks/proposals/**)` that the weekly improver needs (bare `Write` on
+  `dispatcher.py` stays a per-task grant). `python3 dispatcher.py check <file>` shows the problem.
 - Workers run arbitrary Python (`Bash(python3 *)`) and read untrusted web pages, so
   the queue runs as `taskq`, not root, and the Pi should be treated as exposed.
 
@@ -512,6 +551,8 @@ Pi can't message you itself. No ping is sent while the login is expired.
 - **See where the limit goes**: `python3 dispatcher.py usage`.
 - **Login expired**: after the Telegram notice, run `claude` on the queue
   host and sign in (or `claude setup-token`); the next cron run resumes.
+- **See what keeps failing**: `tail logs/lessons.jsonl`; proposed fixes are in
+  `tasks/proposals/{opened,rejected}/`.
 - **Stop a recurring task**: move its template out of `tasks/recurring/`.
   Completed instances accumulate in `done/`; prune them occasionally.
 

@@ -100,7 +100,7 @@ class InstallCase(unittest.TestCase):
         (self.root / "home").mkdir()
         for rel in ("dispatcher.py", "coordinator_bot.py", "requirements.txt", ".env.example",
                     "coordinator/CLAUDE.md.template", "coordinator/claude-coordinator.service.template",
-                    "scripts/install.py"):
+                    "scripts/install.py", "worker_preamble.md"):
             (self.base / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / rel, self.base / rel)
         python = self.base / ".venv" / "bin" / "python3"  # the repo's venv has the libraries
