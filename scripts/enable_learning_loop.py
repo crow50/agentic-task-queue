@@ -218,6 +218,19 @@ def ruleset_body():
     }
 
 
+def confirm(prompt, from_tty):
+    """Ask for a yes. Stdin is already used up when the key came through it, so ask on the terminal."""
+    try:
+        if not from_tty:
+            return input(prompt).strip().lower() == "yes"
+        with open(os.environ.get("ENABLE_LOOP_TTY", "/dev/tty")) as tty:
+            print(prompt, end="", file=sys.stderr, flush=True)
+            return tty.readline().strip().lower() == "yes"
+    except (EOFError, OSError):
+        print("\ncannot ask here: run it again with --yes to apply the plan above", file=sys.stderr)
+        return False
+
+
 def cmd_github_setup(ctx, args):
     slug = ctx.slug()
     rulesets = ctx.gh_run("api", f"repos/{slug}/rulesets", "--jq", ".[].name")
@@ -256,7 +269,7 @@ def cmd_github_setup(ctx, args):
     print("github-setup on " + slug + ":\n" + "".join(f"  - {line}\n" for line in plan))
     if not (need_ruleset or need_key):
         return 0
-    if not args.yes and input("Type yes to apply: ").strip().lower() != "yes":
+    if not args.yes and not confirm("Type yes to apply: ", from_tty=args.pubkey_file == "-"):
         print("nothing changed")
         return 1
 

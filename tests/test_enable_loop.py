@@ -296,6 +296,36 @@ class GithubSetupTests(LoopCase):
         (add,) = self.writes()
         self.assertIn("EXAMPLEKEYMATERIAL", self.body(add)["key"])
 
+    def test_a_key_on_stdin_is_confirmed_on_the_terminal(self):
+        self.setup_rules(rulesets="protect-main\n")
+        tty = self.root / "tty"
+        tty.write_text("yes\n")
+        proc = self.run_script("github-setup", "--pubkey-file", "-", stdin=PUBKEY + "\n", env={"ENABLE_LOOP_TTY": str(tty)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.writes()), 1)
+
+    def test_a_no_on_the_terminal_changes_nothing(self):
+        self.setup_rules(rulesets="protect-main\n")
+        tty = self.root / "tty"
+        tty.write_text("no\n")
+        proc = self.run_script("github-setup", "--pubkey-file", "-", stdin=PUBKEY + "\n", env={"ENABLE_LOOP_TTY": str(tty)})
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(self.writes(), [])
+
+    def test_no_terminal_and_no_yes_fails_cleanly(self):
+        self.setup_rules(rulesets="protect-main\n")
+        proc = self.run_script("github-setup", "--pubkey-file", "-", stdin=PUBKEY + "\n",
+                               env={"ENABLE_LOOP_TTY": str(self.root / "missing")})
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("--yes", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(self.writes(), [])
+
+    def test_end_of_input_at_the_prompt_fails_cleanly(self):
+        proc = self.run_script("github-setup", stdin="")
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("Traceback", proc.stderr)
+
 
 class ReadmeTests(unittest.TestCase):
     def test_the_readme_documents_every_subcommand(self):
