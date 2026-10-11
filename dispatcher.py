@@ -31,6 +31,7 @@ Usage: python3 dispatcher.py                   (typically from cron every 15 min
 
 import difflib
 import fcntl
+import fnmatch
 import html
 import json
 import logging
@@ -235,7 +236,7 @@ def parse_task(path):
 
 def write_task(path, meta, body):
     front = "\n".join(f"{k}: {v}" for k, v in meta.items())
-    path.write_text(f"---\n{front}\n---\n{body}")
+    write_atomic(path, f"---\n{front}\n---\n{body}")
 
 
 def mcp_config_path(meta):
@@ -392,6 +393,43 @@ def frontmatter_problems(meta, template):
     return problems
 
 
+DEFAULT_TASK_TOOLS = (
+    "Read,Glob,Grep,Edit,Write,WebFetch,WebSearch,Skill(*),mcp__*,"
+    "Bash(python3 *),Bash(git *),Bash(gh issue *),Bash(gh pr create*),"
+    "Bash(df *),Bash(du *),Bash(uptime),Bash(free *)"
+)
+
+
+def split_tools(raw):
+    """Split a tool list on the commas outside parentheses: Bash(a, b) is one entry."""
+    items, depth, current = [], 0, ""
+    for char in raw:
+        depth += (char == "(") - (char == ")")
+        if char == "," and depth <= 0:
+            items.append(current.strip())
+            current = ""
+        else:
+            current += char
+    items.append(current.strip())
+    return [item for item in items if item]
+
+
+def allowed_tools_problem(value):
+    """A task may only grant tools matching TASK_ALLOWED_TOOLS (fnmatch patterns).
+
+    The default has no `Bash(gh *)` or `gh api`, so a task can't hand itself the
+    whole GitHub API; it can open issues and pull requests.
+    """
+    patterns = split_tools(cfg("TASK_ALLOWED_TOOLS", DEFAULT_TASK_TOOLS))
+    refused = [
+        tool for tool in split_tools(value)
+        if tool not in patterns and not any(fnmatch.fnmatchcase(tool, pattern) for pattern in patterns)
+    ]
+    if refused:
+        return f"allowed_tools grants {', '.join(refused)}, which TASK_ALLOWED_TOOLS does not allow"
+    return None
+
+
 def validate_task(meta, body, template=False):
     problems = []
     if meta is None:
@@ -399,6 +437,8 @@ def validate_task(meta, body, template=False):
     problems += frontmatter_problems(meta, template)
     if extract_criteria(body) is None:
         problems.append("no '## Acceptance Criteria' section in task body")
+    if meta.get("allowed_tools") and (problem := allowed_tools_problem(meta["allowed_tools"])):
+        problems.append(problem)
     mcp = mcp_config_path(meta)
     if mcp is not None and not mcp.is_file():
         problems.append(f"mcp_config file not found: {mcp}")
@@ -437,11 +477,18 @@ ISO_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def write_atomic(path, text):
-    """Replace a small state file in one step, so the coordinator never reads half of it."""
+    """Replace a file in one step: a reader (or a power cut) sees the old content or the new, never half."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())  # a power cut after the rename must not leave an empty file
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def append_locked(path, text):
@@ -564,6 +611,22 @@ def rate_limit_retrying(label, retries=None):
     )
 
 
+def claude_env():
+    """The environment for a claude subprocess: ours, plus the credentials kept in .env.
+
+    .env is never exported, so the long-lived login token (and the scoped GitHub
+    token) reach claude only through here.
+    """
+    env = dict(os.environ)
+    for key, value in (
+        ("CLAUDE_CODE_OAUTH_TOKEN", cfg("CLAUDE_CODE_OAUTH_TOKEN")),
+        ("GH_TOKEN", cfg("GH_TOKEN")),
+    ):
+        if value:
+            env[key] = value
+    return env
+
+
 def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label):
     """One claude -p invocation: a ClaudeReply, or an exception. Never sleeps."""
     model = model_of(cmd)
@@ -576,6 +639,7 @@ def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=cwd,
+            env=claude_env(),
             text=True,
             start_new_session=True,
         )
@@ -1752,7 +1816,39 @@ def process_task(path):
 # ---------------------------------------------------------------- main
 
 
+def prune_logs():
+    """Delete per-attempt transcripts older than LOG_RETENTION_DAYS, so logs don't wear out an SD card."""
+    days = float(cfg("LOG_RETENTION_DAYS", "30"))
+    if days <= 0:
+        return
+    cutoff = time.time() - days * 86400
+    for path in LOGS.glob("*.attempt-*"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError as exc:
+            log.warning("could not prune %s: %s", path.name, exc)
+
+
+def ping_healthcheck():
+    """Tell the outside dead-man's switch this cycle ran. Silent when the login is expired, so its alert fires."""
+    url = cfg("HEALTHCHECK_URL")
+    if not url or AUTH_FAILED_FILE.exists():
+        return
+    try:
+        httpx.get(url, timeout=10).raise_for_status()
+    except httpx.HTTPError as exc:  # the URL may carry a secret: name the error type only
+        log.warning("healthcheck ping failed: %s", type(exc).__name__)
+
+
 def main():
+    status = cycle()
+    if status == 0:
+        ping_healthcheck()
+    return status
+
+
+def cycle():
     for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED, LOGS, STATE):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -1777,6 +1873,7 @@ def main():
         return 0
     prune_seen()
     recover_stale()
+    prune_logs()
     spawn_recurring()
     if daily_cap_reached():
         return 0

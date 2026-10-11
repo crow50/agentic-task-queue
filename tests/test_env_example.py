@@ -13,6 +13,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = ("dispatcher.py", "coordinator_bot.py")
+# cfg() reads settings; claude_env() copies the inherited environment for the claude subprocess.
+ALLOWED_ENVIRON_READERS = ("cfg", "claude_env")
 ENV_EXAMPLE = REPO / ".env.example"
 
 
@@ -75,7 +77,7 @@ class EnvExampleTests(unittest.TestCase):
             tree = parse(script)
             inside_cfg = set()
             for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name == "cfg":
+                if isinstance(node, ast.FunctionDef) and node.name in ALLOWED_ENVIRON_READERS:
                     inside_cfg.update(id(child) for child in ast.walk(node))
             for node in ast.walk(tree):
                 if (

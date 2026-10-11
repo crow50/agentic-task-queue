@@ -10,7 +10,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 CODEOWNERS = REPO / ".github" / "CODEOWNERS"
 
-PROTECTED = ("/dispatcher.py", "/coordinator/CLAUDE.md", "/tests/", "/.github/")
+PROTECTED = ("/dispatcher.py", "/coordinator/CLAUDE.md.template", "/scripts/", "/tests/", "/.github/")
 
 
 def rules():

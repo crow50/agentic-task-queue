@@ -21,7 +21,8 @@ A step is a dict:
 
 Output is the envelope from tests/fixtures/envelope-success.json unless
 "stdout" or "fixture" is given. Every call is appended to
-<scenario>.calls.jsonl (role, model, allowed_tools, argv, prompt, exit) so
+<scenario>.calls.jsonl (role, model, allowed_tools, argv, the login/GitHub tokens it
+was given in its environment, prompt, exit) so
 tests can count and inspect worker and review calls.
 """
 
@@ -51,6 +52,13 @@ def flag_value(argv, flag):
 
 
 def main(argv):
+    if argv[:1] == ["--version"]:
+        print("2.0.0 (Claude Code)")
+        return 0
+    if argv[:1] == ["setup-token"]:  # the real one prints a token and does not save it
+        print("Open the URL to log in...\nYour OAuth token (valid for 1 year):\n"
+              "sk-ant-oat01-FAKEFAKEFAKEFAKEFAKE0123456789\nStore this token securely.")
+        return 0
     scenario_env = os.environ.get("FAKE_CLAUDE_SCENARIO")
     if not scenario_env:
         print("fake_claude: FAKE_CLAUDE_SCENARIO is not set", file=sys.stderr)
@@ -72,6 +80,8 @@ def main(argv):
             "model": flag_value(argv, "--model"),
             "allowed_tools": flag_value(argv, "--allowedTools"),
             "argv": argv,
+            "oauth_token": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"),
+            "gh_token": os.environ.get("GH_TOKEN"),
             "prompt": prompt,
             "exit": code,
         }) + "\n")

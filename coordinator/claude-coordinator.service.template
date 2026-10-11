@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude task queue Telegram coordinator bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{USER}}
+Group={{GROUP}}
+WorkingDirectory={{BASE}}
+Environment=PATH={{CLAUDE_DIR}}:/usr/local/bin:/usr/bin:/bin
+ExecStart={{BASE}}/.venv/bin/python3 {{BASE}}/coordinator_bot.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

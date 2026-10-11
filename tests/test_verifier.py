@@ -547,7 +547,7 @@ class InstructionTests(VerifyCase):
         self.assertIn("strict automated reviewer", review)
 
     def test_the_coordinator_is_taught_verify_review_skip_schedules_and_check(self):
-        text = (REPO / "coordinator" / "CLAUDE.md").read_text()
+        text = (REPO / "coordinator" / "CLAUDE.md.template").read_text()
 
         self.assertIn("`verify:`", text)
         self.assertIn("`review: skip`", text)
