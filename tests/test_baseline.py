@@ -42,7 +42,7 @@ class Sandbox:
         self.home = self.root / "home"
         self.base.mkdir()
         self.home.mkdir()
-        for script in ("dispatcher.py", "coordinator_bot.py"):
+        for script in ("dispatcher.py", "coordinator_bot.py", "worker_preamble.md"):
             shutil.copy2(REPO / script, self.base / script)
 
         self.telegram = FakeTelegram()
@@ -427,7 +427,7 @@ class SandboxIsolationTests(BaselineCase):
         self.assertIn("TELEGRAM_BOT_TOKEN=test-token", text)
         self.assertEqual(
             sorted(p.name for p in self.sb.base.iterdir()),
-            [".env", "coordinator_bot.py", "dispatcher.py"],
+            [".env", "coordinator_bot.py", "dispatcher.py", "worker_preamble.md"],
         )
 
 

@@ -78,6 +78,7 @@ PAUSED_FILE = STATE / "paused_until"  # first line: ISO UTC time; second line: w
 AUTH_FAILED_FILE = STATE / "auth_failed"  # present while the claude login is known to be expired
 SEEN_FILE = STATE / "seen.json"  # problems already reported, so each is said once
 USAGE_LOG = LOGS / "usage.jsonl"
+LESSONS_LOG = LOGS / "lessons.jsonl"  # one line per failed attempt; the weekly improver learns from it
 FAILED_CALLS_LOG = LOGS / "failed-calls.log"
 
 RATE_LIMIT_RE = re.compile(r"rate.?limit|\b429\b|overloaded|usage limit|quota", re.I)
@@ -90,30 +91,16 @@ AUTH_ERROR_RE = re.compile(
 PAUSE_BUFFER_S = 60  # past a stated reset time, so we don't wake up a moment early
 MAX_RESET_WAIT = timedelta(days=8)  # a "reset time" further out than the weekly window is not one
 MAX_REVIEW_RETRIES = 3  # reviews that error or time out are retried this often, then charged
+LESSON_FEEDBACK_MAX = 2000  # characters of reviewer feedback kept per lesson
 PROBE_PROMPT = "Reply with the single word OK."
 REPORT_INLINE_MAX = 3500  # a longer report goes out as a short preview plus an attachment
 TELEGRAM_FILE_MAX = 50 * 1024 * 1024  # the Bot API refuses uploads above 50 MB
 
-WORKER_PREAMBLE = """\
-You are running unattended inside an automated task queue. Complete the task \
-described below.
-- Sections named "## Attempt N Feedback" contain reviewer feedback from \
-previous failed attempts; address every point before finishing.
-- Work in the current directory unless the task says otherwise.
-- When you are done, print a concise report of what you did, the files you \
-created or changed (with paths), and how each acceptance criterion is met.
-- The reader sees only Telegram. Never write "see file X" unless X is listed in \
-the task's `deliver:` line, and paste what matters inline in your report.
-- The reviewer has no shell, no GitHub CLI and no network. It sees only your \
-report and the files in the working directory, so it cannot run anything to \
-check your claims.
-- For every verification step (tests, builds, lookups), paste the raw output \
-verbatim in your report. Do not summarise it or say that it passed.
-- For any issue or pull request you create, paste its URL and its rendered \
-body (for example the output of `gh issue view`).
-- Run Bash commands one at a time. A command chained with `&&`, `;`, a pipe or \
-`2>&1` is denied, and its output never existed.
-"""
+PREAMBLE_FILE = BASE / "worker_preamble.md"  # the worker's standing instructions; a file so the weekly improver can propose edits
+try:
+    WORKER_PREAMBLE = PREAMBLE_FILE.read_text()
+except OSError as exc:
+    sys.exit(f"dispatcher.py: cannot read {PREAMBLE_FILE}: {exc}")
 
 REVIEW_TEMPLATE = """\
 You are a strict automated reviewer for a task queue. Decide whether the \
@@ -323,6 +310,7 @@ FRONTMATTER_KEYS = {
     "deliver": (False, False, None),
     "verify": (False, False, None),  # checked by verify_problem()
     "review": (False, False, ("skip",)),
+    "quiet": (False, False, ("true", "false")),  # true: no "Task done" report on a pass; failures still report
     "value_class": (False, False, VALUE_CLASSES),  # may be absent: older files read as untagged
     "pending_review": (False, False, None),  # managed by the dispatcher
     "review_failures": (False, False, None),  # managed by the dispatcher
@@ -394,7 +382,7 @@ def frontmatter_problems(meta, template):
 
 
 DEFAULT_TASK_TOOLS = (
-    "Read,Glob,Grep,Edit,Write,WebFetch,WebSearch,Skill(*),mcp__*,"
+    "Read,Glob,Grep,Edit,Write,Write(tasks/proposals/**),WebFetch,WebSearch,Skill(*),mcp__*,"
     "Bash(python3 *),Bash(git *),Bash(gh issue *),Bash(gh pr create*),"
     "Bash(df *),Bash(du *),Bash(uptime),Bash(free *)"
 )
@@ -576,6 +564,15 @@ def log_usage(label, model, exit_code, status, envelope=None):
         append_locked(USAGE_LOG, json.dumps(record) + "\n")
     except OSError as exc:  # bookkeeping must never fail a task
         log.warning("Could not write %s: %s", USAGE_LOG.name, exc)
+
+
+def log_lesson(path, attempts, feedback):
+    """Append {task, attempt, feedback, time} to logs/lessons.jsonl for every failed attempt."""
+    record = {"task": path.stem, "attempt": attempts, "feedback": feedback.strip()[:LESSON_FEEDBACK_MAX], "time": now_iso()}
+    try:
+        append_locked(LESSONS_LOG, json.dumps(record) + "\n")
+    except OSError as exc:  # bookkeeping must never fail a task
+        log.warning("Could not write %s: %s", LESSONS_LOG.name, exc)
 
 
 def log_failed_call(label, exit_code, out, err, command=""):
@@ -1460,6 +1457,7 @@ def pick_task():
 
 
 def handle_failure(path, meta, body, attempts, max_attempts, feedback):
+    log_lesson(path, attempts, feedback)
     body = body.rstrip("\n") + f"\n\n## Attempt {attempts} Feedback ({now_iso()})\n\n{feedback.strip()}\n"
     write_task(path, meta, body)
     if attempts >= max_attempts:
@@ -1660,7 +1658,8 @@ def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials,
     if notice := denial_notice(denials):
         lines.append(notice)
     files, notes = collect_deliverables(meta, cwd)
-    send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem)
+    if meta.get("quiet") != "true":  # quiet tasks (the weekly improver) report only failures
+        send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem)
     if notes:
         send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
 

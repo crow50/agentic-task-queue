@@ -9,6 +9,7 @@ tasks/done/
 tasks/failed/
 tasks/pending/
 tasks/recurring/
+tasks/proposals/
 
 workspace/
 state/
