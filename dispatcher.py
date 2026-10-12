@@ -1937,6 +1937,8 @@ def approve_task(stem):
         problems = validate_task(meta, body) if meta else ["the frontmatter is missing"]
         if problems:
             return False, f"'{stem}' is invalid and was not queued:\n" + "\n".join(f"- {p}" for p in problems)
+        if problem := proposal_problem(meta):
+            return False, f"'{stem}' was not queued: {problem}."
         if not entry or entry.get("status") != "awaiting" or not entry.get("message_id"):
             return False, f"'{stem}' has not been announced yet; approve it from the announcement."
         digest = spec_digest(meta, body)
@@ -2190,6 +2192,7 @@ def publish_draft_pr(path, meta, body, worker_out, verified):
 
 def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False):
     """A task passed verification and review. A repo task now becomes a draft PR; any other is simply done."""
+    collect_proposals(path, meta)
     if not meta.get("repo"):
         finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped)
         return
@@ -2230,6 +2233,110 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
         shutil.move(str(path), str(FAILED / path.name))
         send_report(f"❌ Task could not open a pull request: {path.name}\nThe work passed verification and review and is kept in {worktree_path(stem)}. Last error:",
                     detail, task_id=stem)
+
+
+# ---------------------------------------------------------------- proposals
+#
+# A task with `propose: true` may write follow-up task files into a staging folder
+# of its own, tasks/proposed/.incoming/<id>/, and nowhere else. When the task
+# passes, the dispatcher (not the worker) validates each file, stamps proposed_by
+# and depth, applies the caps, and moves the survivors to tasks/proposed/. There
+# they wait for a 👍 like any task: a proposal never enters pending/ by itself.
+
+PROPOSE_NOTE = (
+    "You may propose follow-up work. Write each proposal as a task file (the usual frontmatter, a body, and a "
+    "## Acceptance Criteria section) into {staging}/ and nowhere else, at most {limit} of them. They are only "
+    "proposals: they wait for the human's approval before anything runs. Do not write to tasks/pending/.\n\n"
+)
+TASK_DIRS = (PENDING, PROPOSED, ACTIVE, DONE, FAILED, CANCELLED, RECURRING)
+MANAGED_KEYS = ("tier", "pr_url", "branch", "pending_review", "review_failures", "pending_publish", "publish_failures")
+
+
+def proposal_limits():
+    return int(cfg("MAX_PROPOSAL_DEPTH", "2")), int(cfg("MAX_PROPOSALS_PER_TASK", "5"))
+
+
+def staging_dir(stem):
+    return PROPOSED / ".incoming" / safe_stem(stem)
+
+
+def find_task(stem):
+    return next((d / f"{stem}.md" for d in TASK_DIRS if (d / f"{stem}.md").exists()), None)
+
+
+def count_proposals(stem):
+    """Proposals this task has already made, wherever they have got to (a cancelled one still counts)."""
+    return sum(
+        1 for directory in TASK_DIRS for file in directory.glob("*.md")
+        if (parse_task(file)[0] or {}).get("proposed_by") == stem
+    )
+
+
+def proposal_problem(meta):
+    """Why a proposal may not be approved (None when it may): its parent and its depth must be what the dispatcher stamped."""
+    parent_stem = meta.get("proposed_by")
+    if not parent_stem:
+        return None
+    parent = find_task(parent_stem)
+    if parent is None:
+        return f"its parent task '{parent_stem}' is not in the queue"
+    expected = int((parse_task(parent)[0] or {}).get("depth") or 0) + 1
+    if str(meta.get("depth")) != str(expected):
+        return f"its depth ({meta.get('depth')}) is not its parent's plus one ({expected})"
+    if expected > proposal_limits()[0]:
+        return f"depth {expected} is past the limit of {proposal_limits()[0]}"
+    return None
+
+
+def unique_name(stem):
+    name, number = safe_stem(stem), 2
+    while find_task(name) is not None:
+        name, number = f"{safe_stem(stem)}-{number}", number + 1
+    return name
+
+
+def collect_proposals(path, meta):
+    """Turn what a passed task left in its staging folder into proposals; then empty the folder."""
+    staging = staging_dir(path.stem)
+    if not staging.is_dir():
+        return
+    try:
+        if meta.get("propose") != "true":
+            return
+        max_depth, per_task = proposal_limits()
+        depth = int(meta.get("depth") or 0)
+        files = sorted(staging.glob("*.md"), key=lambda f: (f.stat().st_mtime, f.name))
+        kept, dropped = [], []
+        if files and depth >= max_depth:
+            dropped.append(f"all {len(files)}: this task is already at proposal depth {depth} (limit {max_depth})")
+            files = []
+        room = per_task - count_proposals(path.stem)
+        for file in files:
+            proposal, body = parse_task(file)
+            if proposal is not None:  # the dispatcher's keys are the dispatcher's to set, whatever the worker wrote
+                for key in MANAGED_KEYS:
+                    proposal.pop(key, None)
+                proposal.update({"attempts": "0", "proposed_by": path.stem, "depth": str(depth + 1)})
+            problems = validate_task(proposal, body) if proposal is not None else ["no frontmatter"]
+            if len(kept) >= room:
+                dropped.append(f"{file.stem}: over the limit of {per_task} proposals per task")
+            elif problems:
+                dropped.append(f"{file.stem}: {problems[0]}")
+            else:
+                name = unique_name(file.stem)
+                write_task(PROPOSED / f"{name}.md", proposal, body)
+                kept.append(name)
+        if kept or dropped:
+            lines = []
+            if kept:
+                lines.append(f"💡 {path.stem} proposed {len(kept)} follow-up task{'s' if len(kept) != 1 else ''}: "
+                             f"{', '.join(kept)}. They wait for your 👍.")
+            lines += [f"Dropped {note}" for note in dropped]
+            send_telegram("\n".join(lines))
+            log.info("Task %s: %d proposal(s) kept, %d dropped", path.name, len(kept), len(dropped))
+            announce_proposals()
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def pick_task():
@@ -2294,6 +2401,7 @@ def handle_failure(path, meta, body, attempts, max_attempts, feedback):
     body = body.rstrip("\n") + f"\n\n## Attempt {attempts} Feedback ({now_iso()})\n\n{feedback.strip()}\n"
     write_task(path, meta, body)
     if attempts >= max_attempts:
+        shutil.rmtree(staging_dir(path.stem), ignore_errors=True)  # a failed task's proposals are not trusted
         shutil.move(str(path), str(FAILED / path.name))
         log.error("Task %s FAILED permanently after %d/%d attempts", path.name, attempts, max_attempts)
         send_report(
@@ -2596,6 +2704,10 @@ def run_task(path, status=None):
         if meta.get("repo"):  # the dispatcher publishes; the worker may neither push nor call gh
             worker_cmd += ["--disallowedTools", "Bash(git push*),Bash(gh *)"]
             note = REPO_NOTE.format(branch=branch_name(path.stem), base=meta.get("base") or "main")
+        if meta.get("propose") == "true":  # its own staging folder, and only that
+            staging = staging_dir(path.stem)
+            worker_cmd[worker_cmd.index("--allowedTools") + 1] = f"{tools},Write(/{staging}/**)"
+            note += PROPOSE_NOTE.format(staging=staging, limit=proposal_limits()[1])
         try:
             reply = run_claude(
                 worker_cmd, WORKER_PREAMBLE + "\n\n" + note + body, timeout_min * 60, cwd, transcript, "worker",

@@ -24,7 +24,8 @@ A step is a dict:
                                            first write that file (path relative to
                                            the call's cwd, parents created), then
                                            act like the other keys say; combine
-                                           with "result" for the reply text
+                                           with "result" for the reply text. A list of
+                                           such dicts writes several files
 
 Called with `--output-format stream-json`, a success or error step prints JSON
 lines as the real CLI does (tests/fixtures/stream-sample.jsonl is a real run):
@@ -127,10 +128,11 @@ def main(argv):
             "exit": code,
         }) + "\n")
 
-    if "write" in step:
-        target = Path(step["write"]["path"])
+    writes = step.get("write") or []
+    for write in [writes] if isinstance(writes, dict) else writes:
+        target = Path(write["path"])
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(step["write"]["content"])
+        target.write_text(write["content"])
 
     if "fixture" in step:
         sys.stdout.write((FIXTURES / step["fixture"]).read_text())
