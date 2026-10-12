@@ -44,6 +44,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -77,6 +78,7 @@ CANCELLED = TASKS / "cancelled"
 PROPOSED = TASKS / "proposed"  # waiting for your 👍 before they may run
 LOGS = BASE / "logs"
 STATE = BASE / "state"
+WORKTREES = BASE / "worktrees"  # one git worktree per task that sets repo:
 APPROVALS = STATE / "approvals"  # one <task>.json per task that needed approval; claude cannot write state/
 LOCKFILE = BASE / "dispatcher.lock"
 PAUSED_FILE = STATE / "paused_until"  # first line: ISO UTC time; second line: why
@@ -551,6 +553,8 @@ def validate_task(meta, body, template=False):
     if meta.get("allowed_tools") and (problem := allowed_tools_problem(meta["allowed_tools"])):
         problems.append(problem)
     problems += autonomy_problems(meta)
+    if problem := repo_problem(meta):
+        problems.append(problem)
     mcp = mcp_config_path(meta)
     if mcp is not None and not mcp.is_file():
         problems.append(f"mcp_config file not found: {mcp}")
@@ -1714,8 +1718,8 @@ def retry_task(stem):
                 meta, body = parse_task(path)
                 meta = meta or {}
                 meta["attempts"] = "0"
-                meta.pop("pending_review", None)  # a fresh start redoes the work too
-                meta.pop("review_failures", None)
+                for key in ("pending_review", "review_failures", "pending_publish", "publish_failures"):
+                    meta.pop(key, None)  # a fresh start redoes the work too
                 write_task(path, meta, body)
                 shutil.move(str(path), str(PENDING / path.name))
                 log.info("retry_task(%s): requeued from tasks/%s/", stem, label)
@@ -1990,6 +1994,244 @@ def apply_reaction(message_id, emoji):
     return None
 
 
+# ------------------------------------------- worktrees and draft pull requests
+#
+# A task with `repo:` runs in its own git worktree on branch task/<id>. Only after
+# verify and review pass does the dispatcher itself commit, push and open a DRAFT
+# pull request; the worker is told not to, and is denied git push and gh. Nothing
+# here merges anything.
+
+MAX_PUBLISH_FAILURES = 3
+GIT_IDENTITY = ["-c", "user.name=Queue worker", "-c", "user.email=worker@localhost"]
+REPO_NOTE = (
+    "You are working in a git worktree on branch {branch}, cut from {base}. Do not run git commit, "
+    "git push or gh: when verification and review pass, the dispatcher commits your changes and "
+    "opens a draft pull request itself.\n\n"
+)
+
+
+class GitError(Exception):
+    pass
+
+
+def repo_path(meta):
+    ref = (meta or {}).get("repo")
+    if not ref:
+        return None
+    path = Path(ref)
+    return path if path.is_absolute() else Path(cfg("REPOS_DIR") or BASE / "workspace") / ref
+
+
+def repo_problem(meta):
+    ref = (meta or {}).get("repo")
+    if not ref:
+        return None
+    if not Path(ref).is_absolute() and ("/" in ref or ref in (".", "..")):
+        return f"repo '{ref}' must be a plain name (looked up under REPOS_DIR) or an absolute path"
+    path = repo_path(meta)
+    if not path.is_dir():
+        return f"repo '{ref}' not found (looked for {path})"
+    if not (path / ".git").exists():
+        return f"repo '{ref}' ({path}) is not a git checkout"
+    return None
+
+
+def safe_stem(stem):
+    return re.sub(r"[^A-Za-z0-9._-]", "-", stem)
+
+
+def branch_name(stem):
+    return f"task/{safe_stem(stem)}"
+
+
+def worktree_path(stem):
+    return WORKTREES / safe_stem(stem)
+
+
+def publish_env():
+    env = claude_env()  # carries GH_TOKEN; git and gh have no use for the claude login
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never wait for a password in an unattended run
+    return env
+
+
+def git_run(cwd, *args, timeout=300):
+    try:
+        return subprocess.run(["git", *GIT_IDENTITY, *args], cwd=cwd, capture_output=True, text=True,
+                              timeout=timeout, env=publish_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(args, 124, "", f"{type(exc).__name__}: {exc}")
+
+
+def git_need(cwd, *args, timeout=300):
+    proc = git_run(cwd, *args, timeout=timeout)
+    if proc.returncode != 0:
+        raise GitError(f"git {args[0]} failed: {tail(proc.stderr or proc.stdout, 400)}")
+    return proc.stdout.strip()
+
+
+def base_ref(repo, meta):
+    base = meta.get("base") or "main"
+    return f"origin/{base}" if git_run(repo, "rev-parse", "--verify", "-q", f"origin/{base}").returncode == 0 else base
+
+
+def prepare_worktree(meta, stem):
+    """The task's worktree: new on the first attempt, the same one (with the last attempt's work) on a retry."""
+    repo, branch, worktree = repo_path(meta), branch_name(stem), worktree_path(stem)
+    git_run(repo, "worktree", "prune")
+    if (worktree / ".git").exists():
+        return worktree
+    if "origin" in git_run(repo, "remote").stdout.split():
+        git_run(repo, "fetch", "--quiet", "origin", timeout=120)  # best effort: an offline Pi still works from what it has
+    WORKTREES.mkdir(parents=True, exist_ok=True)
+    if git_run(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0:
+        git_need(repo, "worktree", "add", "-q", str(worktree), branch)  # branch left by an earlier run
+    else:
+        git_need(repo, "worktree", "add", "-q", "-b", branch, str(worktree), base_ref(repo, meta))
+    return worktree
+
+
+def remove_worktree(meta, stem):
+    worktree = worktree_path(stem)
+    if repo_path(meta) is not None and worktree.exists():
+        git_run(repo_path(meta), "worktree", "remove", "--force", str(worktree))
+    shutil.rmtree(worktree, ignore_errors=True)
+
+
+def prune_worktrees():
+    """Delete worktrees of finished tasks once they are LOG_RETENTION_DAYS old (a failed task's is kept to look at)."""
+    days = float(cfg("LOG_RETENTION_DAYS", "30"))
+    if days <= 0 or not WORKTREES.is_dir():
+        return
+    cutoff = time.time() - days * 86400
+    for worktree in WORKTREES.iterdir():
+        if any((state / f"{worktree.name}.md").exists() for state in (PENDING, ACTIVE, PROPOSED)):
+            continue
+        try:
+            if worktree.is_dir() and worktree.stat().st_mtime < cutoff:
+                common = git_run(worktree, "rev-parse", "--git-common-dir").stdout.strip()
+                if common:
+                    git_run(Path(common).resolve().parent, "worktree", "remove", "--force", str(worktree))
+                shutil.rmtree(worktree, ignore_errors=True)
+        except OSError as exc:
+            log.warning("could not prune worktree %s: %s", worktree.name, exc)
+
+
+def pr_title(stem, body):
+    for line in body.splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line and not line.lower().startswith("acceptance criteria"):
+            return short(line, 72)
+        if line:
+            break
+    return stem
+
+
+def pr_body(stem, body, worker_out, verified):
+    parts = [short(body.split("## Acceptance Criteria")[0], 1500), "**Acceptance criteria**\n" + short(extract_criteria(body) or "(none)", 1500)]
+    if verified:
+        parts.append(f"**Verification**: `{verified.command}` exited 0\n```\n{tail(verified.output or '(no output)', 1500)}\n```")
+    parts.append("**Worker report**\n" + tail(worker_out, 2500))
+    parts.append(f"---\nDraft pull request opened by the task queue from task `{stem}`. Nothing merges automatically.")
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def open_pr_count(cwd):
+    command = [*shlex.split(cfg("GH_BIN", "gh")), "pr", "list", "--state", "open", "--limit", "100", "--json", "headRefName",
+               "--jq", '[.[] | select(.headRefName | startswith("task/"))] | length']
+    try:
+        proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=120, env=publish_env())
+        if proc.returncode == 0:
+            return int(proc.stdout.strip() or 0)
+        detail = tail(proc.stderr or proc.stdout, 300)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+    raise GitError(f"could not count open pull requests: {detail}")
+
+
+def publish_draft_pr(path, meta, body, worker_out, verified):
+    """Commit the worktree, push task/<id> and open a draft PR. Returns (status, detail):
+    ok (the URL), nochange, held (open PR count), or error (why)."""
+    stem, branch = path.stem, branch_name(path.stem)
+    worktree, repo, base = worktree_path(path.stem), repo_path(meta), meta.get("base") or "main"
+    title = pr_title(stem, body)
+    try:
+        git_need(worktree, "add", "-A")
+        if git_run(worktree, "status", "--porcelain").stdout.strip():
+            git_need(worktree, "commit", "-q", "-m", f"{title}\n\nTask {stem}, done by the queue worker.")
+        if int(git_need(worktree, "rev-list", "--count", f"{base_ref(repo, meta)}..HEAD") or 0) == 0:
+            return "nochange", ""
+        cap = int(cfg("MAX_OPEN_PRS", "3") or 0)
+        if cap > 0 and not meta.get("pr_url"):
+            open_prs = open_pr_count(worktree)
+            if open_prs >= cap:
+                return "held", str(open_prs)
+        git_need(worktree, "push", "-q", "-u", "origin", branch, timeout=300)
+        with tempfile.TemporaryDirectory() as tmp:
+            body_file = Path(tmp) / "body.md"
+            body_file.write_text(pr_body(stem, body, worker_out, verified))
+            command = [*shlex.split(cfg("GH_BIN", "gh")), "pr", "create", "--draft", "--base", base, "--head", branch,
+                       "--title", title, "--body-file", str(body_file)]
+            try:
+                proc = subprocess.run(command, cwd=worktree, capture_output=True, text=True, timeout=120, env=publish_env())
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                proc = subprocess.CompletedProcess(command, 124, "", f"{type(exc).__name__}: {exc}")
+        if proc.returncode != 0:
+            git_run(worktree, "push", "-q", "origin", "--delete", branch)  # no PR: don't leave a dangling branch
+            raise GitError(f"gh pr create failed: {tail(proc.stderr or proc.stdout, 400)}")
+        url = next((line.strip() for line in reversed(proc.stdout.splitlines()) if line.strip()), "")
+        if not url.startswith("http"):
+            raise GitError(f"gh pr create printed no URL: {tail(proc.stdout, 200)}")
+        return "ok", url
+    except (GitError, ValueError) as exc:
+        return "error", str(exc)
+
+
+def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False):
+    """A task passed verification and review. A repo task now becomes a draft PR; any other is simply done."""
+    if not meta.get("repo"):
+        finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped)
+        return
+    status, detail = publish_draft_pr(path, meta, body, worker_out, verified)
+    stem = path.stem
+    if status == "ok":
+        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures"):
+            meta.pop(key, None)
+        meta["pr_url"], meta["branch"] = detail, branch_name(stem)
+        clear_reported(f"pr-held|tasks/pending/{path.name}")
+        finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped, pr_url=detail)
+        remove_worktree(meta, stem)
+    elif status == "nochange":
+        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures"):
+            meta.pop(key, None)
+        handle_failure(path, meta, body, attempts, max_attempts,
+                       "The worker made no changes to the repository, so there is nothing to open a pull request for. "
+                       "Make the change the task describes.")
+    elif status == "held":
+        meta["pending_publish"] = "1"
+        park_report(path, meta, body, attempts, worker_out, denials)
+        report_once(
+            f"pr-held|tasks/pending/{path.name}", detail,
+            f"Task {stem}: {detail} draft PRs are open (MAX_OPEN_PRS); result held",
+            f"⏸ Draft PR for {path.name} is held: {detail} task pull requests are already open "
+            f"(MAX_OPEN_PRS={cfg('MAX_OPEN_PRS', '3')}). The work is done and checked; it is published as soon as you merge or close one.",
+        )
+    else:
+        failures = int(meta.get("publish_failures") or 0) + 1
+        log.warning("Task %s: could not publish (%d/%d): %s", path.name, failures, MAX_PUBLISH_FAILURES, detail)
+        meta["pending_publish"], meta["publish_failures"] = "1", str(failures)
+        if failures < MAX_PUBLISH_FAILURES:
+            park_report(path, meta, body, attempts, worker_out, denials)  # try again next run; the work is not redone
+            return
+        meta.pop("pending_publish", None)
+        body = body.rstrip("\n") + f"\n\n## Publish failed ({now_iso()})\n\n{detail}\n"
+        write_task(path, meta, body)
+        shutil.move(str(path), str(FAILED / path.name))
+        send_report(f"❌ Task could not open a pull request: {path.name}\nThe work passed verification and review and is kept in {worktree_path(stem)}. Last error:",
+                    detail, task_id=stem)
+
+
 def pick_task():
     candidates = sorted(PENDING.glob("*.md"), key=lambda p: (p.stat().st_mtime, p.name))
     waiting = 0
@@ -2229,7 +2471,8 @@ def check_file(arg):
     return True, f"{path.name}: OK"
 
 
-def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False):
+def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False,
+                  pr_url=None):
     """A task passed: record the result, move it to done/ and tell the user."""
     name = path.name
     result = worker_out.strip()
@@ -2248,8 +2491,10 @@ def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials,
         lines.append(f"Verified by `{verified.command}` (exit 0)" + ("; review skipped" if skipped else ""))
     if notice := denial_notice(denials):
         lines.append(notice)
+    if pr_url:
+        lines.append(f"🔀 Draft PR ready: {pr_url}")
     files, notes = collect_deliverables(meta, cwd)
-    if meta.get("quiet") != "true":  # quiet tasks (the weekly improver) report only failures
+    if meta.get("quiet") != "true" or pr_url:  # quiet tasks (the weekly improver) report only failures, and PR links
         send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem)
     if notes:
         send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
@@ -2312,11 +2557,20 @@ def run_task(path, status=None):
     write_task(path, meta, body)
 
     timeout_min = float(meta.get("timeout_minutes") or cfg("DEFAULT_TIMEOUT_MINUTES", "30"))
-    cwd = task_cwd(meta)
-    Path(cwd).mkdir(parents=True, exist_ok=True)
     transcript = LOGS / f"{path.stem}.attempt-{attempts}.log"
+    if meta.get("repo"):
+        try:
+            cwd = str(prepare_worktree(meta, path.stem))
+        except GitError as exc:
+            handle_failure(path, meta, body, attempts, max_attempts, f"Could not prepare the git worktree:\n{exc}")
+            return
+    else:
+        cwd = task_cwd(meta)
+        Path(cwd).mkdir(parents=True, exist_ok=True)
 
     parked = load_parked_report(meta)
+    if parked is None:
+        meta.pop("pending_publish", None)  # nothing saved to publish: the worker has to run again
     if parked is not None:
         worker_out, denials = parked
         log.info("Task %s: attempt %d/%d reuses the saved worker report and runs only the review",
@@ -2338,9 +2592,13 @@ def run_task(path, status=None):
         if mcp is not None:
             worker_cmd += ["--mcp-config", str(mcp)]
             log.info("Task %s: MCP servers from %s", name, mcp)
+        note = ""
+        if meta.get("repo"):  # the dispatcher publishes; the worker may neither push nor call gh
+            worker_cmd += ["--disallowedTools", "Bash(git push*),Bash(gh *)"]
+            note = REPO_NOTE.format(branch=branch_name(path.stem), base=meta.get("base") or "main")
         try:
             reply = run_claude(
-                worker_cmd, WORKER_PREAMBLE + "\n\n" + body, timeout_min * 60, cwd, transcript, "worker",
+                worker_cmd, WORKER_PREAMBLE + "\n\n" + note + body, timeout_min * 60, cwd, transcript, "worker",
                 watcher=status or QuietWatcher(),
             )
         except RateLimited as exc:
@@ -2379,9 +2637,13 @@ def run_task(path, status=None):
         if meta.get("review") == "skip":
             meta.pop("pending_review", None)
             meta.pop("review_failures", None)
-            finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped=True)
+            conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped=True)
             return
         verification = VERIFICATION_BLOCK.format(command=verified.command, output=verified.output or "(no output)")
+
+    if meta.get("pending_publish"):  # the review already passed on an earlier run; only publishing is left
+        conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified)
+        return
 
     review_cmd = [
         claude_bin, "-p",
@@ -2426,7 +2688,7 @@ def run_task(path, status=None):
     meta.pop("review_failures", None)
     verdict, feedback = parse_verdict(review_out)
     if verdict == "PASS":
-        finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified)
+        conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified)
     else:
         handle_failure(path, meta, body, attempts, max_attempts, feedback)
 
@@ -2492,6 +2754,7 @@ def cycle():
     prune_seen()
     recover_stale()
     prune_logs()
+    prune_worktrees()
     spawn_recurring()
     if daily_cap_reached():
         return 0
