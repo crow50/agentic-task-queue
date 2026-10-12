@@ -32,6 +32,7 @@ Usage: python3 dispatcher.py                   (typically from cron every 15 min
 import difflib
 import fcntl
 import fnmatch
+import hashlib
 import html
 import json
 import logging
@@ -73,8 +74,10 @@ DONE = TASKS / "done"
 FAILED = TASKS / "failed"
 RECURRING = TASKS / "recurring"
 CANCELLED = TASKS / "cancelled"
+PROPOSED = TASKS / "proposed"  # waiting for your 👍 before they may run
 LOGS = BASE / "logs"
 STATE = BASE / "state"
+APPROVALS = STATE / "approvals"  # one <task>.json per task that needed approval; claude cannot write state/
 LOCKFILE = BASE / "dispatcher.lock"
 PAUSED_FILE = STATE / "paused_until"  # first line: ISO UTC time; second line: why
 AUTH_FAILED_FILE = STATE / "auth_failed"  # present while the claude login is known to be expired
@@ -1648,11 +1651,12 @@ def cancel_task(stem):
         )
         lines = []
         instances = sorted(PENDING.glob(f"{stem}-[0-9]*.md"))
-        for path in ([PENDING / f"{stem}.md"] if (PENDING / f"{stem}.md").exists() else []) + instances:
+        queued = [d / f"{stem}.md" for d in (PENDING, PROPOSED) if (d / f"{stem}.md").exists()]
+        for path in queued + instances:
             meta, body = parse_task(path)
             write_task(path, meta or {}, body.rstrip("\n") + note)
             archive(path)
-            lines.append(f"Cancelled {path.name} (was pending).")
+            lines.append(f"Cancelled {path.name} (was {path.parent.name}).")
         template = RECURRING / f"{stem}.md"
         if template.exists():
             archive(template)
@@ -1758,7 +1762,7 @@ def dep_state(dep):
         return "failed"
     if present(CANCELLED):
         return "cancelled"
-    if present(PENDING) or present(ACTIVE) or present(RECURRING):
+    if present(PENDING) or present(ACTIVE) or present(RECURRING) or present(PROPOSED):
         return "waiting"
     return "missing"
 
@@ -1779,11 +1783,218 @@ def cascade_dependency_failure(path, failed_dep):
     )
 
 
+# ------------------------------------------------------------ approval gate
+#
+# A task at or above APPROVAL_MIN_TIER waits in tasks/proposed/ until you approve
+# it: a 👍 on its announcement (handled by the bridge, in code), or /approve. The
+# approval is recorded in state/approvals/<task>.json, which claude can't write,
+# together with a digest of the spec. Change the spec afterwards and the approval
+# no longer matches, so the task is parked and announced again.
+
+TIER_LABELS = {0: "reads only", 1: "writes in its workspace", 2: "leaves the box"}
+DISPATCHER_HEADING = re.compile(r"^## (Attempt \d+ Feedback|Result \(|Invalid Task|Cancelled)", re.M)
+DIGEST_KEYS = ("model", "allowed_tools", "verify", "repo", "base", "cwd", "mcp_config", "deliver", "propose", "depends_on")
+RECURRING_INSTANCE = re.compile(r"^(?P<template>.+)-\d{8}-\d{6}$")
+
+
+def approval_min_tier():
+    try:
+        return int(cfg("APPROVAL_MIN_TIER", "0") or 0)
+    except ValueError:
+        return 0
+
+
+def spec_digest(meta, body):
+    """What an approval covers: the tools, checks and places the task may touch, and the text you were shown.
+
+    Everything the dispatcher appends later (feedback, results) and its own
+    bookkeeping keys are left out, so a retry doesn't need a new approval.
+    """
+    found = DISPATCHER_HEADING.search(body)
+    spec = body[:found.start()] if found else body
+    parts = [f"{key}={meta.get(key, '')}" for key in DIGEST_KEYS] + [spec.strip()]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def read_ledger(stem):
+    try:
+        return json.loads((APPROVALS / f"{stem}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_ledger(stem, entry):
+    write_atomic(APPROVALS / f"{stem}.json", json.dumps(entry))
+
+
+@contextmanager
+def ledger_lock():
+    """The dispatcher and the bridge both change approvals; one at a time."""
+    APPROVALS.mkdir(parents=True, exist_ok=True)
+    with filelock.FileLock(str(APPROVALS / ".lock"), timeout=30):
+        yield
+
+
+def is_recurring_instance(stem):
+    found = RECURRING_INSTANCE.match(stem)
+    return bool(found) and (RECURRING / f"{found.group('template')}.md").exists()
+
+
+def needs_approval(path, meta, body):
+    """True when this task may not run yet. Invalid tasks are not gated: process_task rejects them."""
+    threshold = approval_min_tier()
+    if threshold <= 0 or meta is None or validate_task(meta, body):
+        return False
+    if tier_of(meta) < threshold or is_recurring_instance(path.stem):
+        return False
+    entry = read_ledger(path.stem)
+    return not (entry and entry.get("status") == "approved" and entry.get("digest") == spec_digest(meta, body))
+
+
+def short(text, limit):
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def approval_text(stem, meta, body):
+    tier = tier_of(meta)
+    spec = body.split("## Acceptance Criteria")[0]
+    lines = [f"🔐 Approval needed: {stem} (tier {tier}: {TIER_LABELS[tier]})", "", short(spec, 700), ""]
+    lines.append("Acceptance criteria:\n" + short(extract_criteria(body) or "(none)", 700))
+    lines.append("")
+    lines.append("Tools: " + ", ".join(task_tools(meta)))
+    lines.append(f"verify: {meta['verify']}" if meta.get("verify") else "verify: (none; the reviewer judges)")
+    if meta.get("repo"):
+        lines.append(f"repo: {meta['repo']} → the result is a draft pull request")
+    if meta.get("proposed_by"):
+        lines.append(f"Proposed by {meta['proposed_by']} (depth {meta.get('depth', '?')})")
+    lines += ["", f"👍 run it · 👎 drop it   (or /approve {stem} · /reject {stem})"]
+    return "\n".join(lines)
+
+
+def announce_proposals():
+    """Tell you about each task waiting in proposed/ that you haven't been told about (or whose spec changed)."""
+    if not (cfg("TELEGRAM_BOT_TOKEN") and cfg("TELEGRAM_CHAT_ID")) or not PROPOSED.is_dir():
+        return
+    for path in sorted(PROPOSED.glob("*.md")):
+        with ledger_lock():
+            meta, body = parse_task(path)
+            if meta is None:
+                continue
+            digest, entry = spec_digest(meta, body), read_ledger(path.stem)
+            if entry and entry.get("status") == "awaiting" and entry.get("message_id") and entry.get("digest") == digest:
+                continue
+            message_id = send_message_id(approval_text(path.stem, meta, body), formatted=False)
+            if not message_id:
+                continue  # not sent: try again next time
+            write_ledger(path.stem, {"task": path.stem, "tier": tier_of(meta), "digest": digest,
+                                     "status": "awaiting", "message_id": message_id, "at": now_iso()})
+            log.info("Task %s is waiting for approval (announced as message %s)", path.name, message_id)
+
+
+def park_for_approval(path):
+    """Move a task that may not run to proposed/, stamp its computed tier, and announce it."""
+    meta, body = parse_task(path)
+    meta["tier"] = str(tier_of(meta))
+    write_task(path, meta, body)
+    dest = PROPOSED / path.name
+    if dest.exists():
+        log.warning("Task %s needs approval but proposed/ already holds a file of that name; leaving it", path.name)
+        return False
+    PROPOSED.mkdir(parents=True, exist_ok=True)
+    with ledger_lock():
+        shutil.move(str(path), str(dest))
+        write_ledger(path.stem, {"task": path.stem, "tier": int(meta["tier"]), "digest": spec_digest(meta, body),
+                                 "status": "awaiting", "message_id": None, "at": now_iso()})
+    log.info("Task %s is tier %s and needs approval; parked in proposed/", path.name, meta["tier"])
+    announce_proposals()
+    return True
+
+
+def clean_stem(stem):
+    stem = stem.strip()
+    return stem[:-3] if stem.endswith(".md") else stem
+
+
+def approve_task(stem):
+    """Approve a task waiting in proposed/: record it and move it to pending/. Returns (ok, message)."""
+    stem = clean_stem(stem)
+    if not stem or "/" in stem:
+        return False, "Give a task id (the file stem)."
+    path = PROPOSED / f"{stem}.md"
+    if not path.is_file():
+        for label, directory in (("pending", PENDING), ("active", ACTIVE), ("done", DONE), ("cancelled", CANCELLED)):
+            if (directory / f"{stem}.md").exists():
+                return False, f"'{stem}' is not waiting for approval; it is in tasks/{label}/."
+        return False, f"No task named '{stem}' is waiting for approval."
+    with ledger_lock():
+        entry = read_ledger(stem)
+        meta, body = parse_task(path)
+        problems = validate_task(meta, body) if meta else ["the frontmatter is missing"]
+        if problems:
+            return False, f"'{stem}' is invalid and was not queued:\n" + "\n".join(f"- {p}" for p in problems)
+        if not entry or entry.get("status") != "awaiting" or not entry.get("message_id"):
+            return False, f"'{stem}' has not been announced yet; approve it from the announcement."
+        digest = spec_digest(meta, body)
+        if entry.get("digest") != digest:
+            write_ledger(stem, {**entry, "digest": digest, "message_id": None})
+            return False, (f"'{stem}' changed after it was announced, so that approval does not cover it. "
+                           "It will be announced again.")
+        write_ledger(stem, {**entry, "status": "approved", "at": now_iso()})
+        shutil.move(str(path), str(PENDING / path.name))
+    log.info("Task %s approved", stem)
+    return True, f"Approved {stem}: queued, it runs next."
+
+
+def reject_task(stem):
+    """Drop a task waiting in proposed/ into cancelled/. Returns (ok, message)."""
+    stem = clean_stem(stem)
+    path = PROPOSED / f"{stem}.md"
+    if not stem or "/" in stem or not path.is_file():
+        return False, f"No task named '{stem}' is waiting for approval."
+    with ledger_lock():
+        meta, body = parse_task(path)
+        write_task(path, meta or {}, body.rstrip("\n") + f"\n\n## Cancelled ({now_iso()})\n\nNot approved.\n")
+        dest = CANCELLED / path.name
+        if dest.exists():
+            dest = CANCELLED / f"{path.stem}.cancelled-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+        CANCELLED.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(dest))
+        entry = read_ledger(stem) or {"task": stem}
+        write_ledger(stem, {**entry, "status": "rejected", "at": now_iso()})
+    log.info("Task %s rejected", stem)
+    return True, f"Dropped {stem}: moved to tasks/cancelled/."
+
+
+def apply_reaction(message_id, emoji):
+    """A 👍/👎 on an announcement: the reply to send, or None when the message is not one of ours."""
+    if not message_id or not APPROVALS.is_dir():
+        return None
+    for ledger in sorted(APPROVALS.glob("*.json")):
+        try:
+            entry = json.loads(ledger.read_text())
+        except (OSError, ValueError):
+            continue
+        if entry.get("message_id") != message_id:
+            continue
+        stem = entry["task"]
+        if entry.get("status") != "awaiting":
+            return f"{stem} was already {entry.get('status')}."
+        if emoji == "👍":
+            ok, message = approve_task(stem)
+        elif emoji == "👎":
+            ok, message = reject_task(stem)
+        else:
+            return None
+        return ("✅ " if ok else "⚠️ ") + message
+    return None
+
+
 def pick_task():
     candidates = sorted(PENDING.glob("*.md"), key=lambda p: (p.stat().st_mtime, p.name))
     waiting = 0
     for src in candidates:
-        meta, _ = parse_task(src)
+        meta, body = parse_task(src)
         blocked = None
         cancelled_dep = None
         for dep in dep_names(meta):
@@ -1823,6 +2034,9 @@ def pick_task():
         else:
             clear_reported(cancelled_key)
         if blocked is None:
+            if needs_approval(src, meta, body):
+                park_for_approval(src)
+                continue
             dest = ACTIVE / src.name
             shutil.move(str(src), str(dest))
             return dest
@@ -2087,9 +2301,14 @@ def run_task(path, status=None):
         shutil.move(str(path), str(PENDING / name))
         return
 
+    if needs_approval(path, meta, body):  # belt and braces: nothing unapproved reaches a claude call
+        park_for_approval(path)
+        return
+
     attempts = int(meta.get("attempts") or 0) + 1
     max_attempts = int(meta["max_attempts"])
     meta["attempts"] = str(attempts)
+    meta["tier"] = str(tier_of(meta))  # computed, never taken from the file
     write_task(path, meta, body)
 
     timeout_min = float(meta.get("timeout_minutes") or cfg("DEFAULT_TIMEOUT_MINUTES", "30"))
@@ -2248,7 +2467,7 @@ def main():
 
 
 def cycle():
-    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED, LOGS, STATE):
+    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED, PROPOSED, LOGS, STATE):
         directory.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
@@ -2276,6 +2495,7 @@ def cycle():
     spawn_recurring()
     if daily_cap_reached():
         return 0
+    announce_proposals()  # anything the coordinator left in proposed/
     task = pick_task()
     if task is None:
         log.info("Queue empty; nothing to do")

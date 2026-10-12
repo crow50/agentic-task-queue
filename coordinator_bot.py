@@ -318,6 +318,14 @@ def converse(prompt, state):
     return False
 
 
+def announce_waiting():
+    """Tell the human about tasks waiting for approval (the dispatcher does the same on its runs)."""
+    try:
+        dispatcher.announce_proposals()
+    except Exception as exc:  # noqa: BLE001 - announcing must never stop the bridge
+        log.warning("Could not announce tasks waiting for approval: %s", exc)
+
+
 def replay_held(state):
     """Answer held messages, oldest first, once nothing stops the queue.
 
@@ -344,6 +352,7 @@ def queue_status():
     lines = ["Queue status"]
     for label, directory in (
         ("pending", dispatcher.PENDING),
+        ("proposed", dispatcher.PROPOSED),
         ("active", dispatcher.ACTIVE),
         ("done", dispatcher.DONE),
         ("failed", dispatcher.FAILED),
@@ -352,7 +361,7 @@ def queue_status():
     ):
         names = sorted(p.stem for p in directory.glob("*.md"))
         line = f"{label}: {len(names)}"
-        if names and label in ("pending", "active", "failed", "recurring"):
+        if names and label in ("pending", "proposed", "active", "failed", "recurring"):
             line += " — " + ", ".join(names)
         lines.append(line)
     return "\n".join(lines)
@@ -375,6 +384,9 @@ def handle_reaction(reaction, state):
     emoji = next((e for e in emojis if e in REACTION_MEANINGS), None)
     if emoji is None:
         return  # reaction removed, or an emoji we give no meaning to
+    if (verdict := dispatcher.apply_reaction(reaction.get("message_id"), emoji)) is not None:
+        send_replies([verdict], state)  # an approval announcement: handled in code, no coordinator turn
+        return
     snippet = next(
         (s for mid, s in reversed(state.get("sent_messages", []))
          if mid == reaction.get("message_id")),
@@ -439,6 +451,16 @@ def handle_update(update, state):
         ok, result = dispatcher.retry_task(target)
         send_replies([("🔁 " if ok else "⚠️ ") + result], state)
         return
+    for command, act, icon in (("/approve", dispatcher.approve_task, "✅ "), ("/reject", dispatcher.reject_task, "🗑 ")):
+        if text == command or text.startswith(command + " "):
+            target = text[len(command):].strip()
+            if not target:
+                waiting = sorted(p.stem for p in dispatcher.PROPOSED.glob("*.md"))
+                send_replies([f"Usage: {command} <task-id>\nWaiting for approval: " + (", ".join(waiting) if waiting else "(none)")], state)
+                return
+            ok, result = act(target)
+            send_replies([(icon if ok else "⚠️ ") + result], state)
+            return
     # 👀 on the message plus a typing indicator while the coordinator runs.
     if dispatcher.current_stop() is None:
         for method, params in (
@@ -501,6 +523,8 @@ def main():
             {"command": "status", "description": "Queue counts and task names"},
             {"command": "cancel", "description": "Archive a pending task: /cancel <task-id>"},
             {"command": "retry", "description": "Requeue a failed/cancelled task: /retry <task-id>"},
+            {"command": "approve", "description": "Let a waiting task run: /approve <task-id>"},
+            {"command": "reject", "description": "Drop a waiting task: /reject <task-id>"},
             {"command": "new", "description": "Start a fresh coordinator conversation"},
         ])}, timeout=30)
     except Exception as exc:
@@ -511,6 +535,7 @@ def main():
     backoff = 5
     while RUNNING:
         replay_held(state)  # messages kept while the queue was paused or the login expired
+        announce_waiting()
         try:
             updates = api(
                 "getUpdates",
@@ -533,6 +558,7 @@ def main():
             save_state(state)  # persist offset before handling: a crash must not replay
             handle_update(update, state)
             save_state(state)
+            announce_waiting()  # the coordinator may just have written a task that needs approval
     log.info("Coordinator bridge stopped")
     return 0
 
