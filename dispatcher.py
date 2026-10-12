@@ -328,6 +328,7 @@ FRONTMATTER_KEYS = {
     "branch": (False, False, None),  # managed by the dispatcher
     "pr_url": (False, False, None),  # managed by the dispatcher
     "pending_publish": (False, False, None),  # managed by the dispatcher
+    "held_until": (False, False, None),  # managed by the dispatcher: not before this time
     "publish_failures": (False, False, None),  # managed by the dispatcher
     "proposed_by": (False, False, None),  # managed by the dispatcher
     "depth": (False, False, _whole_number(0)),  # managed by the dispatcher
@@ -1718,7 +1719,7 @@ def retry_task(stem):
                 meta, body = parse_task(path)
                 meta = meta or {}
                 meta["attempts"] = "0"
-                for key in ("pending_review", "review_failures", "pending_publish", "publish_failures"):
+                for key in ("pending_review", "review_failures", "pending_publish", "publish_failures", "held_until"):
                     meta.pop(key, None)  # a fresh start redoes the work too
                 write_task(path, meta, body)
                 shutil.move(str(path), str(PENDING / path.name))
@@ -2199,20 +2200,22 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
     status, detail = publish_draft_pr(path, meta, body, worker_out, verified)
     stem = path.stem
     if status == "ok":
-        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures"):
+        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures", "held_until"):
             meta.pop(key, None)
         meta["pr_url"], meta["branch"] = detail, branch_name(stem)
         clear_reported(f"pr-held|tasks/pending/{path.name}")
         finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped, pr_url=detail)
         remove_worktree(meta, stem)
     elif status == "nochange":
-        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures"):
+        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures", "held_until"):
             meta.pop(key, None)
         handle_failure(path, meta, body, attempts, max_attempts,
                        "The worker made no changes to the repository, so there is nothing to open a pull request for. "
                        "Make the change the task describes.")
     elif status == "held":
         meta["pending_publish"] = "1"
+        if until := hold_until():
+            meta["held_until"] = until
         park_report(path, meta, body, attempts, worker_out, denials)
         report_once(
             f"pr-held|tasks/pending/{path.name}", detail,
@@ -2225,9 +2228,12 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
         log.warning("Task %s: could not publish (%d/%d): %s", path.name, failures, MAX_PUBLISH_FAILURES, detail)
         meta["pending_publish"], meta["publish_failures"] = "1", str(failures)
         if failures < MAX_PUBLISH_FAILURES:
-            park_report(path, meta, body, attempts, worker_out, denials)  # try again next run; the work is not redone
+            if until := hold_until():
+                meta["held_until"] = until
+            park_report(path, meta, body, attempts, worker_out, denials)  # try again later; the work is not redone
             return
         meta.pop("pending_publish", None)
+        meta.pop("held_until", None)
         body = body.rstrip("\n") + f"\n\n## Publish failed ({now_iso()})\n\n{detail}\n"
         write_task(path, meta, body)
         shutil.move(str(path), str(FAILED / path.name))
@@ -2339,11 +2345,81 @@ def collect_proposals(path, meta):
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def pick_task():
+# ------------------------------------------------------------------ holds, enqueue
+
+
+def hold_until():
+    """When a held or failed publish may next be tried (None: at once)."""
+    minutes = float(cfg("PUBLISH_RETRY_MINUTES", "10") or 0)
+    if minutes <= 0:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime(ISO_FMT)
+
+
+def is_held(meta):
+    try:
+        return datetime.strptime(meta["held_until"], ISO_FMT).replace(tzinfo=timezone.utc) > datetime.now(timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def enqueue_task(arg):
+    """Validate a task file another program wrote and drop it into the queue. Returns (ok, message).
+
+    It arrives whole (a hard link from a temporary file next to pending/, so a watcher on pending/
+    sees one event and never a half-written file) and never overwrites a task of the same name.
+    A task that needs approval goes to proposed/ and is announced, exactly as if pick_task had found it.
+    """
+    path = Path(arg)
+    if not path.is_file():
+        return False, f"{arg}: no such file"
+    if not SAFE_NAME.match(path.stem):
+        return False, f"{path.name}: the name may only use letters, digits, '.', '_' and '-'"
+    meta, body = parse_task(path)
+    problems = validate_task(meta, body)
+    if problems:
+        return False, f"{path.name} is invalid:\n" + "\n".join(f"- {p}" for p in problems)
+    if (existing := find_task(path.stem)) is not None:
+        return False, f"{path.stem} is already in tasks/{existing.parent.name}/; pick another name"
+    gated = needs_approval(path, meta, body)
+    destination = (PROPOSED if gated else PENDING) / path.name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = TASKS / f".enqueue-{os.getpid()}-{path.name}.tmp"
+    try:
+        if gated:
+            meta["tier"] = str(tier_of(meta))
+            write_task(temporary, meta, body)
+        else:
+            shutil.copyfile(path, temporary)
+        try:
+            os.link(temporary, destination)  # fails rather than overwrite
+        except FileExistsError:
+            return False, f"{path.stem} is already in tasks/{destination.parent.name}/; pick another name"
+    finally:
+        temporary.unlink(missing_ok=True)
+    if not gated:
+        log.info("Enqueued %s", path.name)
+        return True, f"Queued {path.name} in tasks/pending/; the next dispatcher run picks it up."
+    with ledger_lock():
+        write_ledger(path.stem, {"task": path.stem, "tier": int(meta["tier"]), "digest": spec_digest(meta, body),
+                                 "status": "awaiting", "message_id": None, "at": now_iso()})
+    announce_proposals()
+    log.info("Enqueued %s: tier %s, waiting for approval", path.name, meta["tier"])
+    return True, f"{path.name} is tier {meta['tier']} and needs approval: waiting in tasks/proposed/ (announced on Telegram)."
+
+
+def pick_task(skip=()):
     candidates = sorted(PENDING.glob("*.md"), key=lambda p: (p.stat().st_mtime, p.name))
     waiting = 0
     for src in candidates:
+        if src.stem in skip:  # already handled in this run
+            continue
         meta, body = parse_task(src)
+        if meta and is_held(meta):  # a held PR or a failed publish: not before its time
+            continue
         blocked = None
         cancelled_dep = None
         for dep in dep_names(meta):
@@ -2853,11 +2929,16 @@ def cycle():
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     lock = open(LOCKFILE, "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        log.info("Another dispatcher run is active; exiting")
-        return 0
+    give_up = time.monotonic() + float(cfg("DISPATCH_LOCK_WAIT_SECONDS", "0") or 0)
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= give_up:  # no wait (cron), or the wait is over
+                log.info("Another dispatcher run is active; exiting")
+                return 0
+            time.sleep(0.5)  # a run started by a new file waits for the one that is working
     lock.write(str(os.getpid()))
     lock.flush()
 
@@ -2871,17 +2952,22 @@ def cycle():
     if daily_cap_reached():
         return 0
     announce_proposals()  # anything the coordinator left in proposed/
-    task = pick_task()
-    if task is None:
-        log.info("Queue empty; nothing to do")
-        return 0
-    process_task(task)
-    return 0
+    drain = cfg("DISPATCH_DRAIN") in ("1", "true", "yes")
+    handled = set()  # a task that needs another attempt waits for the next run, not a tight loop
+    while True:
+        task = pick_task(skip=handled)
+        if task is None:
+            log.info("Queue empty; nothing to do")
+            return 0
+        handled.add(task.stem)
+        process_task(task)
+        if not drain or queue_is_stopped() or daily_cap_reached():
+            return 0
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        actions = {"cancel": cancel_task, "retry": retry_task, "check": check_file}
+        actions = {"cancel": cancel_task, "retry": retry_task, "check": check_file, "enqueue": enqueue_task}
         if sys.argv[1] in actions and len(sys.argv) == 3:
             ok, message = actions[sys.argv[1]](sys.argv[2])
             print(message)
@@ -2893,6 +2979,7 @@ if __name__ == "__main__":
             "       dispatcher.py cancel <task-id>  archive a queued task to tasks/cancelled/\n"
             "       dispatcher.py retry <task-id>   requeue a failed/cancelled task, attempts reset\n"
             "       dispatcher.py check <file>      validate a task or recurring template file\n"
+            "       dispatcher.py enqueue <file>    validate a task file and drop it into the queue\n"
             "       dispatcher.py usage             claude calls, cost and turns by day and model",
             file=sys.stderr,
         )

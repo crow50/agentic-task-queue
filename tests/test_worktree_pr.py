@@ -29,7 +29,10 @@ class RepoSandbox(Sandbox):
         self.gh_script = self.root / "gh-script.json"
         self.origin = self.root / "origin.git"
         self.repo = self.base / "workspace" / "proj"
-        self.configure(GH_BIN=f"{shlex.quote(sys.executable)} {shlex.quote(str(FAKE_GH))}")
+        self.configure(
+            GH_BIN=f"{shlex.quote(sys.executable)} {shlex.quote(str(FAKE_GH))}",
+            PUBLISH_RETRY_MINUTES="0",  # the default waits minutes between tries; tests retry at once
+        )
         self.gh_rules([])
         self.make_repo()
 
@@ -258,6 +261,18 @@ class PublishFailureTests(PrCase):
         self.assertTrue((self.sb.base / "worktrees" / "t" / "feature.txt").exists())
         self.assertTrue(any("could not open a pull request" in t for t in self.sb.telegram.texts()))
 
+    def test_a_failed_publish_waits_before_the_next_try(self):
+        self.sb.configure(PUBLISH_RETRY_MINUTES="10")
+        self.sb.set_scenario(worker=[self.writes_feature()], review=[PASS])
+        self.sb.gh_rules(self.GH_FAILS)
+        self.pr_task()
+        self.sb.run()
+        self.sb.run()
+
+        self.assertEqual(len(self.sb.pr_creates()), 1)  # the second run left it alone
+        meta, _ = self.sb.read_task("pending", "t")
+        self.assertIn("held_until", meta)
+
     def test_a_missing_remote_is_a_publish_failure_not_a_crash(self):
         self.sb.git(self.sb.repo, "remote", "remove", "origin")
         self.sb.set_scenario(worker=[self.writes_feature()], review=[PASS])
@@ -284,6 +299,17 @@ class OpenPrCapTests(PrCase):
         notices = [t for t in self.sb.telegram.texts() if "held" in t.lower()]
         self.assertEqual(len(notices), 1)
         self.assertEqual(len(self.sb.claude_calls("worker")), 1)
+
+    def test_a_held_result_is_not_rechecked_until_its_hold_passes(self):
+        self.sb.configure(PUBLISH_RETRY_MINUTES="10")
+        self.sb.set_scenario(worker=[self.writes_feature()], review=[PASS])
+        self.open_prs(3)
+        self.pr_task()
+        self.sb.run()
+        self.sb.run()
+
+        lists = [c for c in self.sb.gh_calls() if c["argv"][:2] == ["pr", "list"]]
+        self.assertEqual(len(lists), 1)
 
     def test_the_held_result_is_published_once_a_pr_is_closed(self):
         self.sb.set_scenario(worker=[self.writes_feature()], review=[PASS])
