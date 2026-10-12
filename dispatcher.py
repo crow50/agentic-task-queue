@@ -314,6 +314,16 @@ FRONTMATTER_KEYS = {
     "value_class": (False, False, VALUE_CLASSES),  # may be absent: older files read as untagged
     "pending_review": (False, False, None),  # managed by the dispatcher
     "review_failures": (False, False, None),  # managed by the dispatcher
+    "tier": (False, False, ("0", "1", "2")),  # 0 reads, 1 writes in its workspace, 2 leaves the box; computed, see tier_of()
+    "repo": (False, False, None),  # a git checkout (name under REPOS_DIR or absolute path): worktree + draft pull request
+    "base": (False, False, None),  # branch the task branch starts from (default main)
+    "propose": (False, False, ("true", "false")),  # true: the worker may write follow-up proposals
+    "branch": (False, False, None),  # managed by the dispatcher
+    "pr_url": (False, False, None),  # managed by the dispatcher
+    "pending_publish": (False, False, None),  # managed by the dispatcher
+    "publish_failures": (False, False, None),  # managed by the dispatcher
+    "proposed_by": (False, False, None),  # managed by the dispatcher
+    "depth": (False, False, _whole_number(0)),  # managed by the dispatcher
     "schedule": (False, True, None),  # checked by check_schedule()
     "last_run": (False, True, None),  # managed by the dispatcher
 }
@@ -418,6 +428,114 @@ def allowed_tools_problem(value):
     return None
 
 
+# ------------------------------------------------------------ autonomy tiers
+#
+# Tier 0 reads, tier 1 writes inside the task's own workspace, tier 2 leaves the
+# box (push, pull requests, ssh, deploys). The dispatcher computes the tier from
+# allowed_tools, so a task file can't claim a lower one.
+
+READ_TOOLS = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"}
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+READ_ONLY_MCP = re.compile(r"^(fetch|get|list|search|read|query|find|describe|view)(_|-|$)")
+BASH_READ_ONLY = {"df", "du", "uptime", "free", "ls", "cat", "head", "tail", "wc", "pwd", "date"}
+BASH_OFF_BOX = {"ssh", "scp", "rsync", "curl", "wget", "nc", "kubectl", "docker", "systemctl", "sudo", "gh"}
+GH_NEVER = ("gh api", "gh pr merge", "gh pr ready", "gh repo", "gh auth", "gh workflow")
+GH_SAMPLES = ("gh api x", "gh pr merge 1", "gh pr ready 1", "gh repo delete x", "gh auth login", "gh workflow run x")
+
+
+def bash_inner(tool):
+    """The command pattern inside Bash(...), or None when the tool is not a Bash grant."""
+    if tool.startswith("Bash(") and tool.endswith(")"):
+        return tool[5:-1].strip()
+    return None
+
+
+def bash_tier(inner):
+    words = inner.split()
+    if not words:
+        return 2
+    if any(inner.startswith(extra) for extra in split_tools(cfg("TIER2_BASH"))):
+        return 2
+    first = words[0].removeprefix("./").rstrip("*?")
+    if any(char in first for char in "*?[") or not first:
+        return 2  # too broad to know what it runs
+    if first in BASH_OFF_BOX or first.startswith("deploy"):
+        return 2
+    if first == "git":
+        sub = words[1] if len(words) > 1 else ""
+        stripped = sub.rstrip("*?")
+        if stripped.startswith("push") or (stripped and sub != stripped and "push".startswith(stripped)):
+            return 2
+        return 1
+    if first in ("python3", "python", "pytest"):
+        return 1
+    if first == "bash":
+        return 1 if len(words) > 1 and words[1].startswith("scripts/verify-") else 2
+    return 0 if first in BASH_READ_ONLY else 2
+
+
+def tool_tier(tool):
+    inner = bash_inner(tool)
+    if inner is not None:
+        return bash_tier(inner)
+    name = tool.split("(")[0]
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        return 0 if len(parts) > 2 and READ_ONLY_MCP.match(parts[-1]) else 2
+    if name in READ_TOOLS:
+        return 0
+    if name in WRITE_TOOLS:
+        return 1
+    return 2  # Bash with no pattern, or a tool we have never heard of
+
+
+def task_tools(meta):
+    return split_tools(meta.get("allowed_tools") or cfg("DEFAULT_ALLOWED_TOOLS", "Read,Glob,Grep,Edit,Write"))
+
+
+def tier_of(meta):
+    if meta.get("repo"):
+        return 2  # the dispatcher itself pushes the branch and opens the pull request
+    return max((tool_tier(tool) for tool in task_tools(meta)), default=0)
+
+
+def never_granted(tool):
+    """Why no task may hold this tool, whatever TASK_ALLOWED_TOOLS says (None when it is fine)."""
+    if tool == "Bash":
+        return "bare Bash runs anything"
+    inner = bash_inner(tool)
+    if inner is None:
+        return None
+    if inner in ("", "*"):
+        return "Bash(*) runs anything"
+    if inner.startswith(GH_NEVER) or any(fnmatch.fnmatchcase(sample, inner) for sample in GH_SAMPLES):
+        return "it reaches the GitHub API or changes a repository beyond opening an issue or draft pull request"
+    if re.search(r"git push\b.*\s(-f|--force)", inner):
+        return "force-pushing rewrites history"
+    return None
+
+
+def autonomy_problems(meta):
+    """Problems with a task's tools, tier and repo that no allowlist can excuse."""
+    problems = []
+    tools = split_tools(meta.get("allowed_tools") or "")
+    for tool in tools:
+        if reason := never_granted(tool):
+            problems.append(f"allowed_tools grants {tool}, which no task may have ({reason})")
+    if meta.get("repo"):
+        if meta.get("cwd"):
+            problems.append("repo and cwd are mutually exclusive: a repo task runs in its own worktree")
+        for tool in tools:
+            if bash_inner(tool) is not None and bash_tier(bash_inner(tool)) == 2 and not never_granted(tool):
+                problems.append(
+                    f"a task with repo: may not grant {tool}; the dispatcher pushes the branch and opens the pull request"
+                )
+    declared = meta.get("tier")
+    if declared and declared != str(tier_of(meta)):
+        problems.append(f"tier {declared} does not match the tier {tier_of(meta)} its allowed_tools work out to")
+    return problems
+
+
 def validate_task(meta, body, template=False):
     problems = []
     if meta is None:
@@ -427,6 +545,7 @@ def validate_task(meta, body, template=False):
         problems.append("no '## Acceptance Criteria' section in task body")
     if meta.get("allowed_tools") and (problem := allowed_tools_problem(meta["allowed_tools"])):
         problems.append(problem)
+    problems += autonomy_problems(meta)
     mcp = mcp_config_path(meta)
     if mcp is not None and not mcp.is_file():
         problems.append(f"mcp_config file not found: {mcp}")
