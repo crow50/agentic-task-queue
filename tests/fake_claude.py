@@ -18,11 +18,23 @@ A step is a dict:
                                            exit non-zero printing exactly this
     {"fixture": "name.txt"}                print tests/fixtures/<name> verbatim
                                            (combine with "exit")
+    {"stream": [item, ...]}                with --output-format stream-json, print these events
+                                           between the init line and the result line (see below)
     {"write": {"path": "p", "content": "text"}}
                                            first write that file (path relative to
                                            the call's cwd, parents created), then
                                            act like the other keys say; combine
                                            with "result" for the reply text
+
+Called with `--output-format stream-json`, a success or error step prints JSON
+lines as the real CLI does (tests/fixtures/stream-sample.jsonl is a real run):
+a system/init line, the events of "stream", then the envelope as the final
+`result` line. A stream item is one of:
+    {"tool": "Edit", "input": {"file_path": "a.py"}, "tokens": 5}   an assistant tool_use
+    {"text": "words"}                      an assistant text block
+    {"sleep": 0.3}                         wait this many seconds (output is flushed per line)
+    {"event": {...}}                       any other event, printed as is
+Steps with "stdout" or "fixture" still print exactly that, in either format.
 
 Output is the envelope from tests/fixtures/envelope-success.json unless
 "stdout" or "fixture" is given. Every call is appended to
@@ -34,6 +46,7 @@ tests can count and inspect worker and review calls.
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -54,6 +67,29 @@ def role_of(prompt):
 
 def flag_value(argv, flag):
     return argv[argv.index(flag) + 1] if flag in argv[:-1] else None
+
+
+def emit(event):
+    print(json.dumps(event), flush=True)
+
+
+def emit_stream(items, envelope):
+    session = envelope.get("session_id", "fake-session")
+    emit({"type": "system", "subtype": "init", "session_id": session, "model": "fake", "tools": ["Read"]})
+    for item in items:
+        if "sleep" in item:
+            time.sleep(item["sleep"])
+        elif "event" in item:
+            emit(item["event"])
+        else:
+            block = (
+                {"type": "tool_use", "id": "toolu_fake", "name": item["tool"], "input": item.get("input", {})}
+                if "tool" in item else {"type": "text", "text": item.get("text", "")}
+            )
+            emit({"type": "assistant", "session_id": session, "parent_tool_use_id": None,
+                  "message": {"role": "assistant", "content": [block],
+                              "usage": {"input_tokens": 3, "output_tokens": item.get("tokens", 1)}}})
+    emit({**envelope, "type": "result"})
 
 
 def main(argv):
@@ -106,7 +142,10 @@ def main(argv):
         envelope.update(step.get("envelope", {}))
         if "result" in step:
             envelope["result"] = step["result"]
-        print(json.dumps(envelope))
+        if flag_value(argv, "--output-format") == "stream-json":
+            emit_stream(step.get("stream", []), envelope)
+        else:
+            print(json.dumps(envelope))
     if step.get("stderr"):
         sys.stderr.write(step["stderr"])
     return code

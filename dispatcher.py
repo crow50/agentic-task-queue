@@ -36,12 +36,14 @@ import html
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -743,8 +745,80 @@ def claude_env():
     return env
 
 
-def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label):
-    """One claude -p invocation: a ClaudeReply, or an exception. Never sleeps."""
+STREAM_EVENT_TYPES = {"system", "assistant", "user", "rate_limit_event", "stream_event"}
+
+
+def is_result_line(obj):
+    """The envelope `claude -p` ends a stream with (or prints alone with --output-format json)."""
+    return isinstance(obj, dict) and (obj.get("type") == "result" or ("type" not in obj and "is_error" in obj))
+
+
+def read_stream(proc, prompt, timeout_s, watcher, raw_path):
+    """Read a `--output-format stream-json` call while it runs; returns (out, err) like communicate().
+
+    Each event goes to watcher.feed() the moment it arrives, and watcher.tick()
+    runs about once a second when it is quiet. `out` is what the rest of the
+    dispatcher already understands: the final `result` line (the same envelope
+    --output-format json prints), or, when there is none, only the lines that
+    are not stream events, so a rate_limit_event can never read as a limit. The
+    raw stream goes to raw_path. Raises TimeoutExpired past timeout_s.
+    """
+    lines = queue.Queue()
+
+    def pump(pipe, tag):
+        try:
+            for line in pipe:
+                lines.put((tag, line))
+        finally:
+            lines.put((tag, None))
+
+    def write_prompt():
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except OSError:  # claude exited before reading it all
+            pass
+
+    for target, args in ((pump, (proc.stdout, "out")), (pump, (proc.stderr, "err")), (write_prompt, ())):
+        threading.Thread(target=target, args=args, daemon=True).start()
+
+    deadline = time.monotonic() + timeout_s
+    result, text, err, open_pipes = None, [], [], 2
+    with open(raw_path, "a") as raw:
+        while open_pipes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout_s)
+            try:
+                tag, line = lines.get(timeout=min(1.0, remaining))
+            except queue.Empty:
+                watcher.tick()
+                continue
+            if line is None:
+                open_pipes -= 1
+            elif tag == "err":
+                err.append(line)
+            else:
+                raw.write(line)
+                raw.flush()
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    event = None
+                if is_result_line(event):
+                    result = line
+                elif not (isinstance(event, dict) and event.get("type") in STREAM_EVENT_TYPES):
+                    text.append(line)
+                watcher.feed(event)
+    proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+    return (result if result is not None else "".join(text)), "".join(err)
+
+
+def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label, watcher=None):
+    """One claude -p invocation: a ClaudeReply, or an exception. Never sleeps.
+
+    With a watcher the call is read as it runs (--output-format stream-json): see read_stream().
+    """
     model = model_of(cmd)
     command = " ".join(cmd)
     append_transcript(transcript, f"\n=== {label} @ {now_iso()} ===\n$ {command}")
@@ -762,7 +836,10 @@ def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label):
     except OSError as exc:  # binary vanished or isn't executable
         raise ClaudeError(f"cannot execute {cmd[0]!r}: {exc}")
     try:
-        out, err = proc.communicate(prompt, timeout=timeout_s)
+        if watcher is None:
+            out, err = proc.communicate(prompt, timeout=timeout_s)
+        else:
+            out, err = read_stream(proc, prompt, timeout_s, watcher, transcript.with_suffix(".stream.jsonl"))
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -796,7 +873,7 @@ def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label):
     raise ClaudeError(message)
 
 
-def run_claude(cmd, prompt, timeout_s, cwd, transcript, label, retries=None):
+def run_claude(cmd, prompt, timeout_s, cwd, transcript, label, retries=None, watcher=None):
     """Run one claude -p invocation, retrying a transient rate limit with backoff.
 
     Raises RateLimited when the limit outlasts the retries (or names a reset
@@ -804,7 +881,7 @@ def run_claude(cmd, prompt, timeout_s, cwd, transcript, label, retries=None):
     """
     try:
         return rate_limit_retrying(label, retries)(
-            _call_claude, cmd, prompt, timeout_s, cwd, transcript, label
+            _call_claude, cmd, prompt, timeout_s, cwd, transcript, label, watcher
         )
     except TransientLimit as exc:
         raise RateLimited(str(exc)) from None
@@ -863,28 +940,61 @@ def telegram_configured():
     return False
 
 
-def post_message(raw):
-    """sendMessage as HTML, or as plain text when Telegram returns 400. True once it was sent."""
+def send_message_id(raw, formatted=True):
+    """sendMessage (HTML first when `formatted`, plain text if Telegram returns 400).
+
+    Returns the new message's id (0 if Telegram answered without one), or None
+    when nothing was sent. The id is what editMessageText and reactions refer to.
+    """
     chat_id = cfg("TELEGRAM_CHAT_ID")
-    variants = (
-        {"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"},
-        {"chat_id": chat_id, "text": raw},
-    )
-    for formatted, params in zip((True, False), variants):
+    variants = [({"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"}, True)] if formatted else []
+    variants.append(({"chat_id": chat_id, "text": raw}, False))
+    for params, is_html in variants:
         data = urllib.parse.urlencode(params).encode()
         try:
-            urllib.request.urlopen(telegram_url("sendMessage"), data, timeout=30)
-            log.info("Telegram notification sent")
-            return True
+            with urllib.request.urlopen(telegram_url("sendMessage"), data, timeout=30) as reply:
+                body = reply.read()
         except urllib.error.HTTPError as exc:
-            if formatted and exc.code == 400:  # bad entities — resend unformatted
+            if is_html and exc.code == 400:  # bad entities — resend unformatted
                 log.warning("Telegram rejected HTML formatting; resending as plain text")
                 continue
             log.warning("Telegram notification failed: %s", exc)
-            return False
+            return None
         except Exception as exc:  # notification failure must never fail the task
             log.warning("Telegram notification failed: %s", exc)
-            return False
+            return None
+        log.info("Telegram notification sent")
+        try:
+            return int(json.loads(body)["result"]["message_id"])
+        except (ValueError, KeyError, TypeError):
+            return 0
+    return None
+
+
+def post_message(raw):
+    """sendMessage as HTML, or as plain text when Telegram returns 400. True once it was sent."""
+    return send_message_id(raw) is not None
+
+
+def edit_message(message_id, raw):
+    """editMessageText as plain text. True when done (or harmlessly unchanged), False on failure,
+    or the seconds Telegram asked us to wait after a 429."""
+    data = urllib.parse.urlencode({"chat_id": cfg("TELEGRAM_CHAT_ID"), "message_id": message_id, "text": raw}).encode()
+    try:
+        urllib.request.urlopen(telegram_url("editMessageText"), data, timeout=30).close()
+        return True
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read())
+        except (ValueError, OSError):
+            detail = {}
+        if exc.code == 400 and "not modified" in str(detail.get("description", "")):
+            return True
+        if exc.code == 429:
+            return float((detail.get("parameters") or {}).get("retry_after") or 30)
+        log.warning("Telegram edit failed: %s", exc.code)
+    except Exception as exc:  # a status edit must never fail the task
+        log.warning("Telegram edit failed: %s", type(exc).__name__)
     return False
 
 
@@ -905,6 +1015,154 @@ def post_document(name, source):
         return False
     log.info("Telegram document %s sent", name)
     return True
+
+
+# ------------------------------------------------------------- live status
+
+
+def describe_event(event):
+    """The tool a stream-json `assistant` event is calling: {tool, target, tokens, id}, or None for any other event."""
+    if not isinstance(event, dict) or event.get("type") != "assistant":
+        return None
+    message = event.get("message") or {}
+    uses = [b for b in message.get("content") or [] if isinstance(b, dict) and b.get("type") == "tool_use"]
+    if not uses:
+        return None
+    name, tool_input = uses[-1].get("name") or "", uses[-1].get("input") or {}
+    target = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("pattern") \
+        or str(tool_input.get("command") or "")[:40]
+    target = str(target)
+    if len(target) > 60:
+        target = "…" + target[-59:]
+    return {
+        "tool": name, "target": target, "id": message.get("id"),
+        "tokens": int((message.get("usage") or {}).get("output_tokens") or 0),
+    }
+
+
+def clock_text(seconds):
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m{secs:02d}s"
+
+
+class StatusEditor:
+    """One Telegram message that follows a worker run: the current tool and file, elapsed time, steps and tokens.
+
+    Nothing is sent until the worker first calls a tool. Afterwards the message is
+    edited at most once per `interval` seconds (STATUS_EDIT_INTERVAL_SECONDS), plain
+    text, whatever the number of events. finish() waits out the interval before
+    its last edit. Every Telegram failure is swallowed: a status message is never
+    allowed to fail a task. `send(text)` returns the message id (None = could not
+    send); `edit(message_id, text)` returns True, False, or seconds to back off.
+    """
+
+    def __init__(self, title, send, edit, clock=time.monotonic, interval=None, sleep=time.sleep):
+        self.title, self._send, self._edit, self._clock, self._sleep = title, send, edit, clock, sleep
+        self.interval = float(cfg("STATUS_EDIT_INTERVAL_SECONDS", "10")) if interval is None else float(interval)
+        self.started = clock()
+        self.message_id = None
+        self.dead = False  # the message could not be sent: leave the chat alone
+        self.last_call = None
+        self.blocked_until = 0.0
+        self.last_text = None
+        self.tool = self.target = ""
+        self.steps = 0
+        self.tokens = {}
+        self.cost = None
+
+    def feed(self, event):
+        """The stream-reader's hook: one parsed event (or None for an unparseable line)."""
+        try:
+            if isinstance(event, dict) and event.get("type") == "result":
+                self.cost = event.get("total_cost_usd")
+            elif info := describe_event(event):
+                self.event(info)
+        except Exception as exc:  # noqa: BLE001 - a status bug must never fail the task
+            log.warning("status update failed: %s", type(exc).__name__)
+
+    def event(self, info):
+        self.tool, self.target = info["tool"], info.get("target") or ""
+        self.steps += 1
+        key = info.get("id") or object()
+        self.tokens[key] = max(self.tokens.get(key, 0), int(info.get("tokens") or 0))
+        self._push()
+
+    def tick(self):
+        """Quiet stretch: refresh the elapsed time, still no faster than the interval."""
+        self._push()
+
+    def _elapsed(self):
+        return clock_text(self._clock() - self.started)
+
+    def _detail(self):
+        total = sum(self.tokens.values())
+        tokens = f"{total / 1000:.1f}k" if total >= 1000 else str(total)
+        return f"{self._elapsed()} · {self.steps} steps · {tokens} tokens"
+
+    def _text(self):
+        return f"⚙️ {self.title}\n🔧 {self.tool} {self.target}".rstrip() + f"\n⏱ {self._detail()}"
+
+    def _due(self):
+        now = self._clock()
+        return now >= self.blocked_until and (self.last_call is None or now - self.last_call >= self.interval)
+
+    def _push(self):
+        if self.dead or not self.steps:
+            return
+        text = self._text()
+        if self.message_id is None:
+            self.last_call = self._clock()
+            try:
+                self.message_id = self._send(text)
+            except Exception:  # noqa: BLE001
+                self.message_id = None
+            self.dead = not self.message_id  # None, or 0 (no id to edit)
+            self.last_text = text
+        elif text != self.last_text and self._due():
+            self._do_edit(text)
+
+    def _do_edit(self, text):
+        self.last_call = self._clock()
+        try:
+            result = self._edit(self.message_id, text)
+        except Exception:  # noqa: BLE001
+            result = False
+        if isinstance(result, (int, float)) and not isinstance(result, bool):  # Telegram said to wait
+            self.blocked_until = self._clock() + float(result)
+        self.last_text = text
+
+    def finish(self, outcome, cost=None):
+        """The last edit: how it ended, how long, and the exact cost. Waits for the interval first."""
+        if self.dead or not self.message_id:
+            return
+        if cost is not None:
+            self.cost = cost
+        wait = self.interval - (self._clock() - self.last_call) if self.last_call is not None else 0
+        if wait > 0:
+            self._sleep(wait)
+        cost = f" · ${float(self.cost):.2f}" if self.cost is not None else ""
+        self._do_edit(f"{outcome}\n{self.title} · {self._detail()}{cost}")
+
+
+class QuietWatcher:
+    """The stream reader's hook when nobody wants a status message."""
+
+    def feed(self, event):
+        pass
+
+    def tick(self):
+        pass
+
+
+def start_status(path, meta):
+    """A StatusEditor for this task's worker run, or None when there is nobody to tell (no Telegram, a quiet task)."""
+    if meta.get("quiet") == "true" or not (cfg("TELEGRAM_BOT_TOKEN") and cfg("TELEGRAM_CHAT_ID")):
+        return None
+    return StatusEditor(
+        path.name,
+        send=lambda text: send_message_id(text, formatted=False),
+        edit=edit_message,
+    )
 
 
 def fit_preview(prefix, text, suffix):
@@ -1784,6 +2042,28 @@ def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials,
 
 
 def process_task(path):
+    """Run one task through worker, verify and review, with a live status message while the worker works."""
+    meta, _ = parse_task(path)
+    status = start_status(path, meta or {})
+    try:
+        run_task(path, status)
+    finally:
+        if status is not None:
+            status.finish(status_outcome(path.name))
+
+
+def status_outcome(name):
+    """How the attempt ended, judged by where the task file went."""
+    if (DONE / name).exists():
+        return "✅ Passed"
+    if (FAILED / name).exists():
+        return "❌ Failed"
+    if (PENDING / name).exists():
+        return "↩️ Needs another attempt (or waiting for the limit to reset)"
+    return "⏹ Stopped"
+
+
+def run_task(path, status=None):
     name = path.name
     meta, body = parse_task(path)
 
@@ -1833,7 +2113,7 @@ def process_task(path):
             claude_bin, "-p",
             "--model", model,
             "--allowedTools", tools,
-            "--output-format", "json",
+            "--output-format", "stream-json", "--verbose",
         ]
         mcp = mcp_config_path(meta)
         if mcp is not None:
@@ -1841,7 +2121,8 @@ def process_task(path):
             log.info("Task %s: MCP servers from %s", name, mcp)
         try:
             reply = run_claude(
-                worker_cmd, WORKER_PREAMBLE + "\n\n" + body, timeout_min * 60, cwd, transcript, "worker"
+                worker_cmd, WORKER_PREAMBLE + "\n\n" + body, timeout_min * 60, cwd, transcript, "worker",
+                watcher=status or QuietWatcher(),
             )
         except RateLimited as exc:
             requeue_unconsumed(path, meta, body, attempts)
