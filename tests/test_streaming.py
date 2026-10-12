@@ -8,7 +8,6 @@ current tool, file, elapsed time and, at the end, the cost.
 
 import json
 import subprocess
-import sys
 import time
 import unittest
 
