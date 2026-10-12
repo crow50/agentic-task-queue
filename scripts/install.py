@@ -39,6 +39,7 @@ from pathlib import Path
 MIN_PYTHON = (3, 11)
 REPO = Path(__file__).resolve().parent.parent
 SERVICE = "claude-coordinator"
+DISPATCH_UNITS = ("taskq-dispatch.path", "taskq-dispatch.service")  # the path unit starts the service
 CRON_BEGIN = "# agentic-task-queue: managed by scripts/install.py (replaced on every install)"
 CRON_END = "# end agentic-task-queue"
 CLAUDE_INSTALL = "curl -fsSL https://claude.ai/install.sh | bash"
@@ -47,7 +48,7 @@ PROBE_MODEL = "claude-haiku-4-5-20251001"
 TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}")
 TOKEN_WARN_DAYS = 335  # 11 months; setup-token logins last a year
 QUEUE_DIRS = ("tasks/pending", "tasks/active", "tasks/done", "tasks/failed",
-              "tasks/recurring", "tasks/cancelled", "logs", "state", "workspace")
+              "tasks/recurring", "tasks/cancelled", "tasks/proposed", "logs", "state", "workspace", "worktrees")
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
 
@@ -573,6 +574,39 @@ def step_render(ctx, claude_bin, env_changed):
         ctx.changed(f"{SERVICE} restarted")
 
 
+def dispatch_templates(ctx):
+    """[(unit name, template path)] for the event-driven start; empty when this checkout predates it."""
+    found = [(name, ctx.base / "coordinator" / f"{name}.template") for name in DISPATCH_UNITS]
+    return found if all(template.exists() for _, template in found) else []
+
+
+def step_dispatch_units(ctx, claude_bin):
+    """A .path unit watching tasks/pending/ starts a oneshot dispatcher run within seconds; cron stays as the fallback."""
+    templates = dispatch_templates(ctx)
+    if not templates:
+        return
+    values, changed = template_values(ctx, claude_bin), False
+    for name, template in templates:
+        unit = ctx.system.unit_dir / name
+        if write_file(unit, render(template.read_text(), values)):
+            ctx.changed(str(unit))
+            changed = True
+    if not ctx.system.has_systemd():
+        ctx.say("  systemd is not running here: dispatch units written, not enabled")
+        return
+    if changed:
+        ctx.system.systemctl("daemon-reload")
+    path_unit = DISPATCH_UNITS[0]
+    active = ctx.system.systemctl("is-active", path_unit).stdout.strip() == "active"
+    enabled = ctx.system.systemctl("is-enabled", path_unit).stdout.strip() == "enabled"
+    if not (active and enabled):
+        ctx.system.systemctl("enable", "--now", path_unit)
+        ctx.changed(f"{path_unit} enabled and started")
+    elif changed:
+        ctx.system.systemctl("restart", path_unit)
+        ctx.changed(f"{path_unit} restarted")
+
+
 def step_cron(ctx):
     existing = ctx.system.crontab_read(ctx.user)
     merged = merge_crontab(existing, ctx.base)
@@ -611,12 +645,15 @@ def install(ctx):
     step_venv(ctx)
     updates = step_telegram(ctx)
     updates["CLAUDE_BIN"] = claude_bin
+    if "APPROVAL_MIN_TIER" not in ctx.env():  # an existing install: ask before anything that writes runs; an explicit value stays
+        updates["APPROVAL_MIN_TIER"] = "1"
     env_changed = write_env(ctx, updates)
     token_updates = step_token(ctx, claude_bin)
     if token_updates:
         env_changed = write_env(ctx, token_updates) or env_changed
     step_deny_rules(ctx)
     step_render(ctx, claude_bin, env_changed)
+    step_dispatch_units(ctx, claude_bin)
     step_cron(ctx)
     for problem in clock_problems(ctx):
         ctx.say(f"  warning: {problem}")
@@ -697,6 +734,24 @@ def run_checks(ctx):
             "unit matches template", str(unit))
     except (InstallError, OSError) as exc:
         add(False, "unit matches template", str(exc))
+
+    templates = dispatch_templates(ctx)
+    if templates:
+        if ctx.system.has_systemd():
+            state = ctx.system.systemctl("is-active", DISPATCH_UNITS[0]).stdout.strip()
+            add(state == "active", "dispatch path unit",
+                f"{DISPATCH_UNITS[0]}: {state} (cron still runs the queue every 15 minutes)", level=WARN, notify=True)
+        try:
+            values = template_values(ctx, claude_bin or "/usr/local/bin/claude")
+            stale = [name for name, template in templates
+                     if not (ctx.system.unit_dir / name).exists()
+                     or (ctx.system.unit_dir / name).read_text() != render(template.read_text(), values)]
+            add(not stale, "dispatch units match templates", ", ".join(stale) or "both current", level=WARN, notify=False)
+        except (InstallError, OSError) as exc:
+            add(False, "dispatch units match templates", str(exc), level=WARN, notify=False)
+    tier = env.get("APPROVAL_MIN_TIER", "")
+    add(tier.isdigit() and int(tier) > 0, "approval gate",
+        f"APPROVAL_MIN_TIER={tier or 'unset'}: tasks that write run without your 👍 (set it to 1)", level=WARN, notify=False)
 
     missing = [rel for rel in QUEUE_DIRS if ctx.system.run_as(ctx.user, ["test", "-w", str(ctx.base / rel)]).returncode]
     add(not missing, "queue folders writable", ", ".join(missing) or "all present")

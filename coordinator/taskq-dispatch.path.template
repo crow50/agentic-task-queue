@@ -1,0 +1,11 @@
+[Unit]
+Description=Start the Claude task queue when a task file arrives
+
+[Path]
+# Fire on a change, not while the folder holds files: tasks waiting on a
+# dependency stay in pending/ and would restart the service in a loop.
+PathChanged={{BASE}}/tasks/pending
+Unit=taskq-dispatch.service
+
+[Install]
+WantedBy=multi-user.target

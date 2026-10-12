@@ -1,0 +1,20 @@
+[Unit]
+Description=Claude task queue dispatcher (started when a task file arrives)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User={{USER}}
+Group={{GROUP}}
+WorkingDirectory={{BASE}}
+Environment=PATH={{CLAUDE_DIR}}:/usr/local/bin:/usr/bin:/bin
+# Keep going until the queue is empty, and wait for a run that is already working
+# instead of exiting. Cron leaves both off.
+Environment=DISPATCH_DRAIN=1
+Environment=DISPATCH_LOCK_WAIT_SECONDS=60
+ExecStart={{BASE}}/.venv/bin/python3 {{BASE}}/dispatcher.py
+# A task may run for as long as its own timeout_minutes says.
+TimeoutStartSec=0
+NoNewPrivileges=true
+PrivateTmp=true
