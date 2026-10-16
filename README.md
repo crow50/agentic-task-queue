@@ -106,6 +106,9 @@ verify: bash scripts/verify-a.sh              # optional: a command the dispatch
 review: skip                                  # optional: with verify, end the task on exit 0 without a reviewer call
 value_class: deliverable                      # optional: deliverable, research, verification or admin
 quiet: true                                   # optional: no "Task done" message on a pass (failures are still reported)
+repo: sideburn                                # optional: run in a git worktree and end as a draft pull request (see Autonomy)
+base: main                                    # optional: branch the pull request is against (default main)
+propose: true                                 # optional: the worker may propose follow-up tasks (see Autonomy)
 attempts: 0                                   # managed by the dispatcher
 ---
 # Task title
@@ -310,6 +313,93 @@ touching the dispatcher. The opener runs the full test suite (a minute or more),
 so the task allows a generous `timeout_minutes`. `tasks/proposals/` is
 patch-only; it is not an inbox for items that need your attention.
 
+## Autonomy you can watch
+
+Send an idea from your phone, watch it work, review a pull request. Nothing
+here merges anything.
+
+### Tiers
+
+The dispatcher works out a task's tier from its `allowed_tools`; a `tier:` line
+in the file is only checked against it, so the coordinator can't mislabel one.
+
+| Tier | Grants | Runs |
+| --- | --- | --- |
+| 0 | `Read`, `Glob`, `Grep`, `WebSearch`, `WebFetch`, read-only commands (`df`, `du`, `ls`, …), read-style MCP tools | at once |
+| 1 | `Write`, `Edit`, `python3 …`, `pytest`, `git …` (not push) | after your 👍 |
+| 2 | `git push`, `gh pr`, `gh issue`, `ssh`, `curl`, deploys, unknown tools and commands, and any task with `repo:` | after your 👍 |
+
+`APPROVAL_MIN_TIER` (set to 1 by the installer; 0 turns the gate off) decides
+which tiers wait. A task that waits is parked in `tasks/proposed/` and
+announced on Telegram with its spec, acceptance criteria, tools and `verify:`
+line. React 👍 to run it or 👎 to drop it (or send `/approve <id>` or
+`/reject <id>`, which also works in groups where bots can't see reactions). The
+reaction is handled in code, not by the coordinator model. The approval is stored in
+`state/approvals/` (which `claude` can't write) with a digest of the spec: edit
+the spec afterwards and the task is announced again. Recurring instances are
+exempt because you installed their template. Some grants are refused whatever
+`TASK_ALLOWED_TOOLS` says: `gh api`, `Bash(gh *)`, `gh pr merge`, `gh pr ready`,
+`gh repo`, `gh auth`, `gh workflow`, force pushes and bare `Bash`.
+
+### Idea to draft pull request
+
+A task with `repo: <name>` (a checkout under `REPOS_DIR`, default `workspace/`,
+or an absolute path) works like this:
+
+1. you message an idea; the coordinator writes the spec, acceptance criteria and a
+   `verify:` command, and the dispatcher asks for your 👍;
+2. the worker runs in `worktrees/<id>` on branch `task/<id>` cut from `base`
+   (default `main`). It is denied `git push` and `gh`;
+3. `verify:` and the review run as usual. A failing `verify:` makes no pull request;
+4. only then the dispatcher commits, pushes, runs `gh pr create --draft` and
+   sends you the link.
+
+Only tasks with `repo:` get a branch and a pull request. Research, reports and
+admin tasks never do. To keep the noise down, at most `MAX_OPEN_PRS` (3) task
+pull requests are open at once: at the cap the finished work is held, you get
+one notice, and it is published when you merge or close one. An empty change
+makes no pull request. A failed push or `gh` call is retried (no attempt is
+used, the work isn't redone) and fails the task after three tries. The
+worktree is deleted when the pull request is opened; the branch stays. The
+dispatcher runs `verify:` with its own python, not the repo's venv.
+
+### The live status message
+
+The worker runs with `claude -p --output-format stream-json --verbose`. On its
+first tool call the dispatcher sends one Telegram message and then edits it, at
+most every `STATUS_EDIT_INTERVAL_SECONDS` (10): the current tool and file,
+elapsed time, steps and output tokens. The exact cost is only known when the
+run ends, so the last edit shows it. The result still arrives as a new
+message (an edit doesn't notify you). `quiet: true` tasks get no status
+message. The raw stream is kept in `logs/<task>.attempt-<N>.stream.jsonl`.
+
+To steer a run by hand, use Remote Control from a separate Claude login. The
+long-lived `CLAUDE_CODE_OAUTH_TOKEN` can't start those sessions, so sign in
+normally with `CLAUDE_CONFIG_DIR=~/.claude-remote claude` and start it there.
+
+### Start on events
+
+- `python3 dispatcher.py enqueue <file>` validates a task file and drops it into
+  the queue (atomically, never over an existing name; a task that needs approval
+  goes to `proposed/` and is announced). Other programs can call it.
+- `taskq-dispatch.path` watches `tasks/pending/` and starts
+  `taskq-dispatch.service` within seconds. The service sets `DISPATCH_DRAIN=1`
+  (one run empties the queue) and `DISPATCH_LOCK_WAIT_SECONDS=60` (a run
+  started while another works waits instead of exiting). `install.py` installs and
+  enables both. Cron stays as the fallback and still runs one task per run.
+- After a held or failed pull request publish the task waits
+  `PUBLISH_RETRY_MINUTES` (10), so a watched folder can't spin on it.
+
+### Follow-up tasks
+
+A task with `propose: true` may write task files to its own staging folder,
+`tasks/proposed/.incoming/<id>/`, and nowhere else. When it passes, the
+dispatcher validates each file, stamps `proposed_by` and `depth` itself (the
+worker's values are ignored) and files them in `tasks/proposed/` to wait for your
+👍. A proposal never runs without it, even with the gate off. Limits:
+`MAX_PROPOSALS_PER_TASK` (5), `MAX_PROPOSAL_DEPTH` (2), and
+`MAX_ATTEMPTS_PER_DAY` still applies to everything that runs.
+
 ## Giving tasks MCP access
 
 Tasks can use MCP servers (databases, APIs, fetch, GitHub, …) in two ways:
@@ -476,7 +566,8 @@ does what is missing. It:
    writes `state/claude-token-renewal.ics` (import it into your calendar);
 4. renders `coordinator/CLAUDE.md` and the systemd unit from their `.template`
    files, filling in `{{BASE}}` and the user, and enables the coordinator service;
-5. installs two cron lines for `taskq`, replacing any old ones: the dispatcher
+5. installs and enables the `taskq-dispatch.path` unit (starts a run when a task file
+   arrives), and two cron lines for `taskq`, replacing any old ones: the dispatcher
    every 15 minutes, and a daily `install.py --check --quiet --notify`;
 6. adds permission deny rules for `.env`, `state/` and the claude credentials to
    `~taskq/.claude/settings.json`;
@@ -563,7 +654,8 @@ Pi can't message you itself. No ping is sent while the login is expired.
 
 ## Operations
 
-- **Watch the queue**: `ls tasks/pending tasks/active tasks/done tasks/failed`
+- **Watch the queue**: `ls tasks/pending tasks/active tasks/done tasks/failed`, or `/status` in the chat
+  (it also lists `proposed`, the tasks waiting for your 👍).
 - **Remove a queued task**: `/cancel <task-id>` in the Telegram chat, ask
   the coordinator, or `python3 dispatcher.py cancel <task-id>` — the task
   is archived to `tasks/cancelled/`. Undo by moving the file back to

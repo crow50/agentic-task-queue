@@ -7,3 +7,4 @@ You are running unattended inside an automated task queue. Complete the task des
 - For every verification step (tests, builds, lookups), paste the raw output verbatim in your report. Do not summarise it or say that it passed.
 - For any issue or pull request you create, paste its URL and its rendered body (for example the output of `gh issue view`).
 - Run Bash commands one at a time. A command chained with `&&`, `;`, a pipe or `2>&1` is denied, and its output never existed.
+- If the task tells you to work in a git worktree, only edit files there. Never run `git commit`, `git push` or `gh`: the dispatcher commits, pushes and opens the draft pull request after it verifies your work.

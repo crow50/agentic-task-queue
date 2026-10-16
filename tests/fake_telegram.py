@@ -14,8 +14,9 @@ e.g. a 400 to exercise the HTML-to-plain-text fallback.
 import json
 import re
 import threading
+import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -26,6 +27,7 @@ class Request:
     content_type: str
     params: dict  # decoded form / JSON / query parameters
     body: bytes  # raw body, for multipart uploads
+    at: float = field(default_factory=time.monotonic)  # when it arrived, for rate-limit assertions
 
 
 class FakeTelegram:
@@ -70,6 +72,10 @@ class FakeTelegram:
 
     def calls(self, method=None):
         return [r for r in self.requests if method is None or r.method == method]
+
+    def edits(self):
+        """The editMessageText requests, in order."""
+        return self.calls("editMessageText")
 
     def texts(self):
         return [r.params.get("text") for r in self.calls("sendMessage")]

@@ -32,16 +32,20 @@ Usage: python3 dispatcher.py                   (typically from cron every 15 min
 import difflib
 import fcntl
 import fnmatch
+import hashlib
 import html
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -77,8 +81,11 @@ DONE = TASKS / "done"
 FAILED = TASKS / "failed"
 RECURRING = TASKS / "recurring"
 CANCELLED = TASKS / "cancelled"
+PROPOSED = TASKS / "proposed"  # waiting for your 👍 before they may run
 LOGS = BASE / "logs"
 STATE = BASE / "state"
+WORKTREES = BASE / "worktrees"  # one git worktree per task that sets repo:
+APPROVALS = STATE / "approvals"  # one <task>.json per task that needed approval; claude cannot write state/
 LOCKFILE = BASE / "dispatcher.lock"
 PAUSED_FILE = STATE / "paused_until"  # first line: ISO UTC time; second line: why
 AUTH_FAILED_FILE = STATE / "auth_failed"  # present while the claude login is known to be expired
@@ -320,6 +327,17 @@ FRONTMATTER_KEYS = {
     "value_class": (False, False, VALUE_CLASSES),  # may be absent: older files read as untagged
     "pending_review": (False, False, None),  # managed by the dispatcher
     "review_failures": (False, False, None),  # managed by the dispatcher
+    "tier": (False, False, ("0", "1", "2")),  # 0 reads, 1 writes in its workspace, 2 leaves the box; computed, see tier_of()
+    "repo": (False, False, None),  # a git checkout (name under REPOS_DIR or absolute path): worktree + draft pull request
+    "base": (False, False, None),  # branch the task branch starts from (default main)
+    "propose": (False, False, ("true", "false")),  # true: the worker may write follow-up proposals
+    "branch": (False, False, None),  # managed by the dispatcher
+    "pr_url": (False, False, None),  # managed by the dispatcher
+    "pending_publish": (False, False, None),  # managed by the dispatcher
+    "held_until": (False, False, None),  # managed by the dispatcher: not before this time
+    "publish_failures": (False, False, None),  # managed by the dispatcher
+    "proposed_by": (False, False, None),  # managed by the dispatcher
+    "depth": (False, False, _whole_number(0)),  # managed by the dispatcher
     "schedule": (False, True, None),  # checked by check_schedule()
     "last_run": (False, True, None),  # managed by the dispatcher
 }
@@ -424,6 +442,114 @@ def allowed_tools_problem(value):
     return None
 
 
+# ------------------------------------------------------------ autonomy tiers
+#
+# Tier 0 reads, tier 1 writes inside the task's own workspace, tier 2 leaves the
+# box (push, pull requests, ssh, deploys). The dispatcher computes the tier from
+# allowed_tools, so a task file can't claim a lower one.
+
+READ_TOOLS = {"Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"}
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+READ_ONLY_MCP = re.compile(r"^(fetch|get|list|search|read|query|find|describe|view)(_|-|$)")
+BASH_READ_ONLY = {"df", "du", "uptime", "free", "ls", "cat", "head", "tail", "wc", "pwd", "date"}
+BASH_OFF_BOX = {"ssh", "scp", "rsync", "curl", "wget", "nc", "kubectl", "docker", "systemctl", "sudo", "gh"}
+GH_NEVER = ("gh api", "gh pr merge", "gh pr ready", "gh repo", "gh auth", "gh workflow")
+GH_SAMPLES = ("gh api x", "gh pr merge 1", "gh pr ready 1", "gh repo delete x", "gh auth login", "gh workflow run x")
+
+
+def bash_inner(tool):
+    """The command pattern inside Bash(...), or None when the tool is not a Bash grant."""
+    if tool.startswith("Bash(") and tool.endswith(")"):
+        return tool[5:-1].strip()
+    return None
+
+
+def bash_tier(inner):
+    words = inner.split()
+    if not words:
+        return 2
+    if any(inner.startswith(extra) for extra in split_tools(cfg("TIER2_BASH"))):
+        return 2
+    first = words[0].removeprefix("./").rstrip("*?")
+    if any(char in first for char in "*?[") or not first:
+        return 2  # too broad to know what it runs
+    if first in BASH_OFF_BOX or first.startswith("deploy"):
+        return 2
+    if first == "git":
+        sub = words[1] if len(words) > 1 else ""
+        stripped = sub.rstrip("*?")
+        if stripped.startswith("push") or (stripped and sub != stripped and "push".startswith(stripped)):
+            return 2
+        return 1
+    if first in ("python3", "python", "pytest"):
+        return 1
+    if first == "bash":
+        return 1 if len(words) > 1 and words[1].startswith("scripts/verify-") else 2
+    return 0 if first in BASH_READ_ONLY else 2
+
+
+def tool_tier(tool):
+    inner = bash_inner(tool)
+    if inner is not None:
+        return bash_tier(inner)
+    name = tool.split("(")[0]
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        return 0 if len(parts) > 2 and READ_ONLY_MCP.match(parts[-1]) else 2
+    if name in READ_TOOLS:
+        return 0
+    if name in WRITE_TOOLS:
+        return 1
+    return 2  # Bash with no pattern, or a tool we have never heard of
+
+
+def task_tools(meta):
+    return split_tools(meta.get("allowed_tools") or cfg("DEFAULT_ALLOWED_TOOLS", "Read,Glob,Grep,Edit,Write"))
+
+
+def tier_of(meta):
+    if meta.get("repo"):
+        return 2  # the dispatcher itself pushes the branch and opens the pull request
+    return max((tool_tier(tool) for tool in task_tools(meta)), default=0)
+
+
+def never_granted(tool):
+    """Why no task may hold this tool, whatever TASK_ALLOWED_TOOLS says (None when it is fine)."""
+    if tool == "Bash":
+        return "bare Bash runs anything"
+    inner = bash_inner(tool)
+    if inner is None:
+        return None
+    if inner in ("", "*"):
+        return "Bash(*) runs anything"
+    if inner.startswith(GH_NEVER) or any(fnmatch.fnmatchcase(sample, inner) for sample in GH_SAMPLES):
+        return "it reaches the GitHub API or changes a repository beyond opening an issue or draft pull request"
+    if re.search(r"git push\b.*\s(-f|--force)", inner):
+        return "force-pushing rewrites history"
+    return None
+
+
+def autonomy_problems(meta):
+    """Problems with a task's tools, tier and repo that no allowlist can excuse."""
+    problems = []
+    tools = split_tools(meta.get("allowed_tools") or "")
+    for tool in tools:
+        if reason := never_granted(tool):
+            problems.append(f"allowed_tools grants {tool}, which no task may have ({reason})")
+    if meta.get("repo"):
+        if meta.get("cwd"):
+            problems.append("repo and cwd are mutually exclusive: a repo task runs in its own worktree")
+        for tool in tools:
+            if bash_inner(tool) is not None and bash_tier(bash_inner(tool)) == 2 and not never_granted(tool):
+                problems.append(
+                    f"a task with repo: may not grant {tool}; the dispatcher pushes the branch and opens the pull request"
+                )
+    declared = meta.get("tier")
+    if declared and declared != str(tier_of(meta)):
+        problems.append(f"tier {declared} does not match the tier {tier_of(meta)} its allowed_tools work out to")
+    return problems
+
+
 def validate_task(meta, body, template=False):
     problems = []
     if meta is None:
@@ -432,6 +558,9 @@ def validate_task(meta, body, template=False):
     if extract_criteria(body) is None:
         problems.append("no '## Acceptance Criteria' section in task body")
     if meta.get("allowed_tools") and (problem := allowed_tools_problem(meta["allowed_tools"])):
+        problems.append(problem)
+    problems += autonomy_problems(meta)
+    if problem := repo_problem(meta):
         problems.append(problem)
     mcp = mcp_config_path(meta)
     if mcp is not None and not mcp.is_file():
@@ -630,8 +759,80 @@ def claude_env():
     return env
 
 
-def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label):
-    """One claude -p invocation: a ClaudeReply, or an exception. Never sleeps."""
+STREAM_EVENT_TYPES = {"system", "assistant", "user", "rate_limit_event", "stream_event"}
+
+
+def is_result_line(obj):
+    """The envelope `claude -p` ends a stream with (or prints alone with --output-format json)."""
+    return isinstance(obj, dict) and (obj.get("type") == "result" or ("type" not in obj and "is_error" in obj))
+
+
+def read_stream(proc, prompt, timeout_s, watcher, raw_path):
+    """Read a `--output-format stream-json` call while it runs; returns (out, err) like communicate().
+
+    Each event goes to watcher.feed() the moment it arrives, and watcher.tick()
+    runs about once a second when it is quiet. `out` is what the rest of the
+    dispatcher already understands: the final `result` line (the same envelope
+    --output-format json prints), or, when there is none, only the lines that
+    are not stream events, so a rate_limit_event can never read as a limit. The
+    raw stream goes to raw_path. Raises TimeoutExpired past timeout_s.
+    """
+    lines = queue.Queue()
+
+    def pump(pipe, tag):
+        try:
+            for line in pipe:
+                lines.put((tag, line))
+        finally:
+            lines.put((tag, None))
+
+    def write_prompt():
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except OSError:  # claude exited before reading it all
+            pass
+
+    for target, args in ((pump, (proc.stdout, "out")), (pump, (proc.stderr, "err")), (write_prompt, ())):
+        threading.Thread(target=target, args=args, daemon=True).start()
+
+    deadline = time.monotonic() + timeout_s
+    result, text, err, open_pipes = None, [], [], 2
+    with open(raw_path, "a") as raw:
+        while open_pipes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout_s)
+            try:
+                tag, line = lines.get(timeout=min(1.0, remaining))
+            except queue.Empty:
+                watcher.tick()
+                continue
+            if line is None:
+                open_pipes -= 1
+            elif tag == "err":
+                err.append(line)
+            else:
+                raw.write(line)
+                raw.flush()
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    event = None
+                if is_result_line(event):
+                    result = line
+                elif not (isinstance(event, dict) and event.get("type") in STREAM_EVENT_TYPES):
+                    text.append(line)
+                watcher.feed(event)
+    proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+    return (result if result is not None else "".join(text)), "".join(err)
+
+
+def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label, watcher=None):
+    """One claude -p invocation: a ClaudeReply, or an exception. Never sleeps.
+
+    With a watcher the call is read as it runs (--output-format stream-json): see read_stream().
+    """
     model = model_of(cmd)
     command = " ".join(cmd)
     append_transcript(transcript, f"\n=== {label} @ {now_iso()} ===\n$ {command}")
@@ -649,7 +850,10 @@ def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label):
     except OSError as exc:  # binary vanished or isn't executable
         raise ClaudeError(f"cannot execute {cmd[0]!r}: {exc}")
     try:
-        out, err = proc.communicate(prompt, timeout=timeout_s)
+        if watcher is None:
+            out, err = proc.communicate(prompt, timeout=timeout_s)
+        else:
+            out, err = read_stream(proc, prompt, timeout_s, watcher, transcript.with_suffix(".stream.jsonl"))
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -683,7 +887,7 @@ def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label):
     raise ClaudeError(message)
 
 
-def run_claude(cmd, prompt, timeout_s, cwd, transcript, label, retries=None):
+def run_claude(cmd, prompt, timeout_s, cwd, transcript, label, retries=None, watcher=None):
     """Run one claude -p invocation, retrying a transient rate limit with backoff.
 
     Raises RateLimited when the limit outlasts the retries (or names a reset
@@ -691,7 +895,7 @@ def run_claude(cmd, prompt, timeout_s, cwd, transcript, label, retries=None):
     """
     try:
         return rate_limit_retrying(label, retries)(
-            _call_claude, cmd, prompt, timeout_s, cwd, transcript, label
+            _call_claude, cmd, prompt, timeout_s, cwd, transcript, label, watcher
         )
     except TransientLimit as exc:
         raise RateLimited(str(exc)) from None
@@ -750,28 +954,61 @@ def telegram_configured():
     return False
 
 
-def post_message(raw):
-    """sendMessage as HTML, or as plain text when Telegram returns 400. True once it was sent."""
+def send_message_id(raw, formatted=True):
+    """sendMessage (HTML first when `formatted`, plain text if Telegram returns 400).
+
+    Returns the new message's id (0 if Telegram answered without one), or None
+    when nothing was sent. The id is what editMessageText and reactions refer to.
+    """
     chat_id = cfg("TELEGRAM_CHAT_ID")
-    variants = (
-        {"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"},
-        {"chat_id": chat_id, "text": raw},
-    )
-    for formatted, params in zip((True, False), variants):
+    variants = [({"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"}, True)] if formatted else []
+    variants.append(({"chat_id": chat_id, "text": raw}, False))
+    for params, is_html in variants:
         data = urllib.parse.urlencode(params).encode()
         try:
-            urllib.request.urlopen(telegram_url("sendMessage"), data, timeout=30)
-            log.info("Telegram notification sent")
-            return True
+            with urllib.request.urlopen(telegram_url("sendMessage"), data, timeout=30) as reply:
+                body = reply.read()
         except urllib.error.HTTPError as exc:
-            if formatted and exc.code == 400:  # bad entities — resend unformatted
+            if is_html and exc.code == 400:  # bad entities — resend unformatted
                 log.warning("Telegram rejected HTML formatting; resending as plain text")
                 continue
             log.warning("Telegram notification failed: %s", exc)
-            return False
+            return None
         except Exception as exc:  # notification failure must never fail the task
             log.warning("Telegram notification failed: %s", exc)
-            return False
+            return None
+        log.info("Telegram notification sent")
+        try:
+            return int(json.loads(body)["result"]["message_id"])
+        except (ValueError, KeyError, TypeError):
+            return 0
+    return None
+
+
+def post_message(raw):
+    """sendMessage as HTML, or as plain text when Telegram returns 400. True once it was sent."""
+    return send_message_id(raw) is not None
+
+
+def edit_message(message_id, raw):
+    """editMessageText as plain text. True when done (or harmlessly unchanged), False on failure,
+    or the seconds Telegram asked us to wait after a 429."""
+    data = urllib.parse.urlencode({"chat_id": cfg("TELEGRAM_CHAT_ID"), "message_id": message_id, "text": raw}).encode()
+    try:
+        urllib.request.urlopen(telegram_url("editMessageText"), data, timeout=30).close()
+        return True
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read())
+        except (ValueError, OSError):
+            detail = {}
+        if exc.code == 400 and "not modified" in str(detail.get("description", "")):
+            return True
+        if exc.code == 429:
+            return float((detail.get("parameters") or {}).get("retry_after") or 30)
+        log.warning("Telegram edit failed: %s", exc.code)
+    except Exception as exc:  # a status edit must never fail the task
+        log.warning("Telegram edit failed: %s", type(exc).__name__)
     return False
 
 
@@ -792,6 +1029,154 @@ def post_document(name, source):
         return False
     log.info("Telegram document %s sent", name)
     return True
+
+
+# ------------------------------------------------------------- live status
+
+
+def describe_event(event):
+    """The tool a stream-json `assistant` event is calling: {tool, target, tokens, id}, or None for any other event."""
+    if not isinstance(event, dict) or event.get("type") != "assistant":
+        return None
+    message = event.get("message") or {}
+    uses = [b for b in message.get("content") or [] if isinstance(b, dict) and b.get("type") == "tool_use"]
+    if not uses:
+        return None
+    name, tool_input = uses[-1].get("name") or "", uses[-1].get("input") or {}
+    target = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("pattern") \
+        or str(tool_input.get("command") or "")[:40]
+    target = str(target)
+    if len(target) > 60:
+        target = "…" + target[-59:]
+    return {
+        "tool": name, "target": target, "id": message.get("id"),
+        "tokens": int((message.get("usage") or {}).get("output_tokens") or 0),
+    }
+
+
+def clock_text(seconds):
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m{secs:02d}s"
+
+
+class StatusEditor:
+    """One Telegram message that follows a worker run: the current tool and file, elapsed time, steps and tokens.
+
+    Nothing is sent until the worker first calls a tool. Afterwards the message is
+    edited at most once per `interval` seconds (STATUS_EDIT_INTERVAL_SECONDS), plain
+    text, whatever the number of events. finish() waits out the interval before
+    its last edit. Every Telegram failure is swallowed: a status message is never
+    allowed to fail a task. `send(text)` returns the message id (None = could not
+    send); `edit(message_id, text)` returns True, False, or seconds to back off.
+    """
+
+    def __init__(self, title, send, edit, clock=time.monotonic, interval=None, sleep=time.sleep):
+        self.title, self._send, self._edit, self._clock, self._sleep = title, send, edit, clock, sleep
+        self.interval = float(cfg("STATUS_EDIT_INTERVAL_SECONDS", "10")) if interval is None else float(interval)
+        self.started = clock()
+        self.message_id = None
+        self.dead = False  # the message could not be sent: leave the chat alone
+        self.last_call = None
+        self.blocked_until = 0.0
+        self.last_text = None
+        self.tool = self.target = ""
+        self.steps = 0
+        self.tokens = {}
+        self.cost = None
+
+    def feed(self, event):
+        """The stream-reader's hook: one parsed event (or None for an unparseable line)."""
+        try:
+            if isinstance(event, dict) and event.get("type") == "result":
+                self.cost = event.get("total_cost_usd")
+            elif info := describe_event(event):
+                self.event(info)
+        except Exception as exc:  # noqa: BLE001 - a status bug must never fail the task
+            log.warning("status update failed: %s", type(exc).__name__)
+
+    def event(self, info):
+        self.tool, self.target = info["tool"], info.get("target") or ""
+        self.steps += 1
+        key = info.get("id") or object()
+        self.tokens[key] = max(self.tokens.get(key, 0), int(info.get("tokens") or 0))
+        self._push()
+
+    def tick(self):
+        """Quiet stretch: refresh the elapsed time, still no faster than the interval."""
+        self._push()
+
+    def _elapsed(self):
+        return clock_text(self._clock() - self.started)
+
+    def _detail(self):
+        total = sum(self.tokens.values())
+        tokens = f"{total / 1000:.1f}k" if total >= 1000 else str(total)
+        return f"{self._elapsed()} · {self.steps} steps · {tokens} tokens"
+
+    def _text(self):
+        return f"⚙️ {self.title}\n🔧 {self.tool} {self.target}".rstrip() + f"\n⏱ {self._detail()}"
+
+    def _due(self):
+        now = self._clock()
+        return now >= self.blocked_until and (self.last_call is None or now - self.last_call >= self.interval)
+
+    def _push(self):
+        if self.dead or not self.steps:
+            return
+        text = self._text()
+        if self.message_id is None:
+            self.last_call = self._clock()
+            try:
+                self.message_id = self._send(text)
+            except Exception:  # noqa: BLE001
+                self.message_id = None
+            self.dead = not self.message_id  # None, or 0 (no id to edit)
+            self.last_text = text
+        elif text != self.last_text and self._due():
+            self._do_edit(text)
+
+    def _do_edit(self, text):
+        self.last_call = self._clock()
+        try:
+            result = self._edit(self.message_id, text)
+        except Exception:  # noqa: BLE001
+            result = False
+        if isinstance(result, (int, float)) and not isinstance(result, bool):  # Telegram said to wait
+            self.blocked_until = self._clock() + float(result)
+        self.last_text = text
+
+    def finish(self, outcome, cost=None):
+        """The last edit: how it ended, how long, and the exact cost. Waits for the interval first."""
+        if self.dead or not self.message_id:
+            return
+        if cost is not None:
+            self.cost = cost
+        wait = self.interval - (self._clock() - self.last_call) if self.last_call is not None else 0
+        if wait > 0:
+            self._sleep(wait)
+        cost = f" · ${float(self.cost):.2f}" if self.cost is not None else ""
+        self._do_edit(f"{outcome}\n{self.title} · {self._detail()}{cost}")
+
+
+class QuietWatcher:
+    """The stream reader's hook when nobody wants a status message."""
+
+    def feed(self, event):
+        pass
+
+    def tick(self):
+        pass
+
+
+def start_status(path, meta):
+    """A StatusEditor for this task's worker run, or None when there is nobody to tell (no Telegram, a quiet task)."""
+    if meta.get("quiet") == "true" or not (cfg("TELEGRAM_BOT_TOKEN") and cfg("TELEGRAM_CHAT_ID")):
+        return None
+    return StatusEditor(
+        path.name,
+        send=lambda text: send_message_id(text, formatted=False),
+        edit=edit_message,
+    )
 
 
 def fit_preview(prefix, text, suffix):
@@ -1277,11 +1662,12 @@ def cancel_task(stem):
         )
         lines = []
         instances = sorted(PENDING.glob(f"{stem}-[0-9]*.md"))
-        for path in ([PENDING / f"{stem}.md"] if (PENDING / f"{stem}.md").exists() else []) + instances:
+        queued = [d / f"{stem}.md" for d in (PENDING, PROPOSED) if (d / f"{stem}.md").exists()]
+        for path in queued + instances:
             meta, body = parse_task(path)
             write_task(path, meta or {}, body.rstrip("\n") + note)
             archive(path)
-            lines.append(f"Cancelled {path.name} (was pending).")
+            lines.append(f"Cancelled {path.name} (was {path.parent.name}).")
         template = RECURRING / f"{stem}.md"
         if template.exists():
             archive(template)
@@ -1339,8 +1725,8 @@ def retry_task(stem):
                 meta, body = parse_task(path)
                 meta = meta or {}
                 meta["attempts"] = "0"
-                meta.pop("pending_review", None)  # a fresh start redoes the work too
-                meta.pop("review_failures", None)
+                for key in ("pending_review", "review_failures", "pending_publish", "publish_failures", "held_until"):
+                    meta.pop(key, None)  # a fresh start redoes the work too
                 write_task(path, meta, body)
                 shutil.move(str(path), str(PENDING / path.name))
                 log.info("retry_task(%s): requeued from tasks/%s/", stem, label)
@@ -1387,7 +1773,7 @@ def dep_state(dep):
         return "failed"
     if present(CANCELLED):
         return "cancelled"
-    if present(PENDING) or present(ACTIVE) or present(RECURRING):
+    if present(PENDING) or present(ACTIVE) or present(RECURRING) or present(PROPOSED):
         return "waiting"
     return "missing"
 
@@ -1408,11 +1794,638 @@ def cascade_dependency_failure(path, failed_dep):
     )
 
 
-def pick_task():
+# ------------------------------------------------------------ approval gate
+#
+# A task at or above APPROVAL_MIN_TIER waits in tasks/proposed/ until you approve
+# it: a 👍 on its announcement (handled by the bridge, in code), or /approve. The
+# approval is recorded in state/approvals/<task>.json, which claude can't write,
+# together with a digest of the spec. Change the spec afterwards and the approval
+# no longer matches, so the task is parked and announced again.
+
+TIER_LABELS = {0: "reads only", 1: "writes in its workspace", 2: "leaves the box"}
+DISPATCHER_HEADING = re.compile(r"^## (Attempt \d+ Feedback|Result \(|Invalid Task|Cancelled)", re.M)
+DIGEST_KEYS = ("model", "allowed_tools", "verify", "repo", "base", "cwd", "mcp_config", "deliver", "propose", "depends_on")
+RECURRING_INSTANCE = re.compile(r"^(?P<template>.+)-\d{8}-\d{6}$")
+
+
+def approval_min_tier():
+    try:
+        return int(cfg("APPROVAL_MIN_TIER", "0") or 0)
+    except ValueError:
+        return 0
+
+
+def spec_digest(meta, body):
+    """What an approval covers: the tools, checks and places the task may touch, and the text you were shown.
+
+    Everything the dispatcher appends later (feedback, results) and its own
+    bookkeeping keys are left out, so a retry doesn't need a new approval.
+    """
+    found = DISPATCHER_HEADING.search(body)
+    spec = body[:found.start()] if found else body
+    parts = [f"{key}={meta.get(key, '')}" for key in DIGEST_KEYS] + [spec.strip()]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def read_ledger(stem):
+    try:
+        return json.loads((APPROVALS / f"{stem}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_ledger(stem, entry):
+    write_atomic(APPROVALS / f"{stem}.json", json.dumps(entry))
+
+
+@contextmanager
+def ledger_lock():
+    """The dispatcher and the bridge both change approvals; one at a time."""
+    APPROVALS.mkdir(parents=True, exist_ok=True)
+    with filelock.FileLock(str(APPROVALS / ".lock"), timeout=30):
+        yield
+
+
+def is_recurring_instance(stem):
+    found = RECURRING_INSTANCE.match(stem)
+    return bool(found) and (RECURRING / f"{found.group('template')}.md").exists()
+
+
+def needs_approval(path, meta, body):
+    """True when this task may not run yet. Invalid tasks are not gated: process_task rejects them."""
+    threshold = approval_min_tier()
+    if threshold <= 0 or meta is None or validate_task(meta, body):
+        return False
+    if tier_of(meta) < threshold or is_recurring_instance(path.stem):
+        return False
+    entry = read_ledger(path.stem)
+    return not (entry and entry.get("status") == "approved" and entry.get("digest") == spec_digest(meta, body))
+
+
+def short(text, limit):
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def approval_text(stem, meta, body):
+    tier = tier_of(meta)
+    spec = body.split("## Acceptance Criteria")[0]
+    lines = [f"🔐 Approval needed: {stem} (tier {tier}: {TIER_LABELS[tier]})", "", short(spec, 700), ""]
+    lines.append("Acceptance criteria:\n" + short(extract_criteria(body) or "(none)", 700))
+    lines.append("")
+    lines.append("Tools: " + ", ".join(task_tools(meta)))
+    lines.append(f"verify: {meta['verify']}" if meta.get("verify") else "verify: (none; the reviewer judges)")
+    if meta.get("repo"):
+        lines.append(f"repo: {meta['repo']} → the result is a draft pull request")
+    if meta.get("proposed_by"):
+        lines.append(f"Proposed by {meta['proposed_by']} (depth {meta.get('depth', '?')})")
+    lines += ["", f"👍 run it · 👎 drop it   (or /approve {stem} · /reject {stem})"]
+    return "\n".join(lines)
+
+
+def announce_proposals():
+    """Tell you about each task waiting in proposed/ that you haven't been told about (or whose spec changed)."""
+    if not (cfg("TELEGRAM_BOT_TOKEN") and cfg("TELEGRAM_CHAT_ID")) or not PROPOSED.is_dir():
+        return
+    for path in sorted(PROPOSED.glob("*.md")):
+        with ledger_lock():
+            meta, body = parse_task(path)
+            if meta is None:
+                continue
+            digest, entry = spec_digest(meta, body), read_ledger(path.stem)
+            if entry and entry.get("status") == "awaiting" and entry.get("message_id") and entry.get("digest") == digest:
+                continue
+            message_id = send_message_id(approval_text(path.stem, meta, body), formatted=False)
+            if not message_id:
+                continue  # not sent: try again next time
+            write_ledger(path.stem, {"task": path.stem, "tier": tier_of(meta), "digest": digest,
+                                     "status": "awaiting", "message_id": message_id, "at": now_iso()})
+            log.info("Task %s is waiting for approval (announced as message %s)", path.name, message_id)
+
+
+def park_for_approval(path):
+    """Move a task that may not run to proposed/, stamp its computed tier, and announce it."""
+    meta, body = parse_task(path)
+    meta["tier"] = str(tier_of(meta))
+    write_task(path, meta, body)
+    dest = PROPOSED / path.name
+    if dest.exists():
+        log.warning("Task %s needs approval but proposed/ already holds a file of that name; leaving it", path.name)
+        return False
+    PROPOSED.mkdir(parents=True, exist_ok=True)
+    with ledger_lock():
+        shutil.move(str(path), str(dest))
+        write_ledger(path.stem, {"task": path.stem, "tier": int(meta["tier"]), "digest": spec_digest(meta, body),
+                                 "status": "awaiting", "message_id": None, "at": now_iso()})
+    log.info("Task %s is tier %s and needs approval; parked in proposed/", path.name, meta["tier"])
+    announce_proposals()
+    return True
+
+
+def clean_stem(stem):
+    stem = stem.strip()
+    return stem[:-3] if stem.endswith(".md") else stem
+
+
+def approve_task(stem):
+    """Approve a task waiting in proposed/: record it and move it to pending/. Returns (ok, message)."""
+    stem = clean_stem(stem)
+    if not stem or "/" in stem:
+        return False, "Give a task id (the file stem)."
+    path = PROPOSED / f"{stem}.md"
+    if not path.is_file():
+        for label, directory in (("pending", PENDING), ("active", ACTIVE), ("done", DONE), ("cancelled", CANCELLED)):
+            if (directory / f"{stem}.md").exists():
+                return False, f"'{stem}' is not waiting for approval; it is in tasks/{label}/."
+        return False, f"No task named '{stem}' is waiting for approval."
+    with ledger_lock():
+        entry = read_ledger(stem)
+        meta, body = parse_task(path)
+        problems = validate_task(meta, body) if meta else ["the frontmatter is missing"]
+        if problems:
+            return False, f"'{stem}' is invalid and was not queued:\n" + "\n".join(f"- {p}" for p in problems)
+        if problem := proposal_problem(meta):
+            return False, f"'{stem}' was not queued: {problem}."
+        if not entry or entry.get("status") != "awaiting" or not entry.get("message_id"):
+            return False, f"'{stem}' has not been announced yet; approve it from the announcement."
+        digest = spec_digest(meta, body)
+        if entry.get("digest") != digest:
+            write_ledger(stem, {**entry, "digest": digest, "message_id": None})
+            return False, (f"'{stem}' changed after it was announced, so that approval does not cover it. "
+                           "It will be announced again.")
+        write_ledger(stem, {**entry, "status": "approved", "at": now_iso()})
+        shutil.move(str(path), str(PENDING / path.name))
+    log.info("Task %s approved", stem)
+    return True, f"Approved {stem}: queued, it runs next."
+
+
+def reject_task(stem):
+    """Drop a task waiting in proposed/ into cancelled/. Returns (ok, message)."""
+    stem = clean_stem(stem)
+    path = PROPOSED / f"{stem}.md"
+    if not stem or "/" in stem or not path.is_file():
+        return False, f"No task named '{stem}' is waiting for approval."
+    with ledger_lock():
+        meta, body = parse_task(path)
+        write_task(path, meta or {}, body.rstrip("\n") + f"\n\n## Cancelled ({now_iso()})\n\nNot approved.\n")
+        dest = CANCELLED / path.name
+        if dest.exists():
+            dest = CANCELLED / f"{path.stem}.cancelled-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+        CANCELLED.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(dest))
+        entry = read_ledger(stem) or {"task": stem}
+        write_ledger(stem, {**entry, "status": "rejected", "at": now_iso()})
+    log.info("Task %s rejected", stem)
+    return True, f"Dropped {stem}: moved to tasks/cancelled/."
+
+
+def apply_reaction(message_id, emoji):
+    """A 👍/👎 on an announcement: the reply to send, or None when the message is not one of ours."""
+    if not message_id or not APPROVALS.is_dir():
+        return None
+    for ledger in sorted(APPROVALS.glob("*.json")):
+        try:
+            entry = json.loads(ledger.read_text())
+        except (OSError, ValueError):
+            continue
+        if entry.get("message_id") != message_id:
+            continue
+        stem = entry["task"]
+        if entry.get("status") != "awaiting":
+            return f"{stem} was already {entry.get('status')}."
+        if emoji == "👍":
+            ok, message = approve_task(stem)
+        elif emoji == "👎":
+            ok, message = reject_task(stem)
+        else:
+            return None
+        return ("✅ " if ok else "⚠️ ") + message
+    return None
+
+
+# ------------------------------------------- worktrees and draft pull requests
+#
+# A task with `repo:` runs in its own git worktree on branch task/<id>. Only after
+# verify and review pass does the dispatcher itself commit, push and open a DRAFT
+# pull request; the worker is told not to, and is denied git push and gh. Nothing
+# here merges anything.
+
+MAX_PUBLISH_FAILURES = 3
+GIT_IDENTITY = ["-c", "user.name=Queue worker", "-c", "user.email=worker@localhost"]
+REPO_NOTE = (
+    "You are working in a git worktree on branch {branch}, cut from {base}. Do not run git commit, "
+    "git push or gh: when verification and review pass, the dispatcher commits your changes and "
+    "opens a draft pull request itself.\n\n"
+)
+
+
+class GitError(Exception):
+    pass
+
+
+def repo_path(meta):
+    ref = (meta or {}).get("repo")
+    if not ref:
+        return None
+    path = Path(ref)
+    return path if path.is_absolute() else Path(cfg("REPOS_DIR") or BASE / "workspace") / ref
+
+
+def repo_problem(meta):
+    ref = (meta or {}).get("repo")
+    if not ref:
+        return None
+    if not Path(ref).is_absolute() and ("/" in ref or ref in (".", "..")):
+        return f"repo '{ref}' must be a plain name (looked up under REPOS_DIR) or an absolute path"
+    path = repo_path(meta)
+    if not path.is_dir():
+        return f"repo '{ref}' not found (looked for {path})"
+    if not (path / ".git").exists():
+        return f"repo '{ref}' ({path}) is not a git checkout"
+    return None
+
+
+def safe_stem(stem):
+    return re.sub(r"[^A-Za-z0-9._-]", "-", stem)
+
+
+def branch_name(stem):
+    return f"task/{safe_stem(stem)}"
+
+
+def worktree_path(stem):
+    return WORKTREES / safe_stem(stem)
+
+
+def publish_env():
+    env = claude_env()  # carries GH_TOKEN; git and gh have no use for the claude login
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never wait for a password in an unattended run
+    return env
+
+
+def git_run(cwd, *args, timeout=300):
+    try:
+        return subprocess.run(["git", *GIT_IDENTITY, *args], cwd=cwd, capture_output=True, text=True,
+                              timeout=timeout, env=publish_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(args, 124, "", f"{type(exc).__name__}: {exc}")
+
+
+def git_need(cwd, *args, timeout=300):
+    proc = git_run(cwd, *args, timeout=timeout)
+    if proc.returncode != 0:
+        raise GitError(f"git {args[0]} failed: {tail(proc.stderr or proc.stdout, 400)}")
+    return proc.stdout.strip()
+
+
+def base_ref(repo, meta):
+    base = meta.get("base") or "main"
+    return f"origin/{base}" if git_run(repo, "rev-parse", "--verify", "-q", f"origin/{base}").returncode == 0 else base
+
+
+def prepare_worktree(meta, stem):
+    """The task's worktree: new on the first attempt, the same one (with the last attempt's work) on a retry."""
+    repo, branch, worktree = repo_path(meta), branch_name(stem), worktree_path(stem)
+    git_run(repo, "worktree", "prune")
+    if (worktree / ".git").exists():
+        return worktree
+    if "origin" in git_run(repo, "remote").stdout.split():
+        git_run(repo, "fetch", "--quiet", "origin", timeout=120)  # best effort: an offline Pi still works from what it has
+    WORKTREES.mkdir(parents=True, exist_ok=True)
+    if git_run(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0:
+        git_need(repo, "worktree", "add", "-q", str(worktree), branch)  # branch left by an earlier run
+    else:
+        git_need(repo, "worktree", "add", "-q", "-b", branch, str(worktree), base_ref(repo, meta))
+    return worktree
+
+
+def remove_worktree(meta, stem):
+    worktree = worktree_path(stem)
+    if repo_path(meta) is not None and worktree.exists():
+        git_run(repo_path(meta), "worktree", "remove", "--force", str(worktree))
+    shutil.rmtree(worktree, ignore_errors=True)
+
+
+def prune_worktrees():
+    """Delete worktrees of finished tasks once they are LOG_RETENTION_DAYS old (a failed task's is kept to look at)."""
+    days = float(cfg("LOG_RETENTION_DAYS", "30"))
+    if days <= 0 or not WORKTREES.is_dir():
+        return
+    cutoff = time.time() - days * 86400
+    for worktree in WORKTREES.iterdir():
+        if any((state / f"{worktree.name}.md").exists() for state in (PENDING, ACTIVE, PROPOSED)):
+            continue
+        try:
+            if worktree.is_dir() and worktree.stat().st_mtime < cutoff:
+                common = git_run(worktree, "rev-parse", "--git-common-dir").stdout.strip()
+                if common:
+                    git_run(Path(common).resolve().parent, "worktree", "remove", "--force", str(worktree))
+                shutil.rmtree(worktree, ignore_errors=True)
+        except OSError as exc:
+            log.warning("could not prune worktree %s: %s", worktree.name, exc)
+
+
+def pr_title(stem, body):
+    for line in body.splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line and not line.lower().startswith("acceptance criteria"):
+            return short(line, 72)
+        if line:
+            break
+    return stem
+
+
+def pr_body(stem, body, worker_out, verified):
+    parts = [short(body.split("## Acceptance Criteria")[0], 1500), "**Acceptance criteria**\n" + short(extract_criteria(body) or "(none)", 1500)]
+    if verified:
+        parts.append(f"**Verification**: `{verified.command}` exited 0\n```\n{tail(verified.output or '(no output)', 1500)}\n```")
+    parts.append("**Worker report**\n" + tail(worker_out, 2500))
+    parts.append(f"---\nDraft pull request opened by the task queue from task `{stem}`. Nothing merges automatically.")
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def open_pr_count(cwd):
+    command = [*shlex.split(cfg("GH_BIN", "gh")), "pr", "list", "--state", "open", "--limit", "100", "--json", "headRefName",
+               "--jq", '[.[] | select(.headRefName | startswith("task/"))] | length']
+    try:
+        proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=120, env=publish_env())
+        if proc.returncode == 0:
+            return int(proc.stdout.strip() or 0)
+        detail = tail(proc.stderr or proc.stdout, 300)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+    raise GitError(f"could not count open pull requests: {detail}")
+
+
+def publish_draft_pr(path, meta, body, worker_out, verified):
+    """Commit the worktree, push task/<id> and open a draft PR. Returns (status, detail):
+    ok (the URL), nochange, held (open PR count), or error (why)."""
+    stem, branch = path.stem, branch_name(path.stem)
+    worktree, repo, base = worktree_path(path.stem), repo_path(meta), meta.get("base") or "main"
+    title = pr_title(stem, body)
+    try:
+        git_need(worktree, "add", "-A")
+        if git_run(worktree, "status", "--porcelain").stdout.strip():
+            git_need(worktree, "commit", "-q", "-m", f"{title}\n\nTask {stem}, done by the queue worker.")
+        if int(git_need(worktree, "rev-list", "--count", f"{base_ref(repo, meta)}..HEAD") or 0) == 0:
+            return "nochange", ""
+        cap = int(cfg("MAX_OPEN_PRS", "3") or 0)
+        if cap > 0 and not meta.get("pr_url"):
+            open_prs = open_pr_count(worktree)
+            if open_prs >= cap:
+                return "held", str(open_prs)
+        git_need(worktree, "push", "-q", "-u", "origin", branch, timeout=300)
+        with tempfile.TemporaryDirectory() as tmp:
+            body_file = Path(tmp) / "body.md"
+            body_file.write_text(pr_body(stem, body, worker_out, verified))
+            command = [*shlex.split(cfg("GH_BIN", "gh")), "pr", "create", "--draft", "--base", base, "--head", branch,
+                       "--title", title, "--body-file", str(body_file)]
+            try:
+                proc = subprocess.run(command, cwd=worktree, capture_output=True, text=True, timeout=120, env=publish_env())
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                proc = subprocess.CompletedProcess(command, 124, "", f"{type(exc).__name__}: {exc}")
+        if proc.returncode != 0:
+            git_run(worktree, "push", "-q", "origin", "--delete", branch)  # no PR: don't leave a dangling branch
+            raise GitError(f"gh pr create failed: {tail(proc.stderr or proc.stdout, 400)}")
+        url = next((line.strip() for line in reversed(proc.stdout.splitlines()) if line.strip()), "")
+        if not url.startswith("http"):
+            raise GitError(f"gh pr create printed no URL: {tail(proc.stdout, 200)}")
+        return "ok", url
+    except (GitError, ValueError) as exc:
+        return "error", str(exc)
+
+
+def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False):
+    """A task passed verification and review. A repo task now becomes a draft PR; any other is simply done."""
+    collect_proposals(path, meta)
+    if not meta.get("repo"):
+        finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped)
+        return
+    status, detail = publish_draft_pr(path, meta, body, worker_out, verified)
+    stem = path.stem
+    if status == "ok":
+        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures", "held_until"):
+            meta.pop(key, None)
+        meta["pr_url"], meta["branch"] = detail, branch_name(stem)
+        clear_reported(f"pr-held|tasks/pending/{path.name}")
+        finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped, pr_url=detail)
+        remove_worktree(meta, stem)
+    elif status == "nochange":
+        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures", "held_until"):
+            meta.pop(key, None)
+        handle_failure(path, meta, body, attempts, max_attempts,
+                       "The worker made no changes to the repository, so there is nothing to open a pull request for. "
+                       "Make the change the task describes.")
+    elif status == "held":
+        meta["pending_publish"] = "1"
+        if until := hold_until():
+            meta["held_until"] = until
+        park_report(path, meta, body, attempts, worker_out, denials)
+        report_once(
+            f"pr-held|tasks/pending/{path.name}", detail,
+            f"Task {stem}: {detail} draft PRs are open (MAX_OPEN_PRS); result held",
+            f"⏸ Draft PR for {path.name} is held: {detail} task pull requests are already open "
+            f"(MAX_OPEN_PRS={cfg('MAX_OPEN_PRS', '3')}). The work is done and checked; it is published as soon as you merge or close one.",
+        )
+    else:
+        failures = int(meta.get("publish_failures") or 0) + 1
+        log.warning("Task %s: could not publish (%d/%d): %s", path.name, failures, MAX_PUBLISH_FAILURES, detail)
+        meta["pending_publish"], meta["publish_failures"] = "1", str(failures)
+        if failures < MAX_PUBLISH_FAILURES:
+            if until := hold_until():
+                meta["held_until"] = until
+            park_report(path, meta, body, attempts, worker_out, denials)  # try again later; the work is not redone
+            return
+        meta.pop("pending_publish", None)
+        meta.pop("held_until", None)
+        body = body.rstrip("\n") + f"\n\n## Publish failed ({now_iso()})\n\n{detail}\n"
+        write_task(path, meta, body)
+        shutil.move(str(path), str(FAILED / path.name))
+        send_report(f"❌ Task could not open a pull request: {path.name}\nThe work passed verification and review and is kept in {worktree_path(stem)}. Last error:",
+                    detail, task_id=stem)
+
+
+# ---------------------------------------------------------------- proposals
+#
+# A task with `propose: true` may write follow-up task files into a staging folder
+# of its own, tasks/proposed/.incoming/<id>/, and nowhere else. When the task
+# passes, the dispatcher (not the worker) validates each file, stamps proposed_by
+# and depth, applies the caps, and moves the survivors to tasks/proposed/. There
+# they wait for a 👍 like any task: a proposal never enters pending/ by itself.
+
+PROPOSE_NOTE = (
+    "You may propose follow-up work. Write each proposal as a task file (the usual frontmatter, a body, and a "
+    "## Acceptance Criteria section) into {staging}/ and nowhere else, at most {limit} of them. They are only "
+    "proposals: they wait for the human's approval before anything runs. Do not write to tasks/pending/.\n\n"
+)
+TASK_DIRS = (PENDING, PROPOSED, ACTIVE, DONE, FAILED, CANCELLED, RECURRING)
+MANAGED_KEYS = ("tier", "pr_url", "branch", "pending_review", "review_failures", "pending_publish", "publish_failures")
+
+
+def proposal_limits():
+    return int(cfg("MAX_PROPOSAL_DEPTH", "2")), int(cfg("MAX_PROPOSALS_PER_TASK", "5"))
+
+
+def staging_dir(stem):
+    return PROPOSED / ".incoming" / safe_stem(stem)
+
+
+def find_task(stem):
+    return next((d / f"{stem}.md" for d in TASK_DIRS if (d / f"{stem}.md").exists()), None)
+
+
+def count_proposals(stem):
+    """Proposals this task has already made, wherever they have got to (a cancelled one still counts)."""
+    return sum(
+        1 for directory in TASK_DIRS for file in directory.glob("*.md")
+        if (parse_task(file)[0] or {}).get("proposed_by") == stem
+    )
+
+
+def proposal_problem(meta):
+    """Why a proposal may not be approved (None when it may): its parent and its depth must be what the dispatcher stamped."""
+    parent_stem = meta.get("proposed_by")
+    if not parent_stem:
+        return None
+    parent = find_task(parent_stem)
+    if parent is None:
+        return f"its parent task '{parent_stem}' is not in the queue"
+    expected = int((parse_task(parent)[0] or {}).get("depth") or 0) + 1
+    if str(meta.get("depth")) != str(expected):
+        return f"its depth ({meta.get('depth')}) is not its parent's plus one ({expected})"
+    if expected > proposal_limits()[0]:
+        return f"depth {expected} is past the limit of {proposal_limits()[0]}"
+    return None
+
+
+def unique_name(stem):
+    name, number = safe_stem(stem), 2
+    while find_task(name) is not None:
+        name, number = f"{safe_stem(stem)}-{number}", number + 1
+    return name
+
+
+def collect_proposals(path, meta):
+    """Turn what a passed task left in its staging folder into proposals; then empty the folder."""
+    staging = staging_dir(path.stem)
+    if not staging.is_dir():
+        return
+    try:
+        if meta.get("propose") != "true":
+            return
+        max_depth, per_task = proposal_limits()
+        depth = int(meta.get("depth") or 0)
+        files = sorted(staging.glob("*.md"), key=lambda f: (f.stat().st_mtime, f.name))
+        kept, dropped = [], []
+        if files and depth >= max_depth:
+            dropped.append(f"all {len(files)}: this task is already at proposal depth {depth} (limit {max_depth})")
+            files = []
+        room = per_task - count_proposals(path.stem)
+        for file in files:
+            proposal, body = parse_task(file)
+            if proposal is not None:  # the dispatcher's keys are the dispatcher's to set, whatever the worker wrote
+                for key in MANAGED_KEYS:
+                    proposal.pop(key, None)
+                proposal.update({"attempts": "0", "proposed_by": path.stem, "depth": str(depth + 1)})
+            problems = validate_task(proposal, body) if proposal is not None else ["no frontmatter"]
+            if len(kept) >= room:
+                dropped.append(f"{file.stem}: over the limit of {per_task} proposals per task")
+            elif problems:
+                dropped.append(f"{file.stem}: {problems[0]}")
+            else:
+                name = unique_name(file.stem)
+                write_task(PROPOSED / f"{name}.md", proposal, body)
+                kept.append(name)
+        if kept or dropped:
+            lines = []
+            if kept:
+                lines.append(f"💡 {path.stem} proposed {len(kept)} follow-up task{'s' if len(kept) != 1 else ''}: "
+                             f"{', '.join(kept)}. They wait for your 👍.")
+            lines += [f"Dropped {note}" for note in dropped]
+            send_telegram("\n".join(lines))
+            log.info("Task %s: %d proposal(s) kept, %d dropped", path.name, len(kept), len(dropped))
+            announce_proposals()
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ holds, enqueue
+
+
+def hold_until():
+    """When a held or failed publish may next be tried (None: at once)."""
+    minutes = float(cfg("PUBLISH_RETRY_MINUTES", "10") or 0)
+    if minutes <= 0:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime(ISO_FMT)
+
+
+def is_held(meta):
+    try:
+        return datetime.strptime(meta["held_until"], ISO_FMT).replace(tzinfo=timezone.utc) > datetime.now(timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def enqueue_task(arg):
+    """Validate a task file another program wrote and drop it into the queue. Returns (ok, message).
+
+    It arrives whole (a hard link from a temporary file next to pending/, so a watcher on pending/
+    sees one event and never a half-written file) and never overwrites a task of the same name.
+    A task that needs approval goes to proposed/ and is announced, exactly as if pick_task had found it.
+    """
+    path = Path(arg)
+    if not path.is_file():
+        return False, f"{arg}: no such file"
+    if not SAFE_NAME.match(path.stem):
+        return False, f"{path.name}: the name may only use letters, digits, '.', '_' and '-'"
+    meta, body = parse_task(path)
+    problems = validate_task(meta, body)
+    if problems:
+        return False, f"{path.name} is invalid:\n" + "\n".join(f"- {p}" for p in problems)
+    if (existing := find_task(path.stem)) is not None:
+        return False, f"{path.stem} is already in tasks/{existing.parent.name}/; pick another name"
+    gated = needs_approval(path, meta, body)
+    destination = (PROPOSED if gated else PENDING) / path.name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = TASKS / f".enqueue-{os.getpid()}-{path.name}.tmp"
+    try:
+        if gated:
+            meta["tier"] = str(tier_of(meta))
+            write_task(temporary, meta, body)
+        else:
+            shutil.copyfile(path, temporary)
+        try:
+            os.link(temporary, destination)  # fails rather than overwrite
+        except FileExistsError:
+            return False, f"{path.stem} is already in tasks/{destination.parent.name}/; pick another name"
+    finally:
+        temporary.unlink(missing_ok=True)
+    if not gated:
+        log.info("Enqueued %s", path.name)
+        return True, f"Queued {path.name} in tasks/pending/; the next dispatcher run picks it up."
+    with ledger_lock():
+        write_ledger(path.stem, {"task": path.stem, "tier": int(meta["tier"]), "digest": spec_digest(meta, body),
+                                 "status": "awaiting", "message_id": None, "at": now_iso()})
+    announce_proposals()
+    log.info("Enqueued %s: tier %s, waiting for approval", path.name, meta["tier"])
+    return True, f"{path.name} is tier {meta['tier']} and needs approval: waiting in tasks/proposed/ (announced on Telegram)."
+
+
+def pick_task(skip=()):
     candidates = sorted(PENDING.glob("*.md"), key=lambda p: (p.stat().st_mtime, p.name))
     waiting = 0
     for src in candidates:
-        meta, _ = parse_task(src)
+        if src.stem in skip:  # already handled in this run
+            continue
+        meta, body = parse_task(src)
+        if meta and is_held(meta):  # a held PR or a failed publish: not before its time
+            continue
         blocked = None
         cancelled_dep = None
         for dep in dep_names(meta):
@@ -1452,6 +2465,9 @@ def pick_task():
         else:
             clear_reported(cancelled_key)
         if blocked is None:
+            if needs_approval(src, meta, body):
+                park_for_approval(src)
+                continue
             dest = ACTIVE / src.name
             shutil.move(str(src), str(dest))
             return dest
@@ -1467,6 +2483,7 @@ def handle_failure(path, meta, body, attempts, max_attempts, feedback):
     body = body.rstrip("\n") + f"\n\n## Attempt {attempts} Feedback ({now_iso()})\n\n{feedback.strip()}\n"
     write_task(path, meta, body)
     if attempts >= max_attempts:
+        shutil.rmtree(staging_dir(path.stem), ignore_errors=True)  # a failed task's proposals are not trusted
         shutil.move(str(path), str(FAILED / path.name))
         log.error("Task %s FAILED permanently after %d/%d attempts", path.name, attempts, max_attempts)
         send_report(
@@ -1644,7 +2661,8 @@ def check_file(arg):
     return True, f"{path.name}: OK"
 
 
-def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False):
+def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False,
+                  pr_url=None):
     """A task passed: record the result, move it to done/ and tell the user."""
     name = path.name
     result = worker_out.strip()
@@ -1663,14 +2681,38 @@ def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials,
         lines.append(f"Verified by `{verified.command}` (exit 0)" + ("; review skipped" if skipped else ""))
     if notice := denial_notice(denials):
         lines.append(notice)
+    if pr_url:
+        lines.append(f"🔀 Draft PR ready: {pr_url}")
     files, notes = collect_deliverables(meta, cwd)
-    if meta.get("quiet") != "true":  # quiet tasks (the weekly improver) report only failures
+    if meta.get("quiet") != "true" or pr_url:  # quiet tasks (the weekly improver) report only failures, and PR links
         send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem)
     if notes:
         send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
 
 
 def process_task(path):
+    """Run one task through worker, verify and review, with a live status message while the worker works."""
+    meta, _ = parse_task(path)
+    status = start_status(path, meta or {})
+    try:
+        run_task(path, status)
+    finally:
+        if status is not None:
+            status.finish(status_outcome(path.name))
+
+
+def status_outcome(name):
+    """How the attempt ended, judged by where the task file went."""
+    if (DONE / name).exists():
+        return "✅ Passed"
+    if (FAILED / name).exists():
+        return "❌ Failed"
+    if (PENDING / name).exists():
+        return "↩️ Needs another attempt (or waiting for the limit to reset)"
+    return "⏹ Stopped"
+
+
+def run_task(path, status=None):
     name = path.name
     meta, body = parse_task(path)
 
@@ -1694,17 +2736,31 @@ def process_task(path):
         shutil.move(str(path), str(PENDING / name))
         return
 
+    if needs_approval(path, meta, body):  # belt and braces: nothing unapproved reaches a claude call
+        park_for_approval(path)
+        return
+
     attempts = int(meta.get("attempts") or 0) + 1
     max_attempts = int(meta["max_attempts"])
     meta["attempts"] = str(attempts)
+    meta["tier"] = str(tier_of(meta))  # computed, never taken from the file
     write_task(path, meta, body)
 
     timeout_min = float(meta.get("timeout_minutes") or cfg("DEFAULT_TIMEOUT_MINUTES", "30"))
-    cwd = task_cwd(meta)
-    Path(cwd).mkdir(parents=True, exist_ok=True)
     transcript = LOGS / f"{path.stem}.attempt-{attempts}.log"
+    if meta.get("repo"):
+        try:
+            cwd = str(prepare_worktree(meta, path.stem))
+        except GitError as exc:
+            handle_failure(path, meta, body, attempts, max_attempts, f"Could not prepare the git worktree:\n{exc}")
+            return
+    else:
+        cwd = task_cwd(meta)
+        Path(cwd).mkdir(parents=True, exist_ok=True)
 
     parked = load_parked_report(meta)
+    if parked is None:
+        meta.pop("pending_publish", None)  # nothing saved to publish: the worker has to run again
     if parked is not None:
         worker_out, denials = parked
         log.info("Task %s: attempt %d/%d reuses the saved worker report and runs only the review",
@@ -1720,15 +2776,24 @@ def process_task(path):
             claude_bin, "-p",
             "--model", model,
             "--allowedTools", tools,
-            "--output-format", "json",
+            "--output-format", "stream-json", "--verbose",
         ]
         mcp = mcp_config_path(meta)
         if mcp is not None:
             worker_cmd += ["--mcp-config", str(mcp)]
             log.info("Task %s: MCP servers from %s", name, mcp)
+        note = ""
+        if meta.get("repo"):  # the dispatcher publishes; the worker may neither push nor call gh
+            worker_cmd += ["--disallowedTools", "Bash(git push*),Bash(gh *)"]
+            note = REPO_NOTE.format(branch=branch_name(path.stem), base=meta.get("base") or "main")
+        if meta.get("propose") == "true":  # its own staging folder, and only that
+            staging = staging_dir(path.stem)
+            worker_cmd[worker_cmd.index("--allowedTools") + 1] = f"{tools},Write(/{staging}/**)"
+            note += PROPOSE_NOTE.format(staging=staging, limit=proposal_limits()[1])
         try:
             reply = run_claude(
-                worker_cmd, WORKER_PREAMBLE + "\n\n" + body, timeout_min * 60, cwd, transcript, "worker"
+                worker_cmd, WORKER_PREAMBLE + "\n\n" + note + body, timeout_min * 60, cwd, transcript, "worker",
+                watcher=status or QuietWatcher(),
             )
         except RateLimited as exc:
             requeue_unconsumed(path, meta, body, attempts)
@@ -1766,9 +2831,13 @@ def process_task(path):
         if meta.get("review") == "skip":
             meta.pop("pending_review", None)
             meta.pop("review_failures", None)
-            finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped=True)
+            conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped=True)
             return
         verification = VERIFICATION_BLOCK.format(command=verified.command, output=verified.output or "(no output)")
+
+    if meta.get("pending_publish"):  # the review already passed on an earlier run; only publishing is left
+        conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified)
+        return
 
     review_cmd = [
         claude_bin, "-p",
@@ -1813,7 +2882,7 @@ def process_task(path):
     meta.pop("review_failures", None)
     verdict, feedback = parse_verdict(review_out)
     if verdict == "PASS":
-        finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified)
+        conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified)
     else:
         handle_failure(path, meta, body, attempts, max_attempts, feedback)
 
@@ -1854,7 +2923,7 @@ def main():
 
 
 def cycle():
-    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED, LOGS, STATE):
+    for directory in (PENDING, ACTIVE, DONE, FAILED, RECURRING, CANCELLED, PROPOSED, LOGS, STATE):
         directory.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
@@ -1866,11 +2935,16 @@ def cycle():
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     lock = open(LOCKFILE, "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        log.info("Another dispatcher run is active; exiting")
-        return 0
+    give_up = time.monotonic() + float(cfg("DISPATCH_LOCK_WAIT_SECONDS", "0") or 0)
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= give_up:  # no wait (cron), or the wait is over
+                log.info("Another dispatcher run is active; exiting")
+                return 0
+            time.sleep(0.5)  # a run started by a new file waits for the one that is working
     lock.write(str(os.getpid()))
     lock.flush()
 
@@ -1879,20 +2953,27 @@ def cycle():
     prune_seen()
     recover_stale()
     prune_logs()
+    prune_worktrees()
     spawn_recurring()
     if daily_cap_reached():
         return 0
-    task = pick_task()
-    if task is None:
-        log.info("Queue empty; nothing to do")
-        return 0
-    process_task(task)
-    return 0
+    announce_proposals()  # anything the coordinator left in proposed/
+    drain = cfg("DISPATCH_DRAIN") in ("1", "true", "yes")
+    handled = set()  # a task that needs another attempt waits for the next run, not a tight loop
+    while True:
+        task = pick_task(skip=handled)
+        if task is None:
+            log.info("Queue empty; nothing to do")
+            return 0
+        handled.add(task.stem)
+        process_task(task)
+        if not drain or queue_is_stopped() or daily_cap_reached():
+            return 0
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        actions = {"cancel": cancel_task, "retry": retry_task, "check": check_file}
+        actions = {"cancel": cancel_task, "retry": retry_task, "check": check_file, "enqueue": enqueue_task}
         if sys.argv[1] in actions and len(sys.argv) == 3:
             ok, message = actions[sys.argv[1]](sys.argv[2])
             print(message)
@@ -1904,6 +2985,7 @@ if __name__ == "__main__":
             "       dispatcher.py cancel <task-id>  archive a queued task to tasks/cancelled/\n"
             "       dispatcher.py retry <task-id>   requeue a failed/cancelled task, attempts reset\n"
             "       dispatcher.py check <file>      validate a task or recurring template file\n"
+            "       dispatcher.py enqueue <file>    validate a task file and drop it into the queue\n"
             "       dispatcher.py usage             claude calls, cost and turns by day and model",
             file=sys.stderr,
         )
