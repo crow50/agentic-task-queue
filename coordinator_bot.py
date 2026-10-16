@@ -197,6 +197,9 @@ def run_coordinator(prompt, session_id):
         claude_bin, "-p",
         "--model", cfg("COORDINATOR_MODEL", "claude-sonnet-5"),
         "--allowedTools", cfg("COORDINATOR_ALLOWED_TOOLS") or default_allowed_tools(),
+        # Claude only touches files under its working directory (coordinator/) and these folders: without them
+        # a write to tasks/pending/ is refused as outside the sandbox, whatever --allowedTools says.
+        "--add-dir", str(BASE / "tasks"), "--add-dir", str(BASE / "logs"),
         "--output-format", "json",
     ]
     if session_id:

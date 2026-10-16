@@ -25,6 +25,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -574,6 +575,23 @@ def step_render(ctx, claude_bin, env_changed):
         ctx.changed(f"{SERVICE} restarted")
 
 
+def step_seed_memory(ctx):
+    """Copy coordinator/memory.seed/* into coordinator/memory/ once. A file that is already there is never touched."""
+    seed = ctx.base / "coordinator" / "memory.seed"
+    if not seed.is_dir():
+        return
+    memory = ctx.base / "coordinator" / "memory"
+    for source in sorted(seed.glob("*.md")):
+        target = memory / source.name
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write_file(target, source.read_text())
+        ctx.system.chown(target.parent, ctx.user)
+        ctx.system.chown(target, ctx.user)
+        ctx.changed(f"coordinator/memory/{source.name} (standing preferences, yours to edit)")
+
+
 def dispatch_templates(ctx):
     """[(unit name, template path)] for the event-driven start; empty when this checkout predates it."""
     found = [(name, ctx.base / "coordinator" / f"{name}.template") for name in DISPATCH_UNITS]
@@ -653,6 +671,7 @@ def install(ctx):
         env_changed = write_env(ctx, token_updates) or env_changed
     step_deny_rules(ctx)
     step_render(ctx, claude_bin, env_changed)
+    step_seed_memory(ctx)
     step_dispatch_units(ctx, claude_bin)
     step_cron(ctx)
     for problem in clock_problems(ctx):
@@ -673,6 +692,55 @@ def install(ctx):
 
 
 # ---------------------------------------------------------------- --check
+
+
+PUBLISH_PERMISSIONS = ("WRITE", "MAINTAIN", "ADMIN")
+PUBLISH_FIX = ("set GH_TOKEN in .env to a fine-grained token with Contents and Pull requests "
+               "set to read and write on that repository")
+
+
+def repo_targets(ctx):
+    """Checkouts a queue task publishes from: every `repo:` named in a task file, plus any checkout under the
+    repos folder that has an origin. [(name, path)], each once."""
+    env = ctx.env()
+    root = Path(env.get("REPOS_DIR") or ctx.base / "workspace")
+    found = {}
+    for task in sorted((ctx.base / "tasks").glob("*/*.md")):
+        try:
+            match = re.search(r"^repo:\s*(\S+)\s*$", task.read_text().split("\n---", 1)[0], re.M)
+        except OSError:
+            continue
+        if match:
+            ref = match.group(1).strip("'\"")
+            found.setdefault(ref, Path(ref) if Path(ref).is_absolute() else root / ref)
+    if root.is_dir():
+        for child in sorted(root.iterdir()):
+            if child.name not in found and (child / ".git").exists() and \
+                    "origin" in ctx.system.run_as(ctx.user, ["git", "-C", str(child), "remote"]).stdout.split():
+                found[child.name] = child
+    return list(found.items())
+
+
+def publish_probe(ctx, path):
+    """(ok, detail): can the queue user write to this checkout's remote? The same two questions the dispatcher asks."""
+    env = ctx.env()
+    gh = shlex.split(env.get("GH_BIN") or "gh")
+    extra = {"GH_TOKEN": env["GH_TOKEN"]} if env.get("GH_TOKEN") else {}
+    proc = ctx.system.run_as(ctx.user, [*gh, "repo", "view", "--json", "viewerPermission"],
+                             extra_env=extra, cwd=path, timeout=60)
+    if proc.returncode != 0:
+        return False, f"gh repo view failed ({(proc.stderr or proc.stdout).strip()[-120:]}); {PUBLISH_FIX}"
+    try:
+        permission = str(json.loads(proc.stdout).get("viewerPermission") or "").upper()
+    except (ValueError, AttributeError):
+        permission = ""
+    if permission not in PUBLISH_PERMISSIONS:
+        return False, f"the token has {permission or 'no'} permission; {PUBLISH_FIX}"
+    remote = ctx.system.run_as(ctx.user, ["git", "-C", str(path), "ls-remote", "origin", "HEAD"],
+                               extra_env=extra, timeout=60)
+    if remote.returncode != 0:
+        return False, f"git ls-remote origin failed: {(remote.stderr or remote.stdout).strip()[-120:]}"
+    return True, f"{permission} on origin"
 
 
 def run_checks(ctx):
@@ -750,8 +818,17 @@ def run_checks(ctx):
         except (InstallError, OSError) as exc:
             add(False, "dispatch units match templates", str(exc), level=WARN, notify=False)
     tier = env.get("APPROVAL_MIN_TIER", "")
-    add(tier.isdigit() and int(tier) > 0, "approval gate",
-        f"APPROVAL_MIN_TIER={tier or 'unset'}: tasks that write run without your 👍 (set it to 1)", level=WARN, notify=False)
+    gate = tier.isdigit() and int(tier) > 0
+    add(gate, "approval gate",
+        f"APPROVAL_MIN_TIER={tier}: tasks at tier {tier} and above wait for your 👍" if gate
+        else f"APPROVAL_MIN_TIER={tier or 'unset'}: tasks that write run without your 👍; set APPROVAL_MIN_TIER=1 in .env",
+        level=WARN, notify=False)
+    for name, path in repo_targets(ctx):
+        if path.is_dir():
+            ok, detail = publish_probe(ctx, path)
+        else:
+            ok, detail = False, f"{path} is not there"
+        add(ok, f"publish access: {name}", detail)
 
     missing = [rel for rel in QUEUE_DIRS if ctx.system.run_as(ctx.user, ["test", "-w", str(ctx.base / rel)]).returncode]
     add(not missing, "queue folders writable", ", ".join(missing) or "all present")
