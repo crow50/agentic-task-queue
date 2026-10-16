@@ -14,6 +14,9 @@ Telegram file uploads) installed
 into a venv (see Setup). Recurring tasks are supported via schedule templates
 in `tasks/recurring/` (see below).
 
+For `repo:` tasks, the queue can also open a draft pull request with the
+work for you to review.
+
 ## Task lifecycle
 
 ```
