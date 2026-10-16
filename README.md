@@ -129,6 +129,9 @@ known key, which catches `valeu_class`) or a value outside its allowed set.
 `python3 dispatcher.py check <file>` runs the same validation on one task or
 recurring template file and prints what is wrong; the coordinator runs it
 after writing a file.
+Any `python3 dispatcher.py ...` command works from the system python: if the
+libraries are missing and `.venv/bin/python3` exists, it hands over to the venv
+once.
 
 ### Verifying with a command
 

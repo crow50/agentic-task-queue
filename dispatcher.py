@@ -57,6 +57,12 @@ try:
     import httpx
     import tenacity
 except ImportError as exc:  # cron has no terminal: say what to do in the one place it will be seen
+    # The README, the coordinator and cron all say `python3 dispatcher.py ...`, but the libraries live in the
+    # queue's own .venv. Hand over to it once (`-X taskq_venv` marks the second run so a broken venv cannot
+    # loop), and only when run as a script: the Telegram bridge imports this module and must not be replaced.
+    _venv_python = Path(__file__).resolve().parent / ".venv" / "bin" / "python3"
+    if __name__ == "__main__" and "taskq_venv" not in sys._xoptions and _venv_python.exists():
+        os.execv(str(_venv_python), [str(_venv_python), "-X", "taskq_venv", *sys.argv])
     sys.exit(
         f"dispatcher.py needs the libraries in requirements.txt ({exc}).\n"
         "Install them in a venv and run the queue with that venv's python:\n"
