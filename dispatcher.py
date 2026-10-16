@@ -939,6 +939,11 @@ def redact_secrets(text):
 TELEGRAM_MAX = 4096
 
 
+def clip_for_telegram(text, limit=TELEGRAM_MAX):
+    """`text` cut so it fits one message; a last resort for senders that have no attachment to fall back on."""
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 def md_to_telegram_html(text):
     """Convert common markdown to Telegram HTML (for parse_mode=HTML).
 
@@ -993,7 +998,7 @@ def send_message_id(raw, formatted=True):
     when nothing was sent. The id is what editMessageText and reactions refer to.
     """
     chat_id = cfg("TELEGRAM_CHAT_ID")
-    raw = redact_secrets(raw)  # a worker that prints a key must not forward it to a phone
+    raw = clip_for_telegram(redact_secrets(raw))  # a worker that prints a key must not forward it to a phone
     variants = [({"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"}, True)] if formatted else []
     variants.append(({"chat_id": chat_id, "text": raw}, False))
     for params, is_html in variants:
@@ -1214,6 +1219,11 @@ def start_status(path, meta):
     )
 
 
+def fits_in_message(text, limit=REPORT_INLINE_MAX):
+    """True when `text` can go out as one message, in its HTML form and its plain-text fallback, """
+    return len(text) <= limit and len(md_to_telegram_html(text)) <= TELEGRAM_MAX
+
+
 def fit_preview(prefix, text, suffix):
     """prefix + the start of text + suffix, cut at a line break so the HTML form fits one message.
 
@@ -1243,7 +1253,7 @@ def send_report(title, text, files=(), task_id="report", root=None):
         return
     body = f"{title}\n\n{text}" if title and text else title or text
     attachments = []
-    if len(body) <= REPORT_INLINE_MAX and len(md_to_telegram_html(body)) <= TELEGRAM_MAX:
+    if fits_in_message(body):
         post_message(body)
     else:
         name = f"{task_id}.md"
