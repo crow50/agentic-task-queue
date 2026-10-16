@@ -354,6 +354,13 @@ or an absolute path) works like this:
 4. only then the dispatcher commits, pushes, runs `gh pr create --draft` and
    sends you the link.
 
+To push and open the pull request the queue needs `GH_TOKEN` in `.env`: a
+fine-grained token limited to that one repository, with Contents and Pull requests
+read and write (Metadata read is added automatically). The checkout's `origin` must be an https URL
+(`https://github.com/<owner>/<repo>.git`); for github.com the dispatcher gives git
+`gh auth git-credential` as its credential helper, so the same token pushes the branch. It
+does not touch the queue user's own git config, and with no `GH_TOKEN` it adds nothing.
+
 Only tasks with `repo:` get a branch and a pull request. Research, reports and
 admin tasks never do. To keep the noise down, at most `MAX_OPEN_PRS` (3) task
 pull requests are open at once: at the cap the finished work is held, you get
