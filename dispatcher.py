@@ -336,6 +336,7 @@ FRONTMATTER_KEYS = {
     "pending_publish": (False, False, None),  # managed by the dispatcher
     "held_until": (False, False, None),  # managed by the dispatcher: not before this time
     "publish_failures": (False, False, None),  # managed by the dispatcher
+    "publish_blocked": (False, False, None),  # managed by the dispatcher: the credentials cannot publish; wait for the probe
     "proposed_by": (False, False, None),  # managed by the dispatcher
     "depth": (False, False, _whole_number(0)),  # managed by the dispatcher
     "schedule": (False, True, None),  # checked by check_schedule()
@@ -1054,7 +1055,9 @@ def post_document(name, source):
                 files={"document": (name, content)}, timeout=120,
             )
         reply.raise_for_status()
-    except (httpx.HTTPError, OSError) as exc:
+        if reply.json().get("ok") is not True:  # only Telegram's own "ok" counts as sent
+            raise ValueError("Telegram answered ok: false")
+    except (httpx.HTTPError, OSError, ValueError) as exc:
         # httpx puts the request URL, which contains the bot token, in its messages: log only the cause.
         cause = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
         log.warning("Telegram document %s failed: %s", name, cause)
@@ -1228,8 +1231,10 @@ def fit_preview(prefix, text, suffix):
         size = int(size * 0.8)
 
 
-def send_report(title, text, files=(), task_id="report"):
+def send_report(title, text, files=(), task_id="report", root=None):
     """Tell the user something. A long `text` becomes a preview plus `<task_id>.md`; `files` follow as documents.
+
+    A file Telegram did not accept is named in a follow-up as "not delivered: <path>" (relative to `root` when given).
 
     The one way the dispatcher sends done, failed and dependency notices, so
     nothing depends on a path only the machine running the queue can see.
@@ -1245,10 +1250,12 @@ def send_report(title, text, files=(), task_id="report"):
         prefix = f"{title}\n\n" if title else ""
         post_message(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"))
         attachments.append((f"the full report ({name})", name, redact_secrets(text).encode()))
-    attachments += [(path.name, path.name, path) for path in map(Path, files)]
+    root = Path(root).resolve() if root else None
+    attachments += [(str(path.relative_to(root)) if root and path.is_relative_to(root) else path.name, path.name, path)
+                    for path in map(Path, files)]
     for label, name, source in attachments:
         if not post_document(name, source):
-            post_message(f"⚠️ Couldn't attach {label}: Telegram refused the upload.")
+            post_message(f"⚠️ Couldn't attach {label}: Telegram refused the upload.\nnot delivered: {label}")
 
 
 def send_telegram(text):
@@ -1757,7 +1764,8 @@ def retry_task(stem):
                 meta, body = parse_task(path)
                 meta = meta or {}
                 meta["attempts"] = "0"
-                for key in ("pending_review", "review_failures", "pending_publish", "publish_failures", "held_until"):
+                for key in ("pending_review", "review_failures", "pending_publish", "publish_failures", "publish_blocked",
+                            "held_until"):
                     meta.pop(key, None)  # a fresh start redoes the work too
                 write_task(path, meta, body)
                 shutil.move(str(path), str(PENDING / path.name))
@@ -2256,21 +2264,95 @@ def pr_body(stem, body, worker_out, verified):
 
 
 def open_pr_count(cwd):
-    command = [*shlex.split(cfg("GH_BIN", "gh")), "pr", "list", "--state", "open", "--limit", "100", "--json", "headRefName",
-               "--jq", '[.[] | select(.headRefName | startswith("task/"))] | length']
+    proc = gh_run(cwd, "pr", "list", "--state", "open", "--limit", "100", "--json", "headRefName",
+                  "--jq", '[.[] | select(.headRefName | startswith("task/"))] | length')
     try:
-        proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=120, env=publish_env())
         if proc.returncode == 0:
             return int(proc.stdout.strip() or 0)
         detail = tail(proc.stderr or proc.stdout, 300)
-    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+    except ValueError as exc:
         detail = f"{type(exc).__name__}: {exc}"
     raise GitError(f"could not count open pull requests: {detail}")
 
 
+PUBLISH_AUTH_RE = re.compile(
+    r"\b40[13]\b|permission to \S+ denied|permission denied \(publickey|authentication failed|bad credentials|"
+    r"could not read (?:username|password)|resource not accessible|invalid username or token|requires authentication",
+    re.I,
+)
+PUBLISH_PERMISSIONS = ("WRITE", "MAINTAIN", "ADMIN")
+
+
+def publish_auth_problem(text):
+    """True when git or gh output says the credentials cannot do the job (a 401 or 403): a retry never helps."""
+    return bool(PUBLISH_AUTH_RE.search(text or ""))
+
+
+def gh_run(cwd, *args, timeout=120):
+    command = [*shlex.split(cfg("GH_BIN", "gh")), *args]
+    try:
+        return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=publish_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(command, 124, "", f"{type(exc).__name__}: {exc}")
+
+
+def publish_probe(repo):
+    """(ok, detail): can this checkout's credentials write to its remote? One `gh repo view` and one `git ls-remote`."""
+    proc = gh_run(repo, "repo", "view", "--json", "viewerPermission", timeout=60)
+    if proc.returncode != 0:
+        return False, f"gh repo view failed: {tail(proc.stderr or proc.stdout, 300)}"
+    try:
+        permission = str(json.loads(proc.stdout).get("viewerPermission") or "").upper()
+    except (ValueError, AttributeError):
+        permission = ""
+    if permission not in PUBLISH_PERMISSIONS:
+        return False, f"the token has {permission or 'no'} permission on the repository; it needs WRITE"
+    remote = git_run(repo, "ls-remote", "origin", "HEAD", timeout=60)
+    if remote.returncode != 0:
+        return False, f"git ls-remote origin failed: {tail(remote.stderr or remote.stdout, 300)}"
+    return True, ""
+
+
+def remote_slug(repo):
+    """owner/name of the checkout's origin on GitHub, else the folder name."""
+    url = git_run(repo, "remote", "get-url", "origin").stdout.strip()
+    match = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$", url)
+    return match.group(1) if match else Path(repo).name
+
+
+def pull_request_info(cwd, ref):
+    """What `gh pr view` says about a pull request (a URL or a branch name). Raises GitError if it cannot say."""
+    proc = gh_run(cwd, "pr", "view", ref, "--json", "url,state,isDraft,headRefName")
+    if proc.returncode != 0:
+        raise GitError(f"gh pr view could not find the pull request: {tail(proc.stderr or proc.stdout, 300)}")
+    try:
+        info = json.loads(proc.stdout)
+    except ValueError:
+        info = None
+    if not isinstance(info, dict):
+        raise GitError(f"gh pr view gave no usable answer: {tail(proc.stdout, 200)}")
+    return info
+
+
+def pull_request_problems(cwd, info, branch, sha):
+    """Why `info` is not the draft pull request we meant to open (empty when it is), checked against the remote too."""
+    problems = []
+    if str(info.get("state")).upper() != "OPEN":
+        problems.append(f"it is {str(info.get('state')).lower()}, not open")
+    if info.get("isDraft") is not True:
+        problems.append("it is not a draft")
+    if info.get("headRefName") != branch:
+        problems.append(f"its head branch is {info.get('headRefName')!r}, not {branch!r}")
+    remote = git_run(cwd, "ls-remote", "origin", f"refs/heads/{branch}")
+    found = remote.stdout.split()[0] if remote.returncode == 0 and remote.stdout.split() else ""
+    if found != sha:
+        problems.append("the remote branch is not at the commit that was pushed")
+    return problems
+
+
 def publish_draft_pr(path, meta, body, worker_out, verified):
-    """Commit the worktree, push task/<id> and open a draft PR. Returns (status, detail):
-    ok (the URL), nochange, held (open PR count), or error (why)."""
+    """Commit the worktree, push task/<id>, open a draft PR and check it is what we claim. Returns (status, detail):
+    ok (the URL), nochange, held (open PR count), denied (the credentials cannot publish: why) or error (why)."""
     stem, branch = path.stem, branch_name(path.stem)
     worktree, repo, base = worktree_path(path.stem), repo_path(meta), meta.get("base") or "main"
     title = pr_title(stem, body)
@@ -2286,24 +2368,31 @@ def publish_draft_pr(path, meta, body, worker_out, verified):
             if open_prs >= cap:
                 return "held", str(open_prs)
         git_need(worktree, "push", "-q", "-u", "origin", branch, timeout=300)
+        sha = git_need(worktree, "rev-parse", "HEAD")
         with tempfile.TemporaryDirectory() as tmp:
             body_file = Path(tmp) / "body.md"
             body_file.write_text(pr_body(stem, body, worker_out, verified))
-            command = [*shlex.split(cfg("GH_BIN", "gh")), "pr", "create", "--draft", "--base", base, "--head", branch,
-                       "--title", title, "--body-file", str(body_file)]
-            try:
-                proc = subprocess.run(command, cwd=worktree, capture_output=True, text=True, timeout=120, env=publish_env())
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                proc = subprocess.CompletedProcess(command, 124, "", f"{type(exc).__name__}: {exc}")
+            proc = gh_run(worktree, "pr", "create", "--draft", "--base", base, "--head", branch,
+                          "--title", title, "--body-file", str(body_file))
         if proc.returncode != 0:
-            git_run(worktree, "push", "-q", "origin", "--delete", branch)  # no PR: don't leave a dangling branch
-            raise GitError(f"gh pr create failed: {tail(proc.stderr or proc.stdout, 400)}")
-        url = next((line.strip() for line in reversed(proc.stdout.splitlines()) if line.strip()), "")
-        if not url.startswith("http"):
-            raise GitError(f"gh pr create printed no URL: {tail(proc.stdout, 200)}")
-        return "ok", url
+            try:  # an earlier try may have opened it and failed only at the check below: use it, never delete its branch
+                info = pull_request_info(worktree, branch)
+            except GitError:
+                info = None
+            if info is None or str(info.get("state")).upper() != "OPEN":
+                git_run(worktree, "push", "-q", "origin", "--delete", branch)  # no PR: don't leave a dangling branch
+                raise GitError(f"gh pr create failed: {tail(proc.stderr or proc.stdout, 400)}")
+            url = info.get("url") or ""
+        else:
+            url = next((line.strip() for line in reversed(proc.stdout.splitlines()) if line.strip()), "")
+            if not url.startswith("http"):
+                raise GitError(f"gh pr create printed no URL: {tail(proc.stdout, 200)}")
+            info = pull_request_info(worktree, url)
+        if problems := pull_request_problems(worktree, info, branch, sha):
+            raise GitError(f"the pull request {url} did not check out: " + "; ".join(problems))
+        return "ok", info.get("url") or url
     except (GitError, ValueError) as exc:
-        return "error", str(exc)
+        return ("denied" if publish_auth_problem(str(exc)) else "error"), str(exc)
 
 
 def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False):
@@ -2315,18 +2404,34 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
     status, detail = publish_draft_pr(path, meta, body, worker_out, verified)
     stem = path.stem
     if status == "ok":
-        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures", "held_until"):
+        for key in ("pending_publish", "publish_failures", "publish_blocked", "pending_review", "review_failures",
+                    "held_until"):
             meta.pop(key, None)
         meta["pr_url"], meta["branch"] = detail, branch_name(stem)
         clear_reported(f"pr-held|tasks/pending/{path.name}")
+        clear_reported(f"publish-denied|tasks/pending/{path.name}")
         finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped, pr_url=detail)
         remove_worktree(meta, stem)
     elif status == "nochange":
-        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures", "held_until"):
+        for key in ("pending_publish", "publish_failures", "publish_blocked", "pending_review", "review_failures",
+                    "held_until"):
             meta.pop(key, None)
         handle_failure(path, meta, body, attempts, max_attempts,
                        "The worker made no changes to the repository, so there is nothing to open a pull request for. "
                        "Make the change the task describes.")
+    elif status == "denied":  # a setup problem: keep the work, use no attempt, say what to fix once, wait for the probe
+        meta["pending_publish"], meta["publish_blocked"] = "1", "1"
+        meta.pop("held_until", None)
+        park_report(path, meta, body, attempts, worker_out, denials)
+        slug = remote_slug(repo_path(meta))
+        report_once(
+            f"publish-denied|tasks/pending/{path.name}", "denied",
+            f"Task {stem}: the credentials cannot publish to {slug}: {detail}",
+            f"🔑 {path.name} is finished and checked, but the token cannot publish it to {slug}. In .env, GH_TOKEN "
+            "needs Contents and Pull requests set to read and write on that one repository. Nothing is lost: the "
+            "work is kept and publishes by itself on the next run once the token works. This is the only message "
+            "about it.",
+        )
     elif status == "held":
         meta["pending_publish"] = "1"
         if until := hold_until():
@@ -2370,7 +2475,8 @@ PROPOSE_NOTE = (
     "proposals: they wait for the human's approval before anything runs. Do not write to tasks/pending/.\n\n"
 )
 TASK_DIRS = (PENDING, PROPOSED, ACTIVE, DONE, FAILED, CANCELLED, RECURRING)
-MANAGED_KEYS = ("tier", "pr_url", "branch", "pending_review", "review_failures", "pending_publish", "publish_failures")
+MANAGED_KEYS = ("tier", "pr_url", "branch", "pending_review", "review_failures", "pending_publish", "publish_failures",
+                "publish_blocked")
 
 
 def proposal_limits():
@@ -2535,6 +2641,14 @@ def pick_task(skip=()):
         meta, body = parse_task(src)
         if meta and is_held(meta):  # a held PR or a failed publish: not before its time
             continue
+        if meta and meta.get("publish_blocked") and not repo_problem(meta):
+            ok, detail = publish_probe(repo_path(meta))
+            if not ok:  # still broken: one cheap probe per run, no push, no message (it was said once)
+                log.info("Task %s: publishing is still blocked (%s)", src.name, detail)
+                continue
+            meta.pop("publish_blocked", None)
+            write_task(src, meta, body)
+            log.info("Task %s: the publish probe passed; publishing", src.name)
         blocked = None
         cancelled_dep = None
         for dep in dep_names(meta):
@@ -2794,7 +2908,7 @@ def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials,
         lines.append(f"🔀 Draft PR ready: {pr_url}")
     files, notes = collect_deliverables(meta, cwd)
     if meta.get("quiet") != "true" or pr_url:  # quiet tasks (the weekly improver) report only failures, and PR links
-        send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem)
+        send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem, root=cwd)
     if notes:
         send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
 
