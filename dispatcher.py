@@ -2062,6 +2062,15 @@ def publish_env():
     env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never wait for a password in an unattended run
+    if env.get("GH_TOKEN"):
+        # GH_TOKEN reaches `gh` by itself, but `git push` over https asks git's credential helpers, and the queue
+        # user has none. Register `gh auth git-credential` for github.com only (the empty entry first clears any
+        # inherited helper), so the same fine-grained token pushes the task branch.
+        helper = f"!{cfg('GH_BIN', 'gh')} auth git-credential"
+        entries = [("credential.https://github.com.helper", ""), ("credential.https://github.com.helper", helper)]
+        env["GIT_CONFIG_COUNT"] = str(len(entries))
+        for number, (key, value) in enumerate(entries):
+            env[f"GIT_CONFIG_KEY_{number}"], env[f"GIT_CONFIG_VALUE_{number}"] = key, value
     return env
 
 
