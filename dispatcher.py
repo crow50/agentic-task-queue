@@ -992,6 +992,7 @@ def send_message_id(raw, formatted=True):
     when nothing was sent. The id is what editMessageText and reactions refer to.
     """
     chat_id = cfg("TELEGRAM_CHAT_ID")
+    raw = redact_secrets(raw)  # a worker that prints a key must not forward it to a phone
     variants = [({"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"}, True)] if formatted else []
     variants.append(({"chat_id": chat_id, "text": raw}, False))
     for params, is_html in variants:
@@ -1024,7 +1025,7 @@ def post_message(raw):
 def edit_message(message_id, raw):
     """editMessageText as plain text. True when done (or harmlessly unchanged), False on failure,
     or the seconds Telegram asked us to wait after a 429."""
-    data = urllib.parse.urlencode({"chat_id": cfg("TELEGRAM_CHAT_ID"), "message_id": message_id, "text": raw}).encode()
+    data = urllib.parse.urlencode({"chat_id": cfg("TELEGRAM_CHAT_ID"), "message_id": message_id, "text": redact_secrets(raw)}).encode()
     try:
         urllib.request.urlopen(telegram_url("editMessageText"), data, timeout=30).close()
         return True
@@ -1243,7 +1244,7 @@ def send_report(title, text, files=(), task_id="report"):
         name = f"{task_id}.md"
         prefix = f"{title}\n\n" if title else ""
         post_message(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"))
-        attachments.append((f"the full report ({name})", name, text.encode()))
+        attachments.append((f"the full report ({name})", name, redact_secrets(text).encode()))
     attachments += [(path.name, path.name, path) for path in map(Path, files)]
     for label, name, source in attachments:
         if not post_document(name, source):

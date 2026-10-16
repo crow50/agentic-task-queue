@@ -134,7 +134,7 @@ def send_replies(texts, state=None):
     """
     chat_id = cfg("TELEGRAM_CHAT_ID")
     for text in texts:
-        for chunk in chunk_message(text):
+        for chunk in chunk_message(dispatcher.redact_secrets(text)):
             try:
                 sent = api(
                     "sendMessage",
@@ -403,6 +403,20 @@ def handle_reaction(reaction, state):
     converse(prompt, state)
 
 
+def refuse_secret(msg, chat_id, kinds, state):
+    """A message that holds a key or token: not logged, not stored, not sent to the model. Delete it and say why, once."""
+    log.warning("Dropped message %s: it looked like a %s", msg.get("message_id"), " and a ".join(kinds))
+    record = state.setdefault("redacted", [])
+    record.append({"message_id": msg.get("message_id"), "kinds": kinds, "at": dispatcher.now_iso()})
+    del record[:-20]
+    try:
+        api("deleteMessage", {"chat_id": chat_id, "message_id": msg.get("message_id")}, timeout=10)
+    except Exception:
+        pass  # Telegram may refuse (an old message, a group without the right); the reply still tells the user to rotate it
+    send_replies([f"That looked like a {kinds[0]}. I did not read or keep it. Put it in `.env` and rotate it, "
+                  "since it sat in this chat."], state)
+
+
 def handle_update(update, state):
     if update.get("message_reaction"):
         handle_reaction(update["message_reaction"], state)
@@ -416,6 +430,9 @@ def handle_update(update, state):
     text = (msg.get("text") or "").strip()
     if not text:
         send_replies(["I can only read text messages."], state)
+        return
+    if kinds := dispatcher.secret_kinds(text):  # before the log line, the model and the state file see it
+        refuse_secret(msg, chat_id, kinds, state)
         return
     log.info("Received: %s", text[:300])
     if text == "/new":
