@@ -904,6 +904,37 @@ def run_claude(cmd, prompt, timeout_s, cwd, transcript, label, retries=None, wat
 # ---------------------------------------------------------------- telegram
 
 
+# ------------------------------------------------------------------- secrets
+#
+# One list of what a secret looks like, used three ways: the diff guard refuses a commit
+# that adds one, the Telegram bridge refuses to read or keep a message that holds one, and
+# every message sent to Telegram is redacted first. Better a false alarm than a leaked key.
+
+SECRET_PATTERNS = (
+    ("GitHub token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
+    ("Anthropic key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{16,}")),
+    ("Telegram bot token", re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b")),
+    ("Notion token", re.compile(r"\bntn_[A-Za-z0-9]{20,}")),
+    ("DigitalOcean token", re.compile(r"\bdop_v1_[A-Za-z0-9]{20,}")),
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("private key", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
+    ("password or token", re.compile(
+        r"(?P<keep>(?:token|secret|password|api[_-]?key)[\"']?\s*[:=]\s*[\"']?)[A-Za-z0-9/+_=.\-]{16,}", re.I)),
+)
+
+
+def secret_kinds(text):
+    """The kinds of secret `text` appears to contain, in the order of SECRET_PATTERNS. Never the values."""
+    return [kind for kind, pattern in SECRET_PATTERNS if pattern.search(text)]
+
+
+def redact_secrets(text):
+    """`text` with every secret replaced by [redacted <kind>] (a generic assignment keeps its name)."""
+    for kind, pattern in SECRET_PATTERNS:
+        text = pattern.sub(lambda m, kind=kind: (m.groupdict().get("keep") or "") + f"[redacted {kind}]", text)
+    return text
+
+
 TELEGRAM_MAX = 4096
 
 
@@ -2136,6 +2167,74 @@ def prune_worktrees():
             log.warning("could not prune worktree %s: %s", worktree.name, exc)
 
 
+DIFF_GUARD_DENY_DEFAULT = ".venv/,venv/,node_modules/,__pycache__/,*.pyc,.env,*.pem,id_rsa*,*.sqlite"
+GUARD_LISTED_MAX = 20  # findings named in the feedback; the rest are counted
+
+
+def denied_path(path, patterns):
+    """True when `path` matches a DIFF_GUARD_DENY entry: `name/` is a folder anywhere in the path, anything else a file glob."""
+    parts = path.split("/")
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            if any(fnmatch.fnmatch(part, pattern.rstrip("/")) for part in parts[:-1]):
+                return True
+        elif fnmatch.fnmatch(parts[-1], pattern) or fnmatch.fnmatch(path, pattern):
+            return True
+    return False
+
+
+def diff_guard(worktree, repo, meta):
+    """Scan what the worker changed against the branch point, before anything is committed.
+
+    Returns feedback for the worker when something must not be published, else "". The feedback
+    names paths and kinds of secret, never a value. Deleted lines are not scanned.
+    """
+    patterns = [p.strip() for p in cfg("DIFF_GUARD_DENY", DIFF_GUARD_DENY_DEFAULT).split(",") if p.strip()]
+    max_kb = float(cfg("DIFF_GUARD_MAX_KB", "1024"))
+    try:
+        git_need(worktree, "add", "-A")
+        base = git_need(worktree, "merge-base", base_ref(repo, meta), "HEAD")
+        changes = git_need(worktree, "-c", "core.quotepath=off", "diff", "--cached", "--name-status", "--no-renames", "-z", base)
+        tokens = [t for t in changes.split("\0") if t]
+        changed = list(zip(tokens[::2], tokens[1::2]))
+        problems = []
+        for status, path in changed:
+            if denied_path(path, patterns):
+                problems.append(f"- {path}: on the deny list (DIFF_GUARD_DENY)")
+            elif status == "A":
+                size_kb = int(git_need(worktree, "cat-file", "-s", f":{path}")) / 1024
+                if size_kb > max_kb:
+                    problems.append(f"- {path}: {size_kb:.0f} KB is over the {max_kb:g} KB limit for an added file (DIFF_GUARD_MAX_KB)")
+        flagged = {path for _, path in changed if any(path in problem for problem in problems)}
+        diff = git_need(worktree, "-c", "core.quotepath=off", "diff", "--cached", "-U0", "--no-color", "--no-renames", "--text", base)
+    except (GitError, ValueError) as exc:
+        return f"The dispatcher could not check the change before committing it ({exc}). Make sure the repository is healthy."
+    found, path, header = {}, None, False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path, header = None, True
+        elif header and line.startswith("+++ "):
+            path = line[4:].removeprefix("b/") if line != "+++ /dev/null" else None
+        elif line.startswith("@@"):
+            header = False
+        elif not header and line.startswith("+") and path and path not in flagged:
+            for kind in secret_kinds(line[1:]):
+                found.setdefault(path, [])
+                if kind not in found[path]:
+                    found[path].append(kind)
+    problems += [f"- {path}: an added line looks like a {', '.join(kinds)} (the value is not repeated here)"
+                 for path, kinds in found.items()]
+    if not problems:
+        return ""
+    shown = "\n".join(problems[:GUARD_LISTED_MAX]) + (f"\n- ...and {len(problems) - GUARD_LISTED_MAX} more" if len(problems) > GUARD_LISTED_MAX else "")
+    return (
+        "The dispatcher refused to commit this change, so nothing was pushed and no pull request was opened:\n"
+        f"{shown}\n"
+        "Delete these files or lines from the working tree. If a file is a build or environment folder, add its "
+        "path to .gitignore as well. Never put a key or token in a file; read it from the environment."
+    )
+
+
 def pr_title(stem, body):
     for line in body.splitlines():
         line = line.strip().lstrip("#").strip()
@@ -2825,6 +2924,14 @@ def run_task(path, status=None):
             handle_failure(path, meta, body, attempts, max_attempts, f"Worker invocation failed:\n{tail(str(exc))}")
             return
         worker_out, denials = reply.text, reply.envelope.get("permission_denials") or []
+
+    if meta.get("repo") and (problem := diff_guard(Path(cwd), repo_path(meta), meta)):
+        meta.pop("pending_review", None)  # the saved report described files that may not be published
+        meta.pop("review_failures", None)
+        meta.pop("pending_publish", None)
+        log.warning("Task %s: diff guard refused the change", name)
+        handle_failure(path, meta, body, attempts, max_attempts, problem)
+        return
 
     verified, verification = None, ""
     if meta.get("verify"):
