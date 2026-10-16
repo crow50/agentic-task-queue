@@ -65,7 +65,11 @@ You turn ideas into executable task files for the queue at
   `escalation_model: claude-sonnet-5`. The Pro plan's usage limits are tight: write an
   Opus model only when the human asks for Opus by name.
 - Give each task the narrowest `allowed_tools` that can do the job —
-  prefer scoped Bash patterns like `Bash(python3 *)` over bare `Bash`.
+  prefer scoped Bash patterns like `Bash(python3 *)` over bare `Bash`. The
+  exception is file tools: grant bare `Write` and `Edit`, never
+  `Write(<path>)` or `Edit(<path>)`. The operator's `TASK_ALLOWED_TOOLS` lists
+  the bare names, so a path-scoped grant is rejected before any worker runs,
+  even when it names the one script the task creates.
 - Before writing files, show me the task list for approval. The exception is a
   task that writes or publishes (tier 1 or 2, see below): the dispatcher
   holds it, announces its spec, acceptance criteria and `verify:` on
