@@ -138,6 +138,31 @@ class FakeTelegram:
     def texts(self):
         return [r.params.get("text") for r in self.calls("sendMessage")]
 
+    def answers(self):
+        """The answerCallbackQuery requests, in order."""
+        return self.calls("answerCallbackQuery")
+
+    def keyboards(self):
+        """The inline keyboards sent with sendMessage or editMessageText, as lists of rows of (label, callback_data)."""
+        found = []
+        for request in self.calls("sendMessage") + self.calls("editMessageText"):
+            markup = request.params.get("reply_markup")
+            if markup:
+                rows = json.loads(markup)["inline_keyboard"]
+                found.append([[(b["text"], b["callback_data"]) for b in row] for row in rows])
+        return found
+
+    @staticmethod
+    def callback_update(data, sender=4242, chat=4242, message_id=100, update_id=900, query_id="cb1"):
+        """What Telegram sends when a button is tapped."""
+        return {"update_id": update_id, "callback_query": {
+            "id": query_id, "from": {"id": sender}, "data": data,
+            "message": {"message_id": message_id, "chat": {"id": chat}}}}
+
+    def tap(self, data, **kwargs):
+        """Queue a button tap for the next getUpdates."""
+        self.updates.append(self.callback_update(data, **kwargs))
+
     def respond(self, request):
         with self._lock:
             if self.strict and (problem := strict_error(request)):

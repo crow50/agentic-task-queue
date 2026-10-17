@@ -1,0 +1,1 @@
+{"worker": [{"write": {"path": "counts.json", "content": "{\"the\": 4, \"queue\": 4, \"runs\": 1, \"task\": 2, \"ends\": 1, \"waits\": 1, \"a\": 2, \"is\": 1}\n"}, "result": "Wrote counts.json (8 words)."}]}

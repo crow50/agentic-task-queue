@@ -23,6 +23,11 @@ proposing, write nothing.
 2. Read `worker_preamble.md` (the instructions every worker gets) and
    `coordinator/CLAUDE.md.template` (how task files are written; the installer
    renders `coordinator/CLAUDE.md` from it, so propose edits to the template).
+   Also read `models.json` (which model does which job, with fallback chains) and
+   `logs/usage.jsonl` (one line per claude call: `label`, `model`, `status`, `cost_usd`).
+   Propose a change to `models.json` only when the log shows a model failing or costing
+   far more per call than the one the table would use instead; keep every model listed
+   under `capabilities`, and never add Opus.
 3. Group the lessons by cause: a denied command, a criterion that could not be
    verified, a report that pointed at a file the reader never sees, a timeout,
    truncated output. Propose a fix only for a cause that appears in **at least 2
@@ -50,7 +55,7 @@ proposing, write nothing.
   `tasks/proposals/opened/` or `tasks/proposals/rejected/` by the script) and
   the final line names it, or no patch was written and the final line is
   exactly `no proposal`.
-- Any patch file changes only `worker_preamble.md`, `coordinator/CLAUDE.md.template`,
+- Any patch file changes only `worker_preamble.md`, `coordinator/CLAUDE.md.template`, `models.json`,
   new `tests/test_*.py` files, or new files under `.claude/skills/`, and never
   `dispatcher.py`.
 - The proposed change is backed by at least 2 lessons from `logs/lessons.jsonl`,

@@ -1,0 +1,8 @@
+Oak Street | 450000 | 3
+Mill Lane | 620000 | 4
+Harbour View | 495000 | 3
+Pine Court | 380000 | 2
+Rose Cottage | 410000 | 4
+Station Road | 530000 | 3
+Elm Row | 299000 | 1
+Birch Close | 500000 | 5

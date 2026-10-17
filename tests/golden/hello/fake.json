@@ -1,0 +1,1 @@
+{"worker": [{"write": {"path": "hello.txt", "content": "hello, queue\n"}, "result": "Created hello.txt with the greeting."}]}

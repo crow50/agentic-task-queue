@@ -56,6 +56,8 @@ from pathlib import Path
 from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
+from taskq_lib import accounting, alerts, buttons, models, naming
+
 try:
     import filelock
     import httpx
@@ -91,6 +93,12 @@ PAUSED_FILE = STATE / "paused_until"  # first line: ISO UTC time; second line: w
 AUTH_FAILED_FILE = STATE / "auth_failed"  # present while the claude login is known to be expired
 SEEN_FILE = STATE / "seen.json"  # problems already reported, so each is said once
 USAGE_LOG = LOGS / "usage.jsonl"
+MODELS_FILE = BASE / "models.json"  # which model does which job, and the fallback chains (see taskq_lib/models.py)
+UNSUPPORTED_MODELS_FILE = STATE / "unsupported_models.json"  # {model: when the account said it cannot use it}
+CALLBACK_ARGS_FILE = STATE / "callback_args.json"  # full text of button arguments too long for callback_data
+SEEN_AT_FILE = STATE / "seen_at.json"  # when each reported problem was first said, for the one reminder after a day
+ALERTS_FILE = STATE / "alerts.json"  # the local day each per-day alert (context, budget) was last sent
+SESSION_COSTS_FILE = STATE / "session_costs.json"  # last total_cost_usd per claude session, so a resumed one is not counted twice
 LESSONS_LOG = LOGS / "lessons.jsonl"  # one line per failed attempt; the weekly improver learns from it
 FAILED_CALLS_LOG = LOGS / "failed-calls.log"
 
@@ -101,6 +109,12 @@ AUTH_ERROR_RE = re.compile(
     r"not logged in|please run /login|invalid api key|authenticat|oauth|session expired|unauthorized",
     re.I,
 )
+UNSUPPORTED_MODEL_RE = re.compile(
+    r"issue with the selected model|model[^\n]{0,60}(not supported|unsupported|not.?found|does not exist|may not exist"
+    r"|no access|not available)|(unsupported|unknown|invalid) model",
+    re.I,
+)
+MODEL_RETRY_HOURS = 24  # a model the account refused is tried again after this long
 PAUSE_BUFFER_S = 60  # past a stated reset time, so we don't wake up a moment early
 MAX_RESET_WAIT = timedelta(days=8)  # a "reset time" further out than the weekly window is not one
 MAX_REVIEW_RETRIES = 3  # reviews that error or time out are retried this often, then charged
@@ -164,6 +178,10 @@ class CallTimeout(Exception):
 
 class AuthError(Exception):
     """The claude CLI is not authenticated — a config problem, not a task failure."""
+
+
+class UnsupportedModel(Exception):
+    """The account cannot use the model that was asked for. args: (model, what the CLI said)."""
 
 
 class ClaudeError(Exception):
@@ -284,6 +302,16 @@ def extract_criteria(body):
     return match.group(1).strip() if match else None
 
 
+def criteria_covered(body):
+    """True when every acceptance criterion is marked [verify]: the task's verify command is what checks it.
+
+    The marker is the author's statement that the command covers that line, so a criterion that needs judgement
+    (no marker) keeps the review. A section with no bullet lines covers nothing.
+    """
+    bullets = [line.strip() for line in (extract_criteria(body) or "").splitlines() if re.match(r"\s*([-*]|\d+[.)])\s", line)]
+    return bool(bullets) and all("[verify]" in line.lower() for line in bullets)
+
+
 VALUE_CLASSES = ("deliverable", "research", "verification", "admin")
 SCHEDULE_FORMS = "every 30m|6h|2d (any number), daily at 06:30, weekly on mon at 09:00"
 
@@ -322,7 +350,8 @@ FRONTMATTER_KEYS = {
     "cwd": (False, False, None),
     "deliver": (False, False, None),
     "verify": (False, False, None),  # checked by verify_problem()
-    "review": (False, False, ("skip",)),
+    "review": (False, False, ("skip", "skip-if-verified")),  # skip-if-verified: only when every criterion is marked [verify]
+    "max_turns": (False, False, _whole_number(1)),  # passed to the worker as --max-turns, so a runaway task stops
     "quiet": (False, False, ("true", "false")),  # true: no "Task done" report on a pass; failures still report
     "value_class": (False, False, VALUE_CLASSES),  # may be absent: older files read as untagged
     "pending_review": (False, False, None),  # managed by the dispatcher
@@ -572,8 +601,8 @@ def validate_task(meta, body, template=False):
             problems.append(f"deliver path '{ref}' is outside the task's cwd")
     if meta.get("verify") and (problem := verify_problem(meta["verify"])):
         problems.append(problem)
-    if meta.get("review") == "skip" and not meta.get("verify"):
-        problems.append("review: skip needs a verify command; nothing else would check the result")
+    if meta.get("review") in ("skip", "skip-if-verified") and not meta.get("verify"):
+        problems.append(f"review: {meta['review']} needs a verify command; nothing else would check the result")
     if template:
         if not meta.get("schedule"):
             problems.append("recurring template has no 'schedule' key")
@@ -657,7 +686,7 @@ def extract_result(stdout):
 def classify_call(returncode, out, err):
     """Judge one finished claude call as (status, message).
 
-    status is "ok", "rate_limited", "auth" or "error". The rate-limit and login
+    status is "ok", "rate_limited", "auth", "model" (the account cannot use that model) or "error". The rate-limit and login
     patterns only ever see a failed call (non-zero exit, or an envelope with
     is_error set), so a report that merely mentions OAuth is never taken for an
     expired login. An error envelope on exit 0 that matches neither pattern is
@@ -677,6 +706,8 @@ def classify_call(returncode, out, err):
         return "rate_limited", f"{message}\n{err}".strip()  # a reset time may be on either stream
     if AUTH_ERROR_RE.search(evidence):
         return "auth", message
+    if UNSUPPORTED_MODEL_RE.search(evidence):
+        return "model", message
     return "error", message
 
 
@@ -684,22 +715,54 @@ def model_of(cmd):
     return cmd[cmd.index("--model") + 1] if "--model" in cmd[:-1] else None
 
 
-def log_usage(label, model, exit_code, status, envelope=None):
-    """Append one line per claude call to logs/usage.jsonl (read by `usage` and the daily cap)."""
+def session_cost(session_id, total, resumed_from=None):
+    """What this call added to its session's running total (see taskq_lib.accounting), remembering the total."""
+    try:
+        with filelock.FileLock(f"{SESSION_COSTS_FILE}.lock"):
+            try:
+                costs = json.loads(SESSION_COSTS_FILE.read_text())
+            except (OSError, json.JSONDecodeError):
+                costs = {}
+            cost, costs = accounting.cost_increase(costs if isinstance(costs, dict) else {}, session_id, total, resumed_from)
+            if cost is not None and session_id:
+                write_atomic(SESSION_COSTS_FILE, json.dumps(costs))
+            return cost
+    except OSError as exc:  # bookkeeping must never fail a task
+        log.warning("Could not update %s: %s", SESSION_COSTS_FILE.name, exc)
+        return total
+
+
+def log_usage(label, model, exit_code, status, envelope=None, task=None, resumed_from=None):
+    """Append one line per claude call to logs/usage.jsonl (read by `usage` and the daily cap).
+
+    `cost_usd` is what the call added to its session's total (total_cost_usd keeps the CLI's running figure),
+    and `context_tokens`/`context_pct` say how full the model's window was at the end of the call.
+    """
     envelope = envelope or {}
+    tokens, pct = accounting.context_of(envelope, model)
     record = {
         "time": now_iso(),
         "label": label,  # worker, review, probe or coordinator
+        "task": task,
         "model": model,
         "exit": exit_code,
         "status": status,  # ok, error, rate_limited, auth or timeout
         **{key: envelope.get(key) for key in USAGE_FIELDS},
+        "session_id": envelope.get("session_id"),
+        "cost_usd": session_cost(envelope.get("session_id"), envelope.get("total_cost_usd"), resumed_from),
+        "context_tokens": tokens,
+        "context_pct": pct,
         "is_error": envelope["is_error"] if "is_error" in envelope else exit_code != 0,
     }
     try:
         append_locked(USAGE_LOG, json.dumps(record) + "\n")
     except OSError as exc:  # bookkeeping must never fail a task
         log.warning("Could not write %s: %s", USAGE_LOG.name, exc)
+    try:
+        watch_usage(record)
+    except Exception as exc:  # noqa: BLE001 - an alert must never fail a task
+        log.warning("Could not check the usage alerts: %s", exc)
+    return record
 
 
 def log_lesson(path, attempts, feedback):
@@ -829,6 +892,15 @@ def read_stream(proc, prompt, timeout_s, watcher, raw_path):
     return (result if result is not None else "".join(text)), "".join(err)
 
 
+def max_turns_of(cmd):
+    return cmd[cmd.index("--max-turns") + 1] if "--max-turns" in cmd[:-1] else None
+
+
+def task_of(transcript):
+    """The task id a per-attempt transcript (logs/<id>.attempt-N.log) belongs to."""
+    return transcript.name.partition(".attempt-")[0] or None
+
+
 def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label, watcher=None):
     """One claude -p invocation: a ClaudeReply, or an exception. Never sleeps.
 
@@ -862,7 +934,7 @@ def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label, watcher=None):
             pass
         proc.wait()
         append_transcript(transcript, f"[{label}] TIMED OUT after {timeout_s:.0f}s")
-        log_usage(label, model, None, "timeout")
+        log_usage(label, model, None, "timeout", task=task_of(transcript))
         log_failed_call(label, "timeout", "", "", command)
         raise CallTimeout(timeout_s)
     append_transcript(
@@ -871,10 +943,16 @@ def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label, watcher=None):
     )
     envelope = parse_envelope(out)
     status, message = classify_call(proc.returncode, out, err)
-    log_usage(label, model, proc.returncode, status, envelope)
+    log_usage(label, model, proc.returncode, status, envelope, task=task_of(transcript))
     if status != "ok":
         log_failed_call(label, proc.returncode, out, err, command)
     reply = ClaudeReply(extract_result(out), envelope or {})
+    if envelope and (envelope.get("subtype") == "error_max_turns" or envelope.get("terminal_reason") == "max_turns"):
+        raise ClaudeError(
+            f"The worker stopped at its turn limit (max_turns: {max_turns_of(cmd) or '?'}) before it finished. "
+            "Do the work in fewer steps: script the fetching and filtering, batch edits, and report. "
+            "If the task is too big for that, say what is left."
+        )
     if status == "ok":
         return reply
     if status == "rate_limited":
@@ -883,6 +961,8 @@ def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label, watcher=None):
         raise TransientLimit(message)
     if status == "auth":
         raise AuthError(message)
+    if status == "model":
+        raise UnsupportedModel(model, message)
     if proc.returncode == 0:  # an error envelope on exit 0: the reviewer judges the text, as before
         return reply
     raise ClaudeError(message)
@@ -991,8 +1071,31 @@ def telegram_configured():
     return False
 
 
-def send_message_id(raw, formatted=True):
-    """sendMessage (HTML first when `formatted`, plain text if Telegram returns 400).
+def callback_table():
+    try:
+        data = json.loads(CALLBACK_ARGS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def keyboard(rows):
+    """reply_markup JSON for rows of (label, action, arg) buttons, or None for no buttons. An argument too long for
+    Telegram's 64-byte callback_data is replaced by a short key, and the text kept in state/callback_args.json."""
+    table = callback_table()
+    before = dict(table)
+    markup = buttons.markup(rows, table)
+    if table != before:
+        try:
+            write_atomic(CALLBACK_ARGS_FILE, json.dumps(buttons.remembered(table)))
+        except OSError as exc:  # a button that cannot be remembered is better than no message
+            log.warning("Could not write %s: %s", CALLBACK_ARGS_FILE.name, exc)
+    return markup
+
+
+def send_message_id(raw, formatted=True, rows=None):
+    """sendMessage (HTML first when `formatted`, plain text if Telegram returns 400), with inline buttons when `rows`
+    (rows of (label, action, arg)) is given.
 
     Returns the new message's id (0 if Telegram answered without one), or None
     when nothing was sent. The id is what editMessageText and reactions refer to.
@@ -1001,7 +1104,10 @@ def send_message_id(raw, formatted=True):
     raw = clip_for_telegram(redact_secrets(raw))  # a worker that prints a key must not forward it to a phone
     variants = [({"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"}, True)] if formatted else []
     variants.append(({"chat_id": chat_id, "text": raw}, False))
+    markup = keyboard(rows) if rows else None
     for params, is_html in variants:
+        if markup:
+            params["reply_markup"] = markup
         data = urllib.parse.urlencode(params).encode()
         try:
             with urllib.request.urlopen(telegram_url("sendMessage"), data, timeout=30) as reply:
@@ -1023,9 +1129,9 @@ def send_message_id(raw, formatted=True):
     return None
 
 
-def post_message(raw):
+def post_message(raw, rows=None):
     """sendMessage as HTML, or as plain text when Telegram returns 400. True once it was sent."""
-    return send_message_id(raw) is not None
+    return send_message_id(raw, rows=rows) is not None
 
 
 def edit_message(message_id, raw):
@@ -1241,7 +1347,7 @@ def fit_preview(prefix, text, suffix):
         size = int(size * 0.8)
 
 
-def send_report(title, text, files=(), task_id="report", root=None):
+def send_report(title, text, files=(), task_id="report", root=None, rows=None):
     """Tell the user something. A long `text` becomes a preview plus `<task_id>.md`; `files` follow as documents.
 
     A file Telegram did not accept is named in a follow-up as "not delivered: <path>" (relative to `root` when given).
@@ -1254,11 +1360,11 @@ def send_report(title, text, files=(), task_id="report", root=None):
     body = f"{title}\n\n{text}" if title and text else title or text
     attachments = []
     if fits_in_message(body):
-        post_message(body)
+        post_message(body, rows)
     else:
         name = f"{task_id}.md"
         prefix = f"{title}\n\n" if title else ""
-        post_message(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"))
+        post_message(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"), rows)
         attachments.append((f"the full report ({name})", name, redact_secrets(text).encode()))
     root = Path(root).resolve() if root else None
     attachments += [(str(path.relative_to(root)) if root and path.is_relative_to(root) else path.name, path.name, path)
@@ -1268,8 +1374,8 @@ def send_report(title, text, files=(), task_id="report", root=None):
             post_message(f"⚠️ Couldn't attach {label}: Telegram refused the upload.\nnot delivered: {label}")
 
 
-def send_telegram(text):
-    send_report("", text)
+def send_telegram(text, rows=None):
+    send_report("", text, rows=rows)
 
 
 # ---------------------------------------------------------------- limits, login, once-only reports
@@ -1353,6 +1459,13 @@ def read_pause():
     return Pause(until, lines[1].strip() if len(lines) > 1 else "paused")
 
 
+RESUME_ROWS = [[("Resume", "resume", "")]]
+
+
+def retry_rows(stem):
+    return [[("Retry", "retry", stem), ("Open", "open", stem)]]
+
+
 def pause_queue(until, reason, notify=True):
     """Stop the queue until `until`, saying so once. No-op if it is already paused at least that long."""
     current = read_pause()
@@ -1361,7 +1474,7 @@ def pause_queue(until, reason, notify=True):
     write_atomic(PAUSED_FILE, f"{until.astimezone(timezone.utc).strftime(ISO_FMT)}\n{reason}\n")
     log.warning("Queue paused until %s (%s)", format_when(until), reason)
     if notify:
-        send_telegram(f"⏸ Queue paused until {format_when(until)} ({reason}). It resumes by itself.")
+        send_telegram(f"⏸ Queue paused until {format_when(until)} ({reason}). It resumes by itself.", RESUME_ROWS)
 
 
 def current_stop():
@@ -1391,6 +1504,7 @@ def mark_auth_failed(message, notify=True):
             "again: run `claude` and sign in, or `claude setup-token`",
             AUTH_NOTICE,
             level=logging.ERROR,
+            rows=RESUME_ROWS,
         )
 
 
@@ -1402,6 +1516,7 @@ def login_works():
         return False
     cwd = Path(cfg("DEFAULT_CWD") or BASE / "workspace")
     cwd.mkdir(parents=True, exist_ok=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
     cmd = [claude_bin, "-p", "--model", cfg("PROBE_MODEL", "claude-haiku-4-5-20251001"),
            "--output-format", "json"]
     try:
@@ -1431,6 +1546,7 @@ def queue_is_stopped():
         send_telegram(f"▶️ Queue resumed (it was paused: {pause.reason}).")
     if AUTH_FAILED_FILE.exists():
         if not login_works():
+            report_once("auth", "", "Claude login is still expired", AUTH_NOTICE, level=logging.ERROR, rows=RESUME_ROWS)
             return True
         AUTH_FAILED_FILE.unlink(missing_ok=True)
         clear_reported("auth")
@@ -1453,15 +1569,53 @@ def load_seen():
     return data if isinstance(data, dict) else {}
 
 
-def report_once(key, signature, log_text, telegram_text, level=logging.WARNING):
-    """Log and send a problem unless this exact problem was already reported. True if it was said."""
-    seen = load_seen()
+def load_seen_at():
+    try:
+        data = json.loads(SEEN_AT_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def elapsed_text(seconds):
+    days = int(seconds // 86400)
+    if days >= 1:
+        return f"{days} day{'s' if days != 1 else ''}"
+    hours = max(1, int(seconds // 3600))
+    return f"{hours} hour{'s' if hours != 1 else ''}"
+
+
+REMIND_AFTER_S = 86400  # a problem that is still true after this long is said once more
+
+
+def report_once(key, signature, log_text, telegram_text, level=logging.WARNING, rows=None):
+    """Log and send a problem unless this exact problem was already reported. True if it was said.
+
+    `rows` are inline buttons for the obvious next step. A problem that is still true a day after it was first said is
+    sent once more, with the time that has passed; after that it stays quiet until it clears.
+    """
+    seen, seen_at = load_seen(), load_seen_at()
+    now = datetime.now(timezone.utc)
     if seen.get(key) == signature:
-        return False
+        entry = seen_at.get(key)
+        try:
+            first = datetime.strptime(entry["first"], ISO_FMT).replace(tzinfo=timezone.utc)
+        except (TypeError, KeyError, ValueError):
+            return False  # said before this bookkeeping existed: leave it quiet
+        age = (now - first).total_seconds()
+        if entry.get("resent") or age < REMIND_AFTER_S:
+            return False
+        seen_at[key] = {**entry, "resent": True}
+        write_atomic(SEEN_AT_FILE, json.dumps(seen_at))
+        log.log(level, "%s (still true after %s)", log_text, elapsed_text(age))
+        send_telegram(f"⏳ Still true after {elapsed_text(age)}:\n{telegram_text}", rows)
+        return True
     seen[key] = signature
+    seen_at[key] = {"first": now.strftime(ISO_FMT), "resent": False}
     write_atomic(SEEN_FILE, json.dumps(seen, indent=1))
+    write_atomic(SEEN_AT_FILE, json.dumps(seen_at))
     log.log(level, "%s", log_text)
-    send_telegram(telegram_text)
+    send_telegram(telegram_text, rows)
     return True
 
 
@@ -1471,6 +1625,10 @@ def clear_reported(key):
     if key in seen:
         del seen[key]
         write_atomic(SEEN_FILE, json.dumps(seen, indent=1))
+    seen_at = load_seen_at()
+    if key in seen_at:
+        del seen_at[key]
+        write_atomic(SEEN_AT_FILE, json.dumps(seen_at))
 
 
 def prune_seen():
@@ -1478,6 +1636,80 @@ def prune_seen():
     kept = {k: v for k, v in seen.items() if "|" not in k or (BASE / k.split("|", 1)[1]).exists()}
     if kept != seen:
         write_atomic(SEEN_FILE, json.dumps(kept, indent=1))
+        seen_at = load_seen_at()
+        write_atomic(SEEN_AT_FILE, json.dumps({k: v for k, v in seen_at.items() if k in kept}))
+
+
+def number(text, default=0.0):
+    """A numeric setting's text as a float; the default when it is empty or not a number."""
+    try:
+        return float(text or default)
+    except ValueError:
+        return default
+
+
+def alert_today(key, text):
+    """Send `text` unless this condition was already sent today (local day). True when it was sent."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    with filelock.FileLock(f"{ALERTS_FILE}.lock"):
+        try:
+            state = json.loads(ALERTS_FILE.read_text())
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        state = state if isinstance(state, dict) else {}
+        if alerts.sent_today(state, key, today):
+            return False
+        write_atomic(ALERTS_FILE, json.dumps(alerts.mark_sent(state, key, today)))
+    log.warning("%s", text.splitlines()[0])
+    send_telegram(text)
+    return True
+
+
+def spent_today():
+    """(dollars, billed tokens) over today's calls, local time, from logs/usage.jsonl."""
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).astimezone()
+    today = [(record, cost) for when, record, cost in usage_costs(usage_records()) if when >= midnight]
+    return sum(cost for _, cost in today), sum(accounting.tokens_of(record.get("usage")) for record, _ in today)
+
+
+def watch_usage(record):
+    """After a claude call: say so when its context is over the warn line, or today's spend is over a budget.
+
+    Each setting is off at 0. A condition is sent once a day, and says what to do about it.
+    """
+    pct, label = record.get("context_pct"), record.get("label")
+    warn = number(cfg("CONTEXT_WARN_PCT"))
+    if warn > 0 and pct is not None and pct >= warn:
+        tokens = f"{record.get('context_tokens') or 0:,}"
+        if label == "worker" and record.get("task"):
+            alert_today(
+                f"context|worker|{record['task']}",
+                f"⚠️ Task {record['task']} used {pct:.0f}% of its context window ({tokens} tokens). "
+                "A task that fills its window is too big for one run: split it into smaller tasks.",
+            )
+        elif label == "coordinator":
+            rotate = number(cfg("CONTEXT_ROTATE_PCT"))
+            alert_today(
+                "context|coordinator",
+                f"⚠️ The coordinator's context is {pct:.0f}% full ({tokens} tokens). "
+                + (f"It starts a fresh session at {rotate:.0f}%." if rotate > 0 else "Send /new to start a fresh one."),
+            )
+    cost_budget, token_budget = number(cfg("DAILY_COST_BUDGET_USD")), number(cfg("DAILY_TOKEN_BUDGET"))
+    if cost_budget <= 0 and token_budget <= 0:
+        return
+    dollars, tokens = spent_today()
+    if 0 < cost_budget <= dollars:
+        alert_today(
+            "budget|cost",
+            f"💸 Today's spend is ${dollars:.2f}, over your ${cost_budget:.2f} budget (DAILY_COST_BUDGET_USD). "
+            "Tasks keep running; pause the queue if you want it to stop, or raise the budget in .env.",
+        )
+    if 0 < token_budget <= tokens:
+        alert_today(
+            "budget|tokens",
+            f"💸 Today's calls have used {tokens:,} tokens, over your {token_budget:,.0f} budget (DAILY_TOKEN_BUDGET). "
+            "Tasks keep running; pause the queue if you want it to stop, or raise the budget in .env.",
+        )
 
 
 def usage_records():
@@ -1518,44 +1750,71 @@ def daily_cap_reached():
     return True
 
 
-def usage_report():
-    """Print claude calls, errors, cost, turns and web searches by day and model."""
-    records = usage_records()
+USAGE_GROUPS = ("day", "label", "model", "agent")
+
+
+def usage_costs(records):
+    """usage_records() with the cost of each row filled in: [(local datetime, record, cost_usd)]."""
+    costs = accounting.fill_costs([record for _, record in records])
+    return [(when, record, cost) for (when, record), cost in zip(records, costs)]
+
+
+def usage_report(by=None):
+    """Print claude calls, errors, cost, turns and web searches: by day and model, or by one of USAGE_GROUPS.
+
+    The cost is `cost_usd` (what each call added to its session), never the running total_cost_usd. The
+    grouped tables also show `tokens`, the billed input, cache-write and output tokens that DAILY_TOKEN_BUDGET counts.
+    """
+    records = usage_costs(usage_records())
     if not records:
         print("No usage recorded yet.")
         return 0
     rows = {}
 
-    def row(day, model):
-        return rows.setdefault((day, model), {"calls": 0, "errors": 0, "cost": 0.0, "turns": 0, "searches": 0})
+    def row(*key):
+        return rows.setdefault(key, {"calls": 0, "errors": 0, "cost": 0.0, "tokens": 0, "turns": 0, "searches": 0})
 
-    for when, record in records:
+    for when, record, cost in records:
         day = when.strftime("%Y-%m-%d")
-        entry = row(day, record.get("model") or "unknown")
+        if by is None:
+            entry = row(day, record.get("model") or "unknown")
+        else:
+            group = {"day": day, "label": record.get("label"), "model": record.get("model"),
+                     "agent": record.get("agent")}[by]
+            entry = row(group or ("(none)" if by == "agent" else "unknown"))
         entry["calls"] += 1
         entry["errors"] += bool(record.get("is_error")) or record.get("exit") not in (0, None)
         entry["turns"] += record.get("num_turns") or 0
+        entry["tokens"] += accounting.tokens_of(record.get("usage"))
         by_model = record.get("modelUsage") or {}
-        if by_model:  # one call can spend on several models (a search sub-agent, say)
+        if by is None and by_model:  # one call can spend on several models (a search sub-agent, say)
+            billed = sum(spent.get("costUSD") or 0 for spent in by_model.values())
             for name, spent in by_model.items():
                 part = row(day, name)
-                part["cost"] += spent.get("costUSD") or 0
+                share = (spent.get("costUSD") or 0) / billed if billed else 0
+                part["cost"] += cost * share
                 part["searches"] += spent.get("webSearchRequests") or 0
         else:
-            entry["cost"] += record.get("total_cost_usd") or 0
+            entry["cost"] += cost
+            entry["searches"] += sum(spent.get("webSearchRequests") or 0 for spent in by_model.values())
 
-    def show(day, model, entry):
-        print(f"{day:<10}  {model:<34}  {entry['calls']:>5}  {entry['errors']:>6}  "
-              f"{entry['cost']:>9.4f}  {entry['turns']:>5}  {entry['searches']:>12}")
+    names = ("day", "model") if by is None else (by,)
+    head = [f"{n:<{34 if n == 'model' else 10}}" for n in names]
+    columns = ["calls", "errors", "cost_usd"] + ([] if by is None else ["tokens"]) + ["turns", "web_searches"]
+    widths = {"calls": 5, "errors": 6, "cost_usd": 9, "tokens": 10, "turns": 5, "web_searches": 12}
 
-    print(f"{'day':<10}  {'model':<34}  {'calls':>5}  {'errors':>6}  "
-          f"{'cost_usd':>9}  {'turns':>5}  {'web_searches':>12}")
-    total = {"calls": 0, "errors": 0, "cost": 0.0, "turns": 0, "searches": 0}
-    for (day, model), entry in sorted(rows.items()):
-        show(day, model, entry)
-        for key in total:
-            total[key] += entry[key]
-    show("total", "all", total)
+    def show(label, entry):
+        cells = {"calls": entry["calls"], "errors": entry["errors"], "cost_usd": f"{entry['cost']:.4f}",
+                 "tokens": entry["tokens"], "turns": entry["turns"], "web_searches": entry["searches"]}
+        print("  ".join(label) + "  " + "  ".join(f"{cells[c]:>{widths[c]}}" for c in columns))
+
+    print("  ".join(head) + "  " + "  ".join(f"{c:>{widths[c]}}" for c in columns))
+    total = {"calls": 0, "errors": 0, "cost": 0.0, "tokens": 0, "turns": 0, "searches": 0}
+    for key, entry in sorted(rows.items()):
+        show([f"{k:<{34 if n == 'model' else 10}}" for k, n in zip(key, names)], entry)
+        for field in total:
+            total[field] += entry[field]
+    show([f"{'total':<10}", f"{'all':<34}"][:len(names)] if by is None else [f"{'total':<10}"], total)
     return 0
 
 
@@ -1596,6 +1855,41 @@ def is_due(spec, last_run, now):
     raise ValueError(f"unrecognized schedule {spec!r}")
 
 
+INSTANCE_STAMP = re.compile(r"-(\d{8}-\d{6})$")
+
+
+def last_finished_instance(stem):
+    """(when, "pass" or "failed") of the newest finished run of a recurring template, read from the instance file names."""
+    found = []
+    for directory, verdict in ((DONE, "pass"), (FAILED, "failed")):
+        for path in directory.glob(f"{stem}-[0-9]*.md"):
+            if match := INSTANCE_STAMP.search(path.stem):
+                try:
+                    found.append((datetime.strptime(match.group(1), "%Y%m%d-%H%M%S"), verdict))
+                except ValueError:
+                    continue
+    return max(found, default=(None, None))
+
+
+def note_missed_run(template, meta, last_run, now):
+    """Say, once, that a recurring template has not run within two of its periods; forget it when it runs again."""
+    key = f"missed|tasks/recurring/{template.name}"
+    period = alerts.schedule_period(meta.get("schedule"))
+    finished, result = last_finished_instance(template.stem)
+    since = finished or last_run
+    if period is None or since is None or (now - since).total_seconds() <= 2 * period:
+        clear_reported(key)
+        return
+    when = since.strftime("%A" if (now - since) < timedelta(days=6) else "%b %d")
+    report_once(
+        key, since.isoformat(),
+        f"Recurring {template.name} has not run since {since:%Y-%m-%d %H:%M}",
+        f"⏰ {template.stem} has not run since {when}; last result: {result or 'none yet'}. "
+        "An earlier run may be stuck in the queue. This is the only message about it.",
+        rows=[[("Open", "open", template.stem)]],
+    )
+
+
 def spawn_recurring():
     """Stamp out a one-shot pending instance for each due recurring template."""
     now = datetime.now()
@@ -1623,6 +1917,7 @@ def spawn_recurring():
         due = is_due(meta["schedule"], last_run, now)
         clear_reported(schedule_key)
         if not due:
+            note_missed_run(template, meta, last_run, now)
             continue
         # Don't pile up instances while an earlier one is still queued or running;
         # last_run stays untouched so the template fires once the queue clears.
@@ -1632,6 +1927,7 @@ def spawn_recurring():
         if existing:
             log.info("Recurring %s is due but an instance is still queued (%s); deferring",
                      template.name, existing[0].name)
+            note_missed_run(template, meta, last_run, now)
             continue
         instance_meta = {k: v for k, v in meta.items() if k not in ("schedule", "last_run")}
         instance_meta["attempts"] = "0"
@@ -1641,6 +1937,7 @@ def spawn_recurring():
         write_task(template, meta, body)
         log.info("Recurring %s (schedule: %s) spawned instance %s",
                  template.name, meta["schedule"], instance_name)
+        clear_reported(f"missed|tasks/recurring/{template.name}")  # it is running now
 
 
 # ---------------------------------------------------------------- queue flow
@@ -1840,7 +2137,7 @@ def cascade_dependency_failure(path, failed_dep):
     log.error("Task %s cascaded to failed/: its dependency %s failed permanently", path.name, failed_dep)
     send_report(
         f"❌ Task not run: {path.name}\nIts dependency '{failed_dep}' failed permanently.", "",
-        task_id=path.stem,
+        task_id=path.stem, rows=[[("Retry", "retry", failed_dep), ("Open", "open", path.stem)]],
     )
 
 
@@ -1945,7 +2242,8 @@ def announce_proposals():
             digest, entry = spec_digest(meta, body), read_ledger(path.stem)
             if entry and entry.get("status") == "awaiting" and entry.get("message_id") and entry.get("digest") == digest:
                 continue
-            message_id = send_message_id(approval_text(path.stem, meta, body), formatted=False)
+            message_id = send_message_id(approval_text(path.stem, meta, body), formatted=False,
+                                         rows=[[("Approve", "approve", path.stem), ("Reject", "reject", path.stem)]])
             if not message_id:
                 continue  # not sent: try again next time
             write_ledger(path.stem, {"task": path.stem, "tier": tier_of(meta), "digest": digest,
@@ -2050,6 +2348,176 @@ def apply_reaction(message_id, emoji):
         else:
             return None
         return ("✅ " if ok else "⚠️ ") + message
+    return None
+
+
+# ------------------------------------------------ answers that need no model
+#
+# What /status, /usage and the menu buttons say. Everything here reads the queue's own files, so
+# none of it calls claude.
+
+DEFAULT_ASSISTANT_NAME = "taskq"
+MENU_PAUSE_HOURS = 12
+STATE_DIRS = (("pending", PENDING), ("proposed", PROPOSED), ("active", ACTIVE), ("done", DONE), ("failed", FAILED),
+              ("cancelled", CANCELLED), ("recurring", RECURRING))
+
+
+def assistant_name():
+    """ASSISTANT_NAME from .env, read fresh so a new name shows without a restart; taskq when unset or not a plain name."""
+    return naming.clean(load_env(BASE / ".env").get("ASSISTANT_NAME")) or DEFAULT_ASSISTANT_NAME
+
+
+def set_env_value(key, value):
+    """Set `key` in .env (replace its line, or add one), keeping the file private. Only for a value already checked."""
+    path = BASE / ".env"
+    lines = path.read_text().splitlines() if path.exists() else []
+    line = f"{key}={value}"
+    if any(existing.startswith(f"{key}=") for existing in lines):
+        lines = [line if existing.startswith(f"{key}=") else existing for existing in lines]
+    else:
+        lines.append(line)
+    write_atomic(path, "\n".join(lines) + "\n")
+    os.chmod(path, 0o600)
+
+
+def find_state(stem):
+    """(state name, path) of the task or recurring template called `stem`, or (None, None)."""
+    for label, directory in STATE_DIRS:
+        if (directory / f"{stem}.md").is_file():
+            return label, directory / f"{stem}.md"
+    return None, None
+
+
+def task_status(stem):
+    """One task's state, tier, attempts and, when it has one, its outcome; for /status <id> and the Open button."""
+    stem = clean_stem(stem)
+    label, path = find_state(stem) if stem and "/" not in stem else (None, None)
+    if path is None:
+        return False, f"No task named '{stem}'."
+    meta, body = parse_task(path)
+    meta = meta or {}
+    tier = meta.get("tier") or str(tier_of(meta)) if meta.get("model") else "?"
+    lines = [f"{stem}: {label}", f"tier {tier} ({TIER_LABELS.get(int(tier), '?') if tier.isdigit() else '?'}), "
+             f"attempts {meta.get('attempts', '0')}/{meta.get('max_attempts', '?')}"]
+    if meta.get("schedule"):
+        lines.append(f"runs {meta['schedule']}; last run {meta.get('last_run', 'never')}")
+        finished, result = last_finished_instance(stem)
+        lines.append(f"last result: {result} ({finished:%Y-%m-%d %H:%M})" if finished else "last result: none yet")
+    if meta.get("pr_url"):
+        lines.append(f"PR: {meta['pr_url']}")
+    for marker, text in (("pending_publish", "finished and checked; waiting to publish"), ("held_until", f"held until {meta.get('held_until')}")):
+        if meta.get(marker):
+            lines.append(text)
+    outcomes = list(re.finditer(r"^## (Result \(.*?\)|Attempt \d+ Feedback.*?|Dependency Failed.*?|Invalid Task.*?|Cancelled.*?|Publish failed.*?)$\s*(.*?)(?=^## |\Z)",
+                                body, re.M | re.S))
+    if outcomes:
+        last = outcomes[-1]
+        lines.append(f"{last.group(1).split(' (')[0].lower()}: {short(' '.join(last.group(2).split()), 600)}")
+    return True, "\n".join(lines)
+
+
+def usage_summary():
+    """Today's and this week's calls, tokens and dollars from logs/usage.jsonl."""
+    rows = usage_costs(usage_records())
+    if not rows:
+        return "No usage recorded yet."
+    now = datetime.now().astimezone()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def total(since):
+        chosen = [(record, cost) for when, record, cost in rows if when >= since]
+        return (len(chosen), sum(cost for _, cost in chosen),
+                sum(accounting.tokens_of(record.get("usage")) for record, _ in chosen))
+
+    lines = [f"{assistant_name()} usage"]
+    for label, since in (("Today", midnight), ("Last 7 days", midnight - timedelta(days=6))):
+        calls, dollars, tokens = total(since)
+        lines.append(f"{label}: ${dollars:.2f}, {calls} calls, {tokens:,} tokens")
+    budget = number(cfg("DAILY_COST_BUDGET_USD"))
+    if budget > 0:
+        lines.append(f"Daily cost budget: ${budget:.2f}")
+    today = {}
+    for when, record, cost in rows:
+        if when >= midnight:
+            key = record.get("task") or record.get("label") or "other"
+            today[key] = today.get(key, 0.0) + cost
+    top = sorted(today.items(), key=lambda item: -item[1])[:3]
+    if top:
+        lines.append("Most today: " + ", ".join(f"{name} ${cost:.2f}" for name, cost in top))
+    return "\n".join(lines)
+
+
+def average_run_cost(prefix):
+    """(average dollars per run, runs) over the tasks whose id starts with `prefix`, or None before the first."""
+    per_task = {}
+    for _, record, cost in usage_costs(usage_records()):
+        task = record.get("task") or ""
+        if task.startswith(prefix):
+            per_task[task] = per_task.get(task, 0.0) + cost
+    return (sum(per_task.values()) / len(per_task), len(per_task)) if per_task else None
+
+
+def recent_done(limit=8):
+    """The stems of the last `limit` finished tasks, newest first."""
+    done = sorted(DONE.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p.stem for p in done[:limit]]
+
+
+def queue_confirmed(stem, meta, body):
+    """Queue a task the person just confirmed with a button. The tap is the approval of this exact spec, so the
+    approval gate does not hold it again. Returns (ok, message)."""
+    problems = validate_task(meta, body)
+    if problems:
+        return False, f"{stem} is invalid: " + "; ".join(problems)
+    if (existing := find_task(stem)) is not None:
+        return False, f"{stem} is already in tasks/{existing.parent.name}/."
+    temporary = TASKS / f".confirm-{os.getpid()}-{stem}.md"
+    PENDING.mkdir(parents=True, exist_ok=True)
+    write_task(temporary, meta, body)
+    try:
+        with ledger_lock():
+            if needs_approval(Path(f"{stem}.md"), meta, body):
+                write_ledger(stem, {"task": stem, "tier": tier_of(meta), "digest": spec_digest(meta, body),
+                                    "status": "approved", "message_id": None, "at": now_iso()})
+            try:
+                os.link(temporary, PENDING / f"{stem}.md")
+            except FileExistsError:
+                return False, f"{stem} is already queued."
+    finally:
+        temporary.unlink(missing_ok=True)
+    log.info("Queued %s from a confirmed button", stem)
+    return True, f"Queued {stem}."
+
+
+def enqueue_example(example, stem, replacements=None):
+    """Queue a one-off copy of tasks/examples/<example> under the name `stem`, with its placeholders filled in. A
+    recurring template's schedule is dropped: this runs once, now. Returns (ok, message)."""
+    source = BASE / "tasks" / "examples" / example
+    if not source.is_file():
+        return False, f"{example} is not in tasks/examples/."
+    text = source.read_text().replace("__QUEUE_DIR__", str(BASE))
+    for placeholder, value in (replacements or {}).items():
+        text = text.replace(placeholder, value)
+    probe = TASKS / f".example-{os.getpid()}.md"
+    probe.write_text(text)
+    try:
+        meta, body = parse_task(probe)
+    finally:
+        probe.unlink(missing_ok=True)
+    if meta is None:
+        return False, f"{example} has no frontmatter."
+    for key in ("schedule", "last_run"):
+        meta.pop(key, None)
+    meta["attempts"] = "0"
+    return queue_confirmed(stem, meta, body)
+
+
+def queued_like(prefix, needle=""):
+    """A queued or running task whose id starts with `prefix` (and whose text holds `needle`), or None."""
+    for directory in (PENDING, ACTIVE, PROPOSED):
+        for path in sorted(directory.glob(f"{prefix}*.md")):
+            if not needle or needle in path.read_text():
+                return path
     return None
 
 
@@ -2446,6 +2914,7 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
             "needs Contents and Pull requests set to read and write on that one repository. Nothing is lost: the "
             "work is kept and publishes by itself on the next run once the token works. This is the only message "
             "about it.",
+            rows=[[("Retry", "retry", stem), ("Cancel", "cancel", stem)]],
         )
     elif status == "held":
         meta["pending_publish"] = "1"
@@ -2457,6 +2926,7 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
             f"Task {stem}: {detail} draft PRs are open (MAX_OPEN_PRS); result held",
             f"⏸ Draft PR for {path.name} is held: {detail} task pull requests are already open "
             f"(MAX_OPEN_PRS={cfg('MAX_OPEN_PRS', '3')}). The work is done and checked; it is published as soon as you merge or close one.",
+            rows=[[("Retry", "retry", stem), ("Cancel", "cancel", stem)]],
         )
     else:
         failures = int(meta.get("publish_failures") or 0) + 1
@@ -2473,7 +2943,7 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
         write_task(path, meta, body)
         shutil.move(str(path), str(FAILED / path.name))
         send_report(f"❌ Task could not open a pull request: {path.name}\nThe work passed verification and review and is kept in {worktree_path(stem)}. Last error:",
-                    detail, task_id=stem)
+                    detail, task_id=stem, rows=retry_rows(stem))
 
 
 # ---------------------------------------------------------------- proposals
@@ -2726,7 +3196,7 @@ def handle_failure(path, meta, body, attempts, max_attempts, feedback):
         log.error("Task %s FAILED permanently after %d/%d attempts", path.name, attempts, max_attempts)
         send_report(
             f"❌ Task failed: {path.name}\nExhausted {max_attempts} attempts. Last feedback:", feedback,
-            task_id=path.stem,
+            task_id=path.stem, rows=retry_rows(path.stem),
         )
     else:
         shutil.move(str(path), str(PENDING / path.name))
@@ -2740,6 +3210,63 @@ def parse_verdict(review_out):
         return "FAIL", "Reviewer output had no parseable verdict:\n" + tail(review_out)
     feedback = re.sub(r".*?VERDICT:\s*(PASS|FAIL)[^\n]*\n?", "", review_out, count=1, flags=re.S)
     return match.group(1).upper(), feedback.strip() or "(no feedback given)"
+
+
+def models_table():
+    try:
+        return models.load(MODELS_FILE)
+    except ValueError as exc:  # a table somebody broke must not stop the queue: say so and use the built-in one
+        report_once("models-table|models.json", str(exc), f"Ignoring {exc}",
+                    f"⚠️ models.json is wrong, so the built-in model table is used until it is fixed: {exc}")
+        return models.DEFAULT_TABLE
+
+
+def unsupported_models():
+    """Models the account refused within MODEL_RETRY_HOURS."""
+    try:
+        data = json.loads(UNSUPPORTED_MODELS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=MODEL_RETRY_HOURS)
+    fresh = {}
+    for model, when in (data.items() if isinstance(data, dict) else ()):
+        try:
+            if datetime.strptime(when, ISO_FMT).replace(tzinfo=timezone.utc) > cutoff:
+                fresh[model] = when
+        except (TypeError, ValueError):
+            continue
+    return fresh
+
+
+def mark_unsupported(model):
+    with filelock.FileLock(f"{UNSUPPORTED_MODELS_FILE}.lock"):
+        write_atomic(UNSUPPORTED_MODELS_FILE, json.dumps({**unsupported_models(), model: now_iso()}))
+
+
+def resolve_model(wanted, role, value_class=None):
+    """The model to call for a role: the one asked for, or the next in models.json's chain when the account cannot use
+    it. "auto" takes the chain's first. None when nothing in the chain is usable."""
+    return models.resolve(models_table(), role, value_class, wanted, unsupported_models())
+
+
+def model_gone(model, role, value_class=None):
+    """Handle an 'unsupported model' answer: remember it, say so once, and return the model that replaces it (or None)."""
+    mark_unsupported(model)
+    replacement = resolve_model(model, role, value_class)
+    report_once(
+        f"model|{model}", model,
+        f"Model {model} is not available on this account; using {replacement or 'nothing'} instead",
+        f"🧩 The model {model} isn't available on this account. " + (
+            f"I switched {role} calls to {replacement}; no attempt was used and nothing was lost. This is the only message about it."
+            if replacement else
+            f"No other model in models.json can do {role} work, so the queue waits. Fix models.json or your plan."),
+    )
+    return replacement
+
+
+def no_usable_model(role):
+    until = datetime.now(timezone.utc) + timedelta(hours=1)
+    pause_queue(until, f"no usable model for {role} work", notify=False)
 
 
 def escalation_model(meta):
@@ -2915,14 +3442,19 @@ def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials,
     log.info("Task %s PASSED%s on attempt %d/%d; moved to done/", name,
              " verification (review skipped)" if skipped else " review", attempts, max_attempts)
     lines = [f"✅ Task done: {name} (attempt {attempts}/{max_attempts})"]
+    files, notes = collect_deliverables(meta, cwd)
+    empty = not worker_out.strip() and not files and not verified and not pr_url
+    if empty:
+        lines.append("ℹ️ It produced nothing: the report was empty and no files came with it.")
     if verified:
         lines.append(f"Verified by `{verified.command}` (exit 0)" + ("; review skipped" if skipped else ""))
     if notice := denial_notice(denials):
         lines.append(notice)
     if pr_url:
         lines.append(f"🔀 Draft PR ready: {pr_url}")
-    files, notes = collect_deliverables(meta, cwd)
-    if meta.get("quiet") != "true" or pr_url:  # quiet tasks (the weekly improver) report only failures, and PR links
+    if empty and meta.get("quiet") == "true":  # a quiet pass stays hidden, but a pass that did nothing says so in one line
+        send_telegram(f"ℹ️ {name} ran but produced nothing: the report was empty and no files came with it.")
+    elif meta.get("quiet") != "true" or pr_url:  # quiet tasks (the weekly improver) report only failures, and PR links
         send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem, root=cwd)
     if notes:
         send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
@@ -2961,7 +3493,7 @@ def run_task(path, status=None):
         body = body.rstrip("\n") + f"\n\n## Invalid Task ({now_iso()})\n\n{detail}\n"
         write_task(path, meta or {}, body)
         shutil.move(str(path), str(FAILED / name))
-        send_report(f"❌ Task rejected as invalid: {name}", detail, task_id=path.stem)
+        send_report(f"❌ Task rejected as invalid: {name}", detail, task_id=path.stem, rows=[[("Open", "open", path.stem)]])
         return
 
     claude_bin = resolve_claude_bin()
@@ -3005,6 +3537,11 @@ def run_task(path, status=None):
                  name, attempts, max_attempts)
     else:
         model = meta["model"] if attempts == 1 else escalation_model(meta)
+        if (model := resolve_model(model, "worker", meta.get("value_class"))) is None:
+            requeue_unconsumed(path, meta, body, attempts)
+            log.warning("Task %s: no usable model for worker calls; requeued without consuming an attempt", name)
+            no_usable_model("worker")
+            return
         tools = meta.get("allowed_tools") or cfg("DEFAULT_ALLOWED_TOOLS", "Read,Glob,Grep,Edit,Write")
         log.info(
             "Task %s: attempt %d/%d, model=%s, tools=[%s], timeout=%.0f min, cwd=%s",
@@ -3016,6 +3553,8 @@ def run_task(path, status=None):
             "--allowedTools", tools,
             "--output-format", "stream-json", "--verbose",
         ]
+        if meta.get("max_turns"):
+            worker_cmd += ["--max-turns", str(int(meta["max_turns"]))]
         mcp = mcp_config_path(meta)
         if mcp is not None:
             worker_cmd += ["--mcp-config", str(mcp)]
@@ -3042,6 +3581,12 @@ def run_task(path, status=None):
             requeue_unconsumed(path, meta, body, attempts)
             log.warning("Task %s: requeued without consuming an attempt", name)
             mark_auth_failed(str(exc))
+            return
+        except UnsupportedModel as exc:
+            requeue_unconsumed(path, meta, body, attempts)
+            log.warning("Task %s: model %s is not supported; requeued without consuming an attempt", name, exc.args[0])
+            if model_gone(exc.args[0], "worker", meta.get("value_class")) is None:
+                no_usable_model("worker")
             return
         except CallTimeout:
             handle_failure(
@@ -3074,7 +3619,7 @@ def run_task(path, status=None):
             meta.pop("review_failures", None)
             handle_failure(path, meta, body, attempts, max_attempts, verify_feedback(verified))
             return
-        if meta.get("review") == "skip":
+        if meta.get("review") == "skip" or (meta.get("review") == "skip-if-verified" and criteria_covered(body)):
             meta.pop("pending_review", None)
             meta.pop("review_failures", None)
             conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped=True)
@@ -3085,9 +3630,14 @@ def run_task(path, status=None):
         conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified)
         return
 
+    if (review_model := resolve_model(meta["review_model"], "review")) is None:
+        park_report(path, meta, body, attempts, worker_out, denials)
+        log.warning("Task %s: no usable model for review calls; worker report saved, no attempt used", name)
+        no_usable_model("review")
+        return
     review_cmd = [
         claude_bin, "-p",
-        "--model", meta["review_model"],
+        "--model", review_model,
         "--allowedTools", "Read,Glob,Grep",
         "--output-format", "json",
     ]
@@ -3106,6 +3656,12 @@ def run_task(path, status=None):
         park_report(path, meta, body, attempts, worker_out, denials)
         log.warning("Task %s: review could not run; worker report saved, no attempt used", name)
         mark_auth_failed(str(exc))
+        return
+    except UnsupportedModel as exc:
+        park_report(path, meta, body, attempts, worker_out, denials)
+        log.warning("Task %s: review model %s is not supported; worker report saved, no attempt used", name, exc.args[0])
+        if model_gone(exc.args[0], "review") is None:
+            no_usable_model("review")
         return
     except (CallTimeout, ClaudeError) as exc:
         failures = int(meta.get("review_failures") or 0) + 1
@@ -3224,15 +3780,19 @@ if __name__ == "__main__":
             ok, message = actions[sys.argv[1]](sys.argv[2])
             print(message)
             sys.exit(0 if ok else 1)
-        if sys.argv[1] == "usage" and len(sys.argv) == 2:
-            sys.exit(usage_report())
+        if sys.argv[1] == "usage" and (len(sys.argv) == 2 or sys.argv[2:3] == ["--by"] and len(sys.argv) == 4):
+            if len(sys.argv) == 4 and sys.argv[3] not in USAGE_GROUPS:
+                print(f"usage --by takes {'|'.join(USAGE_GROUPS)}", file=sys.stderr)
+                sys.exit(2)
+            sys.exit(usage_report(sys.argv[3] if len(sys.argv) == 4 else None))
         print(
             "Usage: dispatcher.py                   run one queue cycle\n"
             "       dispatcher.py cancel <task-id>  archive a queued task to tasks/cancelled/\n"
             "       dispatcher.py retry <task-id>   requeue a failed/cancelled task, attempts reset\n"
             "       dispatcher.py check <file>      validate a task or recurring template file\n"
             "       dispatcher.py enqueue <file>    validate a task file and drop it into the queue\n"
-            "       dispatcher.py usage             claude calls, cost and turns by day and model",
+            "       dispatcher.py usage [--by day|label|model|agent]\n"
+            "                                       claude calls, cost and turns by day and model (or one grouping)",
             file=sys.stderr,
         )
         sys.exit(2)

@@ -13,7 +13,9 @@ Run as a daemon (see coordinator/claude-coordinator.service.template), not from 
 
 Built-in commands (answered instantly, no API cost):
     /new               start a fresh coordinator conversation
-    /status            queue counts straight from the tasks/ directories
+    /menu              buttons: status, usage, pause/resume, learning review, skills, naming
+    /status [task-id]  queue counts, or one task's state, tier, attempts and outcome (no model)
+    /usage             today's and this week's spend from logs/usage.jsonl (no model)
     /cancel <task-id>  archive a pending task (or recurring template) to
                        tasks/cancelled/
     /retry <task-id>   requeue a failed/cancelled task with attempts reset
@@ -44,8 +46,11 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 
 import dispatcher
+from taskq_lib import buttons, memory, naming
 from dispatcher import (
     TELEGRAM_MAX,
     cfg,
@@ -189,13 +194,13 @@ def extract_session_id(stdout):
     return None
 
 
-def run_coordinator(prompt, session_id):
+def run_coordinator(prompt, session_id, model=None):
     claude_bin = resolve_claude_bin()
     if claude_bin is None:
         raise RuntimeError("no claude binary found — set CLAUDE_BIN in .env")
     cmd = [
         claude_bin, "-p",
-        "--model", cfg("COORDINATOR_MODEL", "claude-sonnet-5"),
+        "--model", model or cfg("COORDINATOR_MODEL", "claude-sonnet-5"),
         "--allowedTools", cfg("COORDINATOR_ALLOWED_TOOLS") or default_allowed_tools(),
         # Claude only touches files under its working directory (coordinator/) and these folders: without them
         # a write to tasks/pending/ is refused as outside the sandbox, whatever --allowedTools says.
@@ -218,41 +223,116 @@ def run_coordinator(prompt, session_id):
 def coordinator_call(text, session_id):
     """One coordinator call with usage logging, retried with backoff on a transient rate limit.
 
-    Returns (proc, status, message) as classify_call judged it. Retries used
-    up, the last result is returned for the caller to treat as a limit.
+    Returns (proc, status, message, record) as classify_call judged it, record being the usage line logged for
+    the call. Retries used up, the last result is returned for the caller to treat as a limit.
     """
-    model = cfg("COORDINATOR_MODEL", "claude-sonnet-5")
-
-    def attempt():
-        proc = run_coordinator(text, session_id)
+    def attempt(model):
+        proc = run_coordinator(text, session_id, model)
         out, err = proc.stdout or "", proc.stderr or ""
         status, message = dispatcher.classify_call(proc.returncode, out, err)
-        dispatcher.log_usage("coordinator", model, proc.returncode, status, dispatcher.parse_envelope(out))
+        record = dispatcher.log_usage("coordinator", model, proc.returncode, status, dispatcher.parse_envelope(out),
+                                      resumed_from=session_id)
         if status != "ok":
             dispatcher.log_failed_call("coordinator", proc.returncode, out, err)
-        result = (proc, status, message)
+        result = (proc, status, message, record)
         if status == "rate_limited" and dispatcher.parse_reset_time(message) is None:
             raise dispatcher.TransientLimit(message, result)
         return result
 
+    wanted = cfg("COORDINATOR_MODEL", "claude-sonnet-5")
+    for _ in range(4):  # a model the account cannot use hands over to the next one in models.json
+        model = dispatcher.resolve_model(wanted, "coordinator")
+        if model is None:
+            raise RuntimeError("no usable model for the coordinator in models.json")
+        try:
+            result = dispatcher.rate_limit_retrying("coordinator")(attempt, model)
+        except dispatcher.TransientLimit as exc:
+            return exc.payload
+        if result[1] != "model":
+            return result
+        dispatcher.model_gone(model, "coordinator")
+    return result
+
+
+ROTATE_PROMPT = (
+    "[Session rotation] This conversation is nearly out of room, so a fresh session starts with the next message. "
+    "Rewrite memory/session.md (keep it under 60 lines) with what the fresh session must not forget: decisions made, "
+    "tasks you queued or are waiting on, anything the human asked for that is not finished, and how they said they "
+    "want things done. Durable preferences also belong in memory/MEMORY.md as usual. Reply with only the word: saved"
+)
+MEMORY_NOTES = "session.md"  # the rolling notes a rotation writes; CLAUDE.md imports it
+
+
+def cap_memory():
+    """Hold coordinator/memory/ to COORDINATOR_MEMORY_MAX_KB (0 = no limit) by dropping the oldest lines of the
+    rolling notes. The curated files are never touched. Returns False when they alone are over the limit."""
+    limit = int(dispatcher.number(cfg("COORDINATOR_MEMORY_MAX_KB")) * 1024)
+    folder = COORD_DIR / "memory"
+    if limit <= 0 or not folder.is_dir():
+        return True
+    notes = folder / MEMORY_NOTES
+    others = sum(p.stat().st_size for p in folder.iterdir() if p.is_file() and p != notes)
+    if notes.is_file():
+        text = notes.read_text()
+        trimmed = memory.trim_to_fit(text, limit - others)
+        if trimmed != text:
+            dispatcher.write_atomic(notes, trimmed)
+            log.info("Trimmed %s to fit COORDINATOR_MEMORY_MAX_KB=%s", MEMORY_NOTES, cfg("COORDINATOR_MEMORY_MAX_KB"))
+    return others <= limit
+
+
+def rotation_due(state):
+    line = dispatcher.number(cfg("CONTEXT_ROTATE_PCT"))
+    pct = state.get("context_pct")
+    return bool(line > 0 and state.get("session_id") and pct is not None and pct >= line)
+
+
+def rotate_session(state):
+    """Save the session's key facts, then forget the session. Returns the one line to tell the human, or None if
+    the saving call failed (the session is kept, and nothing is retried until the next call reads its context again).
+
+    Raises CoordinatorBlocked when a usage limit or an expired login stopped the saving call."""
+    pct = state.get("context_pct")
+    state["context_pct"] = None  # whatever happens, this crossing is dealt with once
     try:
-        return dispatcher.rate_limit_retrying("coordinator")(attempt)
-    except dispatcher.TransientLimit as exc:
-        return exc.payload
+        proc, status, message, _ = coordinator_call(ROTATE_PROMPT, state["session_id"])
+    except (subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
+        log.warning("Session rotation: the saving call failed (%s); keeping the session", type(exc).__name__)
+        return None
+    if status == "auth":
+        dispatcher.mark_auth_failed(message, notify=False)
+        raise CoordinatorBlocked("auth")
+    if status == "rate_limited":
+        dispatcher.pause_queue(dispatcher.usage_limit_until(message), "usage limit", notify=False)
+        raise CoordinatorBlocked("paused")
+    if proc.returncode != 0:
+        log.warning("Session rotation: the saving call exited %d; keeping the session", proc.returncode)
+        return None
+    state["session_id"] = None
+    fits = cap_memory()
+    log.info("Rotated the coordinator session (context was %.0f%%)", pct)
+    return (f"Started a fresh session (context was {pct:.0f}%)."
+            + ("" if fits else " The memory folder is over its limit; trim coordinator/memory/."))
 
 
 def ask_coordinator(text, state):
-    """Run the coordinator, handling resume failure and rate limits. Returns the reply.
+    """Run the coordinator, handling resume failure, rate limits and session rotation. Returns the reply.
 
     Raises CoordinatorBlocked, after writing the shared pause or auth-failed
     file, when a usage limit or an expired login means nothing can run: the
     caller keeps the message instead of losing it.
     """
+    note = rotate_session(state) if rotation_due(state) else None
+    reply = ask_in_session(text, state)
+    return f"{note}\n\n{reply}" if note else reply
+
+
+def ask_in_session(text, state):
     session_id = state.get("session_id")
     tried_fresh = False
     while True:
         try:
-            proc, status, message = coordinator_call(text, session_id)
+            proc, status, message, record = coordinator_call(text, session_id)
         except subprocess.TimeoutExpired:
             log.error("Coordinator call timed out")
             return "⚠️ The coordinator timed out. Try again, or /new for a fresh session."
@@ -270,6 +350,7 @@ def ask_coordinator(text, state):
             sid = extract_session_id(out)
             if sid:
                 state["session_id"] = sid
+            state["context_pct"] = record.get("context_pct")
             return extract_result(out).strip() or "(the coordinator sent an empty reply)"
         combined = f"{out}\n{err}"
         if session_id and not tried_fresh and re.search(r"session|conversation", combined, re.I):
@@ -401,6 +482,286 @@ def handle_reaction(reaction, state):
     converse(prompt, state)
 
 
+# ---------------------------------------------------------------- the menu and its buttons
+#
+# A tap arrives as a callback_query. It passes the same sender check as a message, is always answered (so the button
+# stops spinning), and runs code that reads or writes the queue's files: no tap calls a model, except the naming
+# exchange, which is a conversation by design. callback_data is `act:<action>[:<arg>]`, at most 64 bytes.
+
+
+class Reply(NamedTuple):
+    text: str
+    rows: list = None  # inline buttons: rows of (label, action, arg)
+    new: bool = False  # send as a new message instead of editing the one that was tapped
+
+
+BACK = [("Menu", "menu", "")]
+KEEP_MENU_TASKS = 8
+NAME_PROMPT = (
+    "[Naming] You are about to be given a name. Propose three names for yourself. Reply with exactly three lines, each "
+    "`Name | one short reason`, and nothing else. A name is 3 to 12 letters, easy to say aloud, not a common English word. "
+    "{avoid}"
+)
+NAME_SELF_PROMPT = (
+    "[Naming] Choose the one name you want, for yourself. Reply with exactly one line, `Name | one short reason`, and "
+    "nothing else. A name is 3 to 12 letters, easy to say aloud, not a common English word. {avoid}"
+)
+
+
+def menu_rows():
+    paused = dispatcher.read_pause()
+    paused = bool(paused and paused.until > datetime.now(timezone.utc))
+    return [
+        [("Status", "status", ""), ("Usage", "usage", "")],
+        [("Resume", "resume", "") if paused else ("Pause", "pause", "")],
+        [("Run learning review", "learn", "")],
+        [("Create skill from a task", "skillpick", "")],
+        [("Name your assistant", "name", "")],
+    ]
+
+
+def menu_reply():
+    return Reply(f"{dispatcher.assistant_name()} menu", menu_rows())
+
+
+def spend_prompt(what, prefix):
+    average = dispatcher.average_run_cost(prefix)
+    cost = (f"The last {average[1]} run{'s' if average[1] != 1 else ''} averaged ${average[0]:.2f}."
+            if average else "There is no earlier run to average yet.")
+    return f"{what}? {cost}"
+
+
+def do_resume():
+    pause = dispatcher.read_pause()
+    if pause:
+        dispatcher.PAUSED_FILE.unlink(missing_ok=True)
+    lines = ["Resumed: the queue runs again." if pause else "The queue was not paused."]
+    if dispatcher.AUTH_FAILED_FILE.exists():
+        if dispatcher.login_works():
+            dispatcher.AUTH_FAILED_FILE.unlink(missing_ok=True)
+            dispatcher.clear_reported("auth")
+            lines.append("The Claude login works again.")
+        else:
+            lines.append("The Claude login still fails: run `claude` on the queue host and sign in.")
+    return Reply("\n".join(lines), [BACK])
+
+
+def do_retry(stem):
+    """Retry a failed or cancelled task, or make a finished-but-unpublished one try publishing at once."""
+    path = dispatcher.PENDING / f"{stem}.md"
+    if path.is_file():
+        meta, body = dispatcher.parse_task(path)
+        if meta and meta.get("pending_publish"):
+            for key in ("held_until", "publish_blocked", "publish_failures"):
+                meta.pop(key, None)
+            dispatcher.write_task(path, meta, body)
+            return Reply(f"{stem} will try to publish on the next run.")
+    ok, message = dispatcher.retry_task(stem)
+    return Reply(("🔁 " if ok else "⚠️ ") + message)
+
+
+def do_pick_skill():
+    done = dispatcher.recent_done(KEEP_MENU_TASKS)
+    if not done:
+        return Reply("No finished tasks yet.", [BACK])
+    return Reply("Which finished task should become a skill?",
+                 [[(stem if len(stem) <= 40 else stem[:37] + "...", "skill", stem)] for stem in done] + [BACK])
+
+
+def do_skill_ok(stem):
+    if not stem or "/" in stem or not (dispatcher.DONE / f"{stem}.md").is_file():
+        return Reply(f"'{stem}' is not a finished task.", [BACK])
+    if dispatcher.queued_like("skill-from-task-", f"tasks/done/{stem}.md"):
+        return Reply(f"A skill for {stem} is already queued.", [BACK])
+    name = f"skill-from-task-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    ok, message = dispatcher.enqueue_example("skill-from-task.md", name, {"__TASK_ID__": stem})
+    return Reply((f"Queued a skill for {stem} as {name}. If it generalises, a pull request opens; if not, you hear nothing."
+                  if ok else f"Could not queue it: {message}"), [BACK])
+
+
+def do_learn_ok():
+    if existing := dispatcher.queued_like("weekly-improver-"):
+        return Reply(f"A learning review is already queued: {existing.stem}.", [BACK])
+    name = f"weekly-improver-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    ok, message = dispatcher.enqueue_example("weekly-improver.md", name)
+    return Reply((f"Queued {name}. If it finds nothing worth proposing, you hear nothing."
+                  if ok else f"Could not queue it: {message}"), [BACK])
+
+
+# --- naming the assistant
+
+
+def ask_for_names(avoid, one=False):
+    """A fresh, throwaway coordinator session asked for names. Returns (pairs, error text)."""
+    note = ("Do not suggest: " + ", ".join(avoid) + ".") if avoid else ""
+    prompt = (NAME_SELF_PROMPT if one else NAME_PROMPT).format(avoid=note)
+    try:
+        proc, status, message, _ = coordinator_call(prompt, None)
+    except (subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
+        return [], f"I could not ask for names: {type(exc).__name__}."
+    if status != "ok":
+        return [], "I could not ask for names right now (the queue is paused or the login needs renewing)."
+    return naming.parse_proposals(extract_result(proc.stdout or "")), ""
+
+
+def offer_names(state, more=False):
+    avoid = state.get("name_offered", []) if more else []
+    pairs, error = ask_for_names(avoid)
+    if not pairs:
+        return Reply(error or "No usable names came back. Tap again to retry.", [BACK])
+    state["name_offered"] = (avoid + [n for n, _ in pairs])[-12:]
+    lines = ["Three names for me:"] + [f"{n}. {name}: {reason}" for n, (name, reason) in enumerate(pairs, 1)]
+    return Reply("\n".join(lines),
+                 [[(name, "name_pick", name) for name, _ in pairs],
+                  [("More names", "name_more", ""), ("Choose for me", "name_self", "")]])
+
+
+def open_name_pr(patch_path):
+    """Run the opener for the naming patch. Returns its one line, or why it could not run."""
+    env = dispatcher.publish_env()
+    env[open_proposal_name_env()] = "1"
+    cmd = [sys.executable, str(BASE / "scripts" / "open_proposal_pr.py"), str(patch_path.relative_to(BASE)),
+           "--allow", naming.IDENTITY_PATH, "--allow", naming.ENV_EXAMPLE_PATH,
+           "--test-cmd", f"{sys.executable} -m unittest discover -s tests -p test_naming.py"]
+    if cfg("GH_BIN"):
+        cmd += ["--gh", cfg("GH_BIN")]
+    try:
+        proc = subprocess.run(cmd, cwd=str(BASE), env=env, capture_output=True, text=True, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not run the opener ({type(exc).__name__})"
+    return (proc.stdout.strip().splitlines() or [proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "no output"])[-1]
+
+
+def open_proposal_name_env():
+    return "TASKQ_NAME_PR"
+
+
+def save_name(name):
+    """Record the chosen name: ASSISTANT_NAME in .env, and a pull request for identity.md and the .env.example default."""
+    name = naming.clean(name)
+    if name is None:
+        return Reply("That is not a name I can use.", [BACK])
+    try:
+        patch = naming.name_patch((COORD_DIR / "identity.md").read_text(), (BASE / ".env.example").read_text(), name)
+    except (OSError, ValueError) as exc:
+        return Reply(f"I could not record the name: {exc}", [BACK])
+    dispatcher.set_env_value("ASSISTANT_NAME", name)
+    if not patch:
+        return Reply(f"I am already {name} in the repo; .env now says so too.", [BACK])
+    target = BASE / "tasks" / "proposals" / "assistant-name.patch"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(patch)
+    return Reply(f"I am {name} from now on (set in .env). The repo change: {open_name_pr(target)}", [BACK])
+
+
+def do_name_self(state):
+    pairs, error = ask_for_names(state.get("name_offered", []), one=True)
+    if not pairs:
+        return Reply(error or "No usable name came back. Tap again to retry.", [BACK])
+    return save_name(pairs[0][0])
+
+
+def do_name_pick(state, name):
+    if name not in state.get("name_offered", []):
+        return Reply("That name was not one I offered. Tap Name your assistant to start again.", [BACK])
+    return save_name(name)
+
+
+def run_action(action, arg, state):
+    """The Reply for a button. Raises KeyError for an action that does not exist."""
+    simple = {
+        "menu": lambda: menu_reply(),
+        "status": lambda: Reply(queue_status(), [BACK]),
+        "usage": lambda: Reply(dispatcher.usage_summary(), [BACK]),
+        "pause": lambda: pause_from_menu(),
+        "resume": lambda: do_resume(),
+        "learn": lambda: (Reply(f"A learning review is already queued: {existing.stem}.", [BACK])
+                          if (existing := dispatcher.queued_like("weekly-improver-")) else
+                          Reply(spend_prompt("Run a learning review", "weekly-improver-"),
+                                [[("Confirm", "learn_ok", ""), ("Cancel", "menu", "")]])),
+        "learn_ok": lambda: do_learn_ok(),
+        "skillpick": lambda: do_pick_skill(),
+        "skill": lambda: Reply(spend_prompt(f"Create a skill from {arg}", "skill-from-task-"),
+                               [[("Confirm", "skill_ok", arg), ("Cancel", "menu", "")]]),
+        "skill_ok": lambda: do_skill_ok(arg),
+        "approve": lambda: acted(dispatcher.approve_task(arg), "✅ "),
+        "reject": lambda: acted(dispatcher.reject_task(arg), "🗑 "),
+        "retry": lambda: do_retry(arg),
+        "cancel": lambda: acted(dispatcher.cancel_task(arg), "🗑 "),
+        "open": lambda: Reply(dispatcher.task_status(arg)[1], new=True),
+        "name": lambda: offer_names(state),
+        "name_more": lambda: offer_names(state, more=True),
+        "name_self": lambda: do_name_self(state),
+        "name_pick": lambda: do_name_pick(state, arg),
+    }
+    return simple[action]()
+
+
+def acted(result, icon):
+    ok, message = result
+    return Reply((icon if ok else "⚠️ ") + message)
+
+
+def pause_from_menu():
+    until = datetime.now(timezone.utc) + timedelta(hours=dispatcher.MENU_PAUSE_HOURS)
+    dispatcher.pause_queue(until, "paused from the menu", notify=False)
+    return Reply(f"Paused until {dispatcher.format_when(until)}. Nothing new starts; a running task finishes.",
+                 [[("Resume", "resume", "")], BACK])
+
+
+def edit_message(chat_id, message_id, text, rows=None):
+    params = {"chat_id": chat_id, "message_id": message_id,
+              "text": dispatcher.clip_for_telegram(dispatcher.redact_secrets(text))}
+    if rows:
+        params["reply_markup"] = dispatcher.keyboard(rows)
+    try:
+        api("editMessageText", params, timeout=30)
+    except Exception as exc:  # an unchanged text is refused with a 400; the tap was still handled
+        log.info("editMessageText did not apply (%s)", type(exc).__name__)
+
+
+def handle_callback(query, state):
+    """A button tap. Ignored without a word unless it comes from the one authorised sender in the one chat."""
+    message = query.get("message") or {}
+    chat_id = str((message.get("chat") or {}).get("id", ""))
+    if not is_authorized(chat_id, (query.get("from") or {}).get("id")):
+        log.warning("Ignoring a button tap from unauthorized chat %s or sender", chat_id or "(unknown)")
+        return
+    answer = {"callback_query_id": query.get("id")}
+    decoded = buttons.decode(query.get("data"), dispatcher.callback_table())
+    try:
+        if decoded is None:
+            reply = Reply("I don't know that button any more. Send /menu for a fresh one.", [BACK])
+        else:
+            action, arg = decoded
+            try:
+                reply = run_action(action, arg, state)
+            except KeyError:
+                reply = Reply(f"I don't know the action '{action}'.", [BACK])
+    except Exception as exc:  # noqa: BLE001 - a tap must always be answered
+        log.exception("Button %s failed", query.get("data"))
+        reply = Reply(f"Something went wrong ({type(exc).__name__}). Nothing was changed that I know of.", [BACK])
+    try:
+        api("answerCallbackQuery", answer, timeout=10)
+    except Exception:
+        pass  # the spinner stops by itself after a while
+    if reply.new:
+        send_replies([reply.text], state)
+        return
+    original = (message.get("text") or "").strip()
+    keep_original = decoded is not None and decoded[0] in ("approve", "reject", "retry", "cancel") and original
+    edit_message(chat_id, message.get("message_id"), f"{original}\n\n{reply.text}" if keep_original else reply.text, reply.rows)
+
+
+def send_menu():
+    reply = menu_reply()
+    try:
+        api("sendMessage", {"chat_id": cfg("TELEGRAM_CHAT_ID"), "text": reply.text,
+                            "reply_markup": dispatcher.keyboard(reply.rows)}, timeout=30)
+    except Exception as exc:
+        log.error("Could not send the menu: %s", exc)
+
+
 def refuse_secret(msg, chat_id, kinds, state):
     """A message that holds a key or token: not logged, not stored, not sent to the model. Delete it and say why, once."""
     log.warning("Dropped message %s: it looked like a %s", msg.get("message_id"), " and a ".join(kinds))
@@ -419,6 +780,9 @@ def handle_update(update, state):
     if update.get("message_reaction"):
         handle_reaction(update["message_reaction"], state)
         return
+    if update.get("callback_query"):
+        handle_callback(update["callback_query"], state)
+        return
     msg = update.get("message") or {}
     chat_id = str((msg.get("chat") or {}).get("id", ""))
     if not is_authorized(chat_id, (msg.get("from") or {}).get("id")):
@@ -435,10 +799,20 @@ def handle_update(update, state):
     log.info("Received: %s", text[:300])
     if text == "/new":
         state["session_id"] = None
+        state["context_pct"] = None
         send_replies(["Starting a fresh conversation."], state)
+        return
+    if text == "/menu":
+        send_menu()
+        return
+    if text == "/usage":
+        send_replies([dispatcher.usage_summary()], state)
         return
     if text == "/status":
         send_replies([queue_status()], state)
+        return
+    if text.startswith("/status "):
+        send_replies([dispatcher.task_status(text[len("/status"):])[1]], state)
         return
     if text == "/cancel" or text.startswith("/cancel "):
         target = text[len("/cancel"):].strip()
@@ -535,7 +909,9 @@ def main():
 
     try:  # register the / command menu; cosmetic, never fatal
         api("setMyCommands", {"commands": json.dumps([
-            {"command": "status", "description": "Queue counts and task names"},
+            {"command": "menu", "description": "Buttons: status, usage, pause, learning review, skills, naming"},
+            {"command": "status", "description": "Queue counts, or one task: /status <task-id>"},
+            {"command": "usage", "description": "What today and this week cost"},
             {"command": "cancel", "description": "Archive a pending task: /cancel <task-id>"},
             {"command": "retry", "description": "Requeue a failed/cancelled task: /retry <task-id>"},
             {"command": "approve", "description": "Let a waiting task run: /approve <task-id>"},
@@ -557,7 +933,7 @@ def main():
                 {
                     "timeout": 50,
                     "offset": state.get("offset", 0) + 1,
-                    "allowed_updates": json.dumps(["message", "message_reaction"]),
+                    "allowed_updates": json.dumps(["message", "message_reaction", "callback_query"]),
                 },
                 timeout=70,
             )

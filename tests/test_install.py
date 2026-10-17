@@ -103,6 +103,7 @@ class InstallCase(unittest.TestCase):
                     "scripts/install.py", "worker_preamble.md"):
             (self.base / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / rel, self.base / rel)
+        shutil.copytree(REPO / "taskq_lib", self.base / "taskq_lib", ignore=shutil.ignore_patterns("__pycache__"))
         python = self.base / ".venv" / "bin" / "python3"  # the repo's venv has the libraries
         python.parent.mkdir(parents=True)
         python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')

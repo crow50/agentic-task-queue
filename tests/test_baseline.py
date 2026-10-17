@@ -44,6 +44,7 @@ class Sandbox:
         self.home.mkdir()
         for script in ("dispatcher.py", "coordinator_bot.py", "worker_preamble.md"):
             shutil.copy2(REPO / script, self.base / script)
+        shutil.copytree(REPO / "taskq_lib", self.base / "taskq_lib", ignore=shutil.ignore_patterns("__pycache__"))
 
         self.telegram = FakeTelegram()
         self.telegram.start()
@@ -427,7 +428,7 @@ class SandboxIsolationTests(BaselineCase):
         self.assertIn("TELEGRAM_BOT_TOKEN=test-token", text)
         self.assertEqual(
             sorted(p.name for p in self.sb.base.iterdir()),
-            [".env", "coordinator_bot.py", "dispatcher.py", "worker_preamble.md"],
+            [".env", "coordinator_bot.py", "dispatcher.py", "taskq_lib", "worker_preamble.md"],
         )
 
 

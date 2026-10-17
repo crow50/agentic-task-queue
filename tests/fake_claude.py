@@ -37,7 +37,8 @@ a system/init line, the events of "stream", then the envelope as the final
     {"event": {...}}                       any other event, printed as is
 Steps with "stdout" or "fixture" still print exactly that, in either format.
 
-Output is the envelope from tests/fixtures/envelope-success.json unless
+Output is the envelope from tests/fixtures/envelope-success.json (with a session_id that is new for each
+call, or the one named by --resume) unless
 "stdout" or "fixture" is given. Every call is appended to
 <scenario>.calls.jsonl (role, model, allowed_tools, argv, the login/GitHub tokens it
 was given in its environment, prompt, exit) so
@@ -48,6 +49,7 @@ import json
 import os
 import sys
 import time
+import zlib
 from pathlib import Path
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -142,6 +144,9 @@ def main(argv):
         envelope = json.loads((FIXTURES / "envelope-success.json").read_text())
         envelope["is_error"] = code != 0
         envelope.update(step.get("envelope", {}))
+        if "session_id" not in step.get("envelope", {}):
+            # A new session per call, as the real CLI makes; a resumed call (--resume <id>) continues that session.
+            envelope["session_id"] = flag_value(argv, "--resume") or f"{zlib.crc32(scenario_env.encode()):08x}-0000-4000-8000-{len(previous) + 1:012d}"
         if "result" in step:
             envelope["result"] = step["result"]
         if flag_value(argv, "--output-format") == "stream-json":

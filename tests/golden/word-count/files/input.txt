@@ -1,0 +1,3 @@
+The queue runs the task.
+The task ends; the queue waits.
+A queue is a queue.
