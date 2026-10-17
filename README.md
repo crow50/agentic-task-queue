@@ -685,9 +685,25 @@ speech service, and only the transcript reaches the model. Voice is optional and
   sentence. The bridge logs the same factor for every note (`Transcribed 7s of audio in 2.1s`). `install.py --check` warns
   when a configured tool or model file is missing.
 
-Setting it up on the Pi. Only the first command needs `sudo`: `/opt` is writable by the person who set the Pi up, and the
-`taskq` user only has to read and run what is put there. Do not move `whisper-cli` after building it (it finds its
-libraries in the build folder).
+Setting it up on the Pi: run the installer as your own user (not root, not with `sudo`).
+
+```bash
+python3 scripts/install_voice.py              # whisper.cpp base.en-q5_1 and Piper en_US-lessac-medium under /opt/voice
+python3 scripts/install_voice.py --check-only # install nothing, only test what is there
+```
+
+It checks for `ffmpeg`, `git`, `cmake`, a C++ compiler and `python3-venv`; if any is missing it prints the one
+`sudo apt install ...` line and stops (the only step that needs `sudo`). Then it fetches and builds whisper.cpp, downloads the
+model, creates a Piper environment and downloads the voice, skipping each step that is already done, so after a failure
+you fix the cause and run it again. The build takes a few minutes on a Pi. Finally it tests the result without a recording:
+Piper says "The queue is ready.", whisper.cpp must hear "ready", ffmpeg must encode it to Opus, and every file must be
+reachable by the `taskq` user (a home directory or a umask of 077 hides them; it names the folder). Only after the test passes
+does it set `WHISPER_BIN`, `WHISPER_MODEL`, `TTS_BIN` and `TTS_MODEL`: in the queue's `.env` if you can write it, otherwise
+in `/opt/voice/voice.env` with the one command that adds them as `taskq`. `--model tiny.en-q5_1` picks the faster model,
+`--voice` another Piper voice, `--dest` another folder. Do not move `whisper-cli` after building (it finds its libraries in the
+build folder).
+
+By hand, the same thing is:
 
 ```bash
 sudo apt install ffmpeg                       # cmake, gcc and git are already installed
@@ -704,7 +720,7 @@ piper/bin/pip install piper-tts
 piper/bin/python -m piper.download_voices en_US-lessac-medium --data-dir /opt/voice
 ```
 
-Then in `.env` (edit it as the queue's user: `sudo -u taskq nano /opt/agentic-task-queue/.env`; a later line wins over an
+and in `.env` (edit it as the queue's user: `sudo -u taskq nano /opt/agentic-task-queue/.env`; a later line wins over an
 earlier one, so adding these at the end is safe):
 
 ```
@@ -714,7 +730,7 @@ TTS_BIN=/opt/voice/piper/bin/piper
 TTS_MODEL=/opt/voice/en_US-lessac-medium.onnx
 ```
 
-Check it by hand as `taskq` before relying on it (`sudo -u taskq <command>`), then `sudo python3 scripts/install.py --check`
+Then `sudo python3 scripts/install.py --check`
 (the `voice:` lines), then `sudo systemctl restart claude-coordinator`, then `scripts/voice_bench.py` on a note you
 recorded, then send a voice note. The upstream pages for the tools are the whisper.cpp README and Piper's `docs/CLI.md`.
 
