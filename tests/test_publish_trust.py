@@ -164,6 +164,24 @@ class DeniedPushTests(TrustCase):
         self.assertEqual(self.sb.names("pending"), ["t"])
         self.assertEqual(self.sb.pr_creates(), [])
 
+    def test_a_token_that_can_read_but_not_push_is_not_a_pass(self):
+        """The repo role (viewerPermission) is the person's, not the token's: a fine-grained token with Contents
+        read-only still sees ADMIN. Only the remote's answer to a push tells."""
+        self.finished()
+        self.deny_pushes()
+        self.sb.run()
+        pushes = self.denied_calls()
+
+        self.sb.gh_rules([PROBE_WRITE])
+        self.sb.git(self.sb.repo, "remote", "set-url", "--push", "origin", str(self.sb.root / "refuses-pushes.git"))
+        self.sb.run()
+
+        self.assertEqual(self.sb.names("pending"), ["t"])
+        self.assertEqual(self.sb.pr_creates(), [])
+        self.assertEqual(self.denied_calls(), pushes, "the real push is not tried while the probe says no")
+        meta, _ = self.sb.read_task("pending", "t")
+        self.assertNotIn("publish_failures", meta, "the probe holds the task; a failed push would have counted")
+
     def test_a_403_from_gh_pr_create_is_the_same_kind_of_problem(self):
         self.finished()
         self.sb.gh_rules([{"match": "pr create", "exit": 1,

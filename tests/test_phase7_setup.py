@@ -114,6 +114,8 @@ class PublishProbeCheckTests(InstallCase):
         repo.mkdir(parents=True)
         for args in (["init", "-q", "-b", "main"], ["remote", "add", "origin", str(self.origin)]):
             subprocess.run(["git", "-C", str(repo), *args], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q",
+                        "--allow-empty", "-m", "init"], check=True)
         (self.base / "tasks" / "pending").mkdir(parents=True, exist_ok=True)
         (self.base / "tasks" / "pending" / "t.md").write_text("---\nmodel: m\nrepo: proj\n---\nbody\n")
 
@@ -144,6 +146,16 @@ class PublishProbeCheckTests(InstallCase):
         code, out, _ = self.check()
         self.assertEqual(code, 1, out)
         self.assertRegex(out, r"FAIL +publish access: proj")
+
+    def test_a_role_of_write_is_not_proof_the_token_can_push(self):
+        """viewerPermission is the person's role on the repo; a read-only fine-grained token still reports it."""
+        self.permission("ADMIN")
+        subprocess.run(["git", "-C", str(self.base / "workspace" / "proj"), "remote", "set-url", "--push", "origin",
+                        str(self.root / "refuses-pushes.git")], check=True)
+        code, out, _ = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"FAIL +publish access: proj")
+        self.assertIn("GH_TOKEN", out)
 
     def test_without_any_repo_task_there_is_nothing_to_probe(self):
         (self.base / "tasks" / "pending" / "t.md").unlink()
