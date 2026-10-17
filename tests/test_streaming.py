@@ -168,6 +168,7 @@ class WorkerStreamTests(StreamCase):
         self.assertIn("boom: not a limit", body)
 
     def test_a_worker_past_its_timeout_is_killed_while_streaming(self):
+        self.sb.configure(MAX_RESUMES="0")  # Phase 9: a timeout after tool calls would otherwise resume, not fail
         self.sb.set_scenario(worker=[{"result": "late", "stream": [tool("Read", "a.txt"), {"sleep": 30}]}])
         self.sb.add_task("t", timeout_minutes="0.03", max_attempts="1")
         started = time.monotonic()

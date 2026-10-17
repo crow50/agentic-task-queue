@@ -467,6 +467,10 @@ def handle_reaction(reaction, state):
     if (verdict := dispatcher.apply_reaction(reaction.get("message_id"), emoji)) is not None:
         send_replies([verdict], state)  # an approval announcement: handled in code, no coordinator turn
         return
+    if emoji == "👎" and (stem := dispatcher.outcome_for_message(reaction.get("message_id"))):
+        state["awaiting_followup"] = {"task": stem, "at": dispatcher.now_iso()}  # the next message says what was wrong
+        send_replies([f"What was wrong with {stem}? Reply with what to change, or send /skip."], state)
+        return
     snippet = next(
         (s for mid, s in reversed(state.get("sent_messages", []))
          if mid == reaction.get("message_id")),
@@ -498,6 +502,7 @@ class Reply(NamedTuple):
 
 BACK = [("Menu", "menu", "")]
 KEEP_MENU_TASKS = 8
+EXTEND_STEP_MINUTES = 15  # what the Extend button adds
 NAME_PROMPT = (
     "[Naming] You are about to be given a name. Propose three names for yourself. Reply with exactly three lines, each "
     "`Name | one short reason`, and nothing else. A name is 3 to 12 letters, easy to say aloud, not a common English word. "
@@ -688,6 +693,11 @@ def run_action(action, arg, state):
         "approve": lambda: acted(dispatcher.approve_task(arg), "✅ "),
         "reject": lambda: acted(dispatcher.reject_task(arg), "🗑 "),
         "retry": lambda: do_retry(arg),
+        "extend": lambda: Reply(("⏱ " if (done := dispatcher.request_extend(arg, EXTEND_STEP_MINUTES))[0] else "⚠️ ") + done[1], new=True),
+        "stop": lambda: Reply(("⏹ " if (done := dispatcher.request_stop(arg))[0] else "⚠️ ") + done[1], new=True),
+        "wait": lambda: Reply(("👀 " if (done := dispatcher.request_wait(arg))[0] else "⚠️ ") + done[1], new=True),
+        "revisit": lambda: acted(dispatcher.revisit_continue(arg), "↪️ "),
+        "revisit_done": lambda: acted(dispatcher.revisit_done(arg), "👍 "),
         "cancel": lambda: acted(dispatcher.cancel_task(arg), "🗑 "),
         "open": lambda: Reply(dispatcher.task_status(arg)[1], new=True),
         "name": lambda: offer_names(state),
@@ -750,7 +760,7 @@ def handle_callback(query, state):
         send_replies([reply.text], state)
         return
     original = (message.get("text") or "").strip()
-    keep_original = decoded is not None and decoded[0] in ("approve", "reject", "retry", "cancel") and original
+    keep_original = decoded is not None and decoded[0] in ("approve", "reject", "retry", "cancel", "revisit", "revisit_done") and original
     edit_message(chat_id, message.get("message_id"), f"{original}\n\n{reply.text}" if keep_original else reply.text, reply.rows)
 
 
@@ -761,6 +771,25 @@ def send_menu():
                             "reply_markup": dispatcher.keyboard(reply.rows)}, timeout=30)
     except Exception as exc:
         log.error("Could not send the menu: %s", exc)
+
+
+FOLLOWUP_WAIT = timedelta(minutes=60)  # how long a 👎 waits for its answer
+
+
+def continue_from(stem, text):
+    """The reply to /continue, to a reply on a result and to the answer to a 👎: queue a follow-up. No model is called."""
+    ok, message = dispatcher.create_followup(stem, text, source="user")
+    return ("↪️ " if ok else "⚠️ ") + message
+
+
+def awaited_task(state):
+    """The task a 👎 is waiting to hear about, or None when nothing is awaited or it has gone stale."""
+    waiting = state.get("awaiting_followup")
+    try:
+        asked = datetime.strptime(waiting["at"], dispatcher.ISO_FMT).replace(tzinfo=timezone.utc)
+        return waiting["task"] if datetime.now(timezone.utc) - asked < FOLLOWUP_WAIT else None
+    except (TypeError, KeyError, ValueError):
+        return None
 
 
 def refuse_secret(msg, chat_id, kinds, state):
@@ -841,6 +870,48 @@ def handle_update(update, state):
         ok, result = dispatcher.retry_task(target)
         send_replies([("🔁 " if ok else "⚠️ ") + result], state)
         return
+    if text == "/backlog":
+        send_replies([dispatcher.backlog_text()], state)
+        return
+    if text == "/extend" or text.startswith("/extend "):
+        stem, _, minutes = text[len("/extend"):].strip().partition(" ")
+        try:
+            float(minutes)
+        except ValueError:
+            send_replies(["Usage: /extend <task-id> <minutes>\nRunning: " + (", ".join(sorted(p.stem for p in dispatcher.ACTIVE.glob("*.md"))) or "(none)")], state)
+            return
+        ok, result = dispatcher.request_extend(stem, minutes)
+        send_replies([("⏱ " if ok else "⚠️ ") + result], state)
+        return
+    if text == "/stop" or text.startswith("/stop "):
+        stem = text[len("/stop"):].strip()
+        if not stem:
+            send_replies(["Usage: /stop <task-id>\nRunning: " + (", ".join(sorted(p.stem for p in dispatcher.ACTIVE.glob("*.md"))) or "(none)")], state)
+            return
+        ok, result = dispatcher.request_stop(stem)
+        send_replies([("⏹ " if ok else "⚠️ ") + result], state)
+        return
+    if text == "/tasks":
+        send_replies([dispatcher.finished_tasks_text()], state)
+        return
+    if text == "/continue" or text.startswith("/continue "):
+        stem, _, change = text[len("/continue"):].strip().partition(" ")
+        send_replies([continue_from(stem, change) if stem else dispatcher.finished_tasks_text()], state)
+        return
+    if text == "/skip":
+        dropped = state.pop("awaiting_followup", None)
+        send_replies(["Dropped it." if dropped else "Nothing to skip."], state)
+        return
+    replied_to = (msg.get("reply_to_message") or {}).get("message_id")
+    if not text.startswith("/"):  # a command inside a reply is still a command
+        if replied_to and (stem := dispatcher.outcome_for_message(replied_to)):  # a reply to a result: continue that task
+            state.pop("awaiting_followup", None)
+            send_replies([continue_from(stem, text)], state)
+            return
+        if stem := awaited_task(state):  # the answer to "what was wrong?"
+            state.pop("awaiting_followup", None)
+            send_replies([continue_from(stem, text)], state)
+            return
     for command, act, icon in (("/approve", dispatcher.approve_task, "✅ "), ("/reject", dispatcher.reject_task, "🗑 ")):
         if text == command or text.startswith(command + " "):
             target = text[len(command):].strip()
@@ -915,6 +986,11 @@ def main():
             {"command": "usage", "description": "What today and this week cost"},
             {"command": "cancel", "description": "Archive a pending task: /cancel <task-id>"},
             {"command": "retry", "description": "Requeue a failed/cancelled task: /retry <task-id>"},
+            {"command": "tasks", "description": "The last finished tasks and what each made"},
+            {"command": "backlog", "description": "Items tasks deferred, and proposals waiting for a thumbs-up"},
+            {"command": "extend", "description": "Give a running task more time: /extend <task-id> <minutes>"},
+            {"command": "stop", "description": "End a running task cleanly: /stop <task-id>"},
+            {"command": "continue", "description": "Carry on from a finished task: /continue <task-id> <what to change>"},
             {"command": "approve", "description": "Let a waiting task run: /approve <task-id>"},
             {"command": "reject", "description": "Drop a waiting task: /reject <task-id>"},
             {"command": "new", "description": "Start a fresh coordinator conversation"},

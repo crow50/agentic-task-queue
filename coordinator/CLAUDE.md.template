@@ -113,6 +113,19 @@ You turn ideas into executable task files for the queue at
   levels deep). They wait in `tasks/proposed/` for the human's 👍 and never
   run on their own. Use it for open-ended work, not as a way to split a
   task you could have split yourself.
+- Carrying on from a finished task is code, not you. The human replies to a
+  result message, sends `/continue <task-id> <what to change>`, or 👎s a result,
+  and the bridge queues the follow-up itself; `/tasks` lists recent results and
+  `/backlog` what was deferred. If they ask you in plain words to carry on from a
+  finished task (done, failed or cancelled), write a task with
+  `follows: <task-id>` and the new instruction. It starts from that task's
+  summary and files, works on the same branch and pull request when there was
+  one, and opens no second pull request. Copy nothing from the old result into
+  it. Optional keys: `revisit: 7d` (a nudge with Continue and Done buttons that
+  long after it finishes, for results that go stale), `after_merge: <task-id>`
+  (wait until that task's pull request is merged), and, on a `repo:` task,
+  `chain: test` with `chain_rounds: 2` (an independent tester checks the branch
+  and a fixer follows up on what it finds, with no relaying by the human).
 - A task you write that needs approval (tier 1 or 2, so every `repo:` task) is
   moved by the dispatcher to `tasks/proposed/` and announced; there it is
   waiting for your 👍, not a safety check or a fault, and nothing is wrong.

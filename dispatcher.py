@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
-from taskq_lib import accounting, alerts, buttons, models, naming
+from taskq_lib import accounting, alerts, buttons, chain, fence, followups, models, naming, outcomes, sources
 
 try:
     import filelock
@@ -88,6 +88,7 @@ PROPOSED = TASKS / "proposed"  # waiting for your 👍 before they may run
 LOGS = BASE / "logs"
 STATE = BASE / "state"
 WORKTREES = BASE / "worktrees"  # one git worktree per task that sets repo:
+OUTCOMES = STATE / "outcomes"  # one <task>.json per finished task: what it produced, so a follow-up starts from what is true
 APPROVALS = STATE / "approvals"  # one <task>.json per task that needed approval; claude cannot write state/
 LOCKFILE = BASE / "dispatcher.lock"
 PAUSED_FILE = STATE / "paused_until"  # first line: ISO UTC time; second line: why
@@ -177,6 +178,14 @@ class ClaudeReply(NamedTuple):
 
 class CallTimeout(Exception):
     """A claude invocation exceeded its timeout."""
+
+
+class StopRequested(Exception):
+    """/stop reached a running call (raised inside read_stream)."""
+
+
+class TaskStopped(Exception):
+    """A running call was ended cleanly because the person asked (raised by _call_claude)."""
 
 
 class AuthError(Exception):
@@ -329,6 +338,10 @@ def _whole_number(minimum):
     return check
 
 
+def _duration(value):
+    return None if sources.duration_seconds(value) else "must look like 12h, 7d or 2w"
+
+
 def _positive_number(value):
     try:
         number = float(value)
@@ -363,6 +376,18 @@ FRONTMATTER_KEYS = {
     "repo": (False, False, None),  # a git checkout (name under REPOS_DIR or absolute path): worktree + draft pull request
     "base": (False, False, None),  # branch the task branch starts from (default main)
     "propose": (False, False, ("true", "false")),  # true: the worker may write follow-up proposals
+    "after_merge": (False, False, None),  # wait until the pull request of this task has been merged (by you)
+    "revisit": (False, False, _duration),  # e.g. 7d: nudge me to look again this long after it finishes
+    "revisit_task": (False, False, None),  # a task file under tasks/ to queue at that time instead of asking
+    "chain": (False, False, ("test",)),  # on a repo task: queue an independent tester when it passes
+    "chain_rounds": (False, False, _whole_number(1)),  # test, fix, test again at most this often (capped by MAX_CHAIN_ROUNDS)
+    "chain_hop": (False, False, chain.ROLES),  # managed by the dispatcher: this task is a tester or a fixer
+    "chain_round": (False, False, _whole_number(1)),  # managed by the dispatcher
+    "chain_root": (False, False, None),  # managed by the dispatcher: the build task the hops belong to
+    "resume_session": (False, False, None),  # managed by the dispatcher: the next attempt resumes this claude session
+    "resumes": (False, False, _whole_number(0)),  # managed by the dispatcher: free resumes used after timeouts
+    "follows": (False, False, None),  # the task this one continues (checked by follows_problems()); see create_followup()
+    "session_id": (False, False, None),  # managed by the dispatcher: the worker's claude session, kept for a follow-up
     "branch": (False, False, None),  # managed by the dispatcher
     "pr_url": (False, False, None),  # managed by the dispatcher
     "pending_publish": (False, False, None),  # managed by the dispatcher
@@ -604,6 +629,13 @@ def validate_task(meta, body, template=False):
             problems.append(f"deliver path '{ref}' is outside the task's cwd")
     if meta.get("verify") and (problem := verify_problem(meta["verify"])):
         problems.append(problem)
+    problems += follows_problems(meta)
+    if meta.get("chain") and not meta.get("repo"):
+        problems.append("chain: needs a repo: task; the hops work on its branch")
+    if meta.get("chain_hop") and not meta.get("follows"):
+        problems.append("chain_hop is set by the dispatcher and needs follows")
+    if meta.get("revisit_task") and not (BASE / meta["revisit_task"]).resolve().is_relative_to(TASKS.resolve()):
+        problems.append("revisit_task must be a file under tasks/")
     if meta.get("review") in ("skip", "skip-if-verified") and not meta.get("verify"):
         problems.append(f"review: {meta['review']} needs a verify command; nothing else would check the result")
     if template:
@@ -838,7 +870,8 @@ def read_stream(proc, prompt, timeout_s, watcher, raw_path):
     """Read a `--output-format stream-json` call while it runs; returns (out, err) like communicate().
 
     Each event goes to watcher.feed() the moment it arrives, and watcher.tick()
-    runs about once a second when it is quiet. `out` is what the rest of the
+    runs about once a second when it is quiet. A watcher with a poll() method is asked, before every wait, for seconds to
+    add to the deadline and whether to stop (raises StopRequested). `out` is what the rest of the
     dispatcher already understands: the final `result` line (the same envelope
     --output-format json prints), or, when there is none, only the lines that
     are not stream events, so a rate_limit_event can never read as a limit. The
@@ -865,8 +898,14 @@ def read_stream(proc, prompt, timeout_s, watcher, raw_path):
 
     deadline = time.monotonic() + timeout_s
     result, text, err, open_pipes = None, [], [], 2
+    poll = getattr(watcher, "poll", None)  # a watcher that can lengthen the deadline or ask for a stop (see CallControl)
     with open(raw_path, "a") as raw:
         while open_pipes:
+            if poll is not None:
+                extra, stop = poll()
+                deadline += extra
+                if stop:
+                    raise StopRequested()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(proc.args, timeout_s)
@@ -930,12 +969,16 @@ def _call_claude(cmd, prompt, timeout_s, cwd, transcript, label, watcher=None):
             out, err = proc.communicate(prompt, timeout=timeout_s)
         else:
             out, err = read_stream(proc, prompt, timeout_s, watcher, transcript.with_suffix(".stream.jsonl"))
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, StopRequested) as ended:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         proc.wait()
+        if isinstance(ended, StopRequested):
+            append_transcript(transcript, f"[{label}] STOPPED on request")
+            log_usage(label, model, None, "stopped", task=task_of(transcript))
+            raise TaskStopped() from None
         append_transcript(transcript, f"[{label}] TIMED OUT after {timeout_s:.0f}s")
         log_usage(label, model, None, "timeout", task=task_of(transcript))
         log_failed_call(label, "timeout", "", "", command)
@@ -1142,10 +1185,13 @@ def post_message(raw, rows=None):
     return send_message_id(raw, rows=rows) is not None
 
 
-def edit_message(message_id, raw):
-    """editMessageText as plain text. True when done (or harmlessly unchanged), False on failure,
-    or the seconds Telegram asked us to wait after a 429."""
-    data = urllib.parse.urlencode({"chat_id": cfg("TELEGRAM_CHAT_ID"), "message_id": message_id, "text": redact_secrets(raw)}).encode()
+def edit_message(message_id, raw, rows=None):
+    """editMessageText as plain text, keeping the inline buttons `rows` (an edit without them takes them off). True when
+    done (or harmlessly unchanged), False on failure, or the seconds Telegram asked us to wait after a 429."""
+    params = {"chat_id": cfg("TELEGRAM_CHAT_ID"), "message_id": message_id, "text": redact_secrets(raw)}
+    if rows:
+        params["reply_markup"] = keyboard(rows)
+    data = urllib.parse.urlencode(params).encode()
     try:
         urllib.request.urlopen(telegram_url("editMessageText"), data, timeout=30).close()
         return True
@@ -1237,6 +1283,7 @@ class StatusEditor:
         self.steps = 0
         self.tokens = {}
         self.cost = None
+        self.before_finish = None  # called before the last edit, e.g. to take the buttons off
 
     def feed(self, event):
         """The stream-reader's hook: one parsed event (or None for an unparseable line)."""
@@ -1309,6 +1356,8 @@ class StatusEditor:
         if wait > 0:
             self._sleep(wait)
         cost = f" · ${float(self.cost):.2f}" if self.cost is not None else ""
+        if self.before_finish:
+            self.before_finish()
         self._do_edit(f"{outcome}\n{self.title} · {self._detail()}{cost}")
 
 
@@ -1326,11 +1375,14 @@ def start_status(path, meta):
     """A StatusEditor for this task's worker run, or None when there is nobody to tell (no Telegram, a quiet task)."""
     if meta.get("quiet") == "true" or not (cfg("TELEGRAM_BOT_TOKEN") and cfg("TELEGRAM_CHAT_ID")):
         return None
-    return StatusEditor(
+    live = {"rows": [[("Extend", "extend", path.stem), ("Stop", "stop", path.stem)]]}  # on the message while the worker runs
+    editor = StatusEditor(
         path.name,
-        send=lambda text: send_message_id(text, formatted=False),
-        edit=edit_message,
+        send=lambda text: send_message_id(text, formatted=False, rows=live["rows"]),
+        edit=lambda message_id, text: edit_message(message_id, text, live["rows"]),
     )
+    editor.before_finish = lambda: live.update(rows=None)
+    return editor
 
 
 def fits_in_message(text, limit=REPORT_INLINE_MAX):
@@ -1355,35 +1407,45 @@ def fit_preview(prefix, text, suffix):
         size = int(size * 0.8)
 
 
+class Sent(NamedTuple):
+    message_id: int  # of the first message: 0 when Telegram sent none back, None when nothing was sent
+    refused: list  # the `files` Telegram did not accept, as the paths that were given
+
+
 def send_report(title, text, files=(), task_id="report", root=None, rows=None):
     """Tell the user something. A long `text` becomes a preview plus `<task_id>.md`; `files` follow as documents.
 
     A file Telegram did not accept is named in a follow-up as "not delivered: <path>" (relative to `root` when given).
+    Returns a Sent: the id of the message, which a reply to it can be traced back by, and the files that were refused.
 
     The one way the dispatcher sends done, failed and dependency notices, so
     nothing depends on a path only the machine running the queue can see.
     """
     if not telegram_configured():
-        return
+        return Sent(None, [])
     body = f"{title}\n\n{text}" if title and text else title or text
     attachments = []
     if fits_in_message(body):
-        post_message(body, rows)
+        message_id = send_message_id(body, rows=rows)
     else:
         name = f"{task_id}.md"
         prefix = f"{title}\n\n" if title else ""
-        post_message(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"), rows)
-        attachments.append((f"the full report ({name})", name, redact_secrets(text).encode()))
+        message_id = send_message_id(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"), rows=rows)
+        attachments.append((f"the full report ({name})", name, redact_secrets(text).encode(), None))
     root = Path(root).resolve() if root else None
-    attachments += [(str(path.relative_to(root)) if root and path.is_relative_to(root) else path.name, path.name, path)
+    attachments += [(str(path.relative_to(root)) if root and path.is_relative_to(root) else path.name, path.name, path, path)
                     for path in map(Path, files)]
-    for label, name, source in attachments:
+    refused = []
+    for label, name, source, given in attachments:
         if not post_document(name, source):
             post_message(f"⚠️ Couldn't attach {label}: Telegram refused the upload.\nnot delivered: {label}")
+            if given is not None:
+                refused.append(given)
+    return Sent(message_id, refused)
 
 
 def send_telegram(text, rows=None):
-    send_report("", text, rows=rows)
+    return send_report("", text, rows=rows)
 
 
 # ---------------------------------------------------------------- limits, login, once-only reports
@@ -2112,7 +2174,7 @@ def retry_task(stem):
                 meta = meta or {}
                 meta["attempts"] = "0"
                 for key in ("pending_review", "review_failures", "pending_publish", "publish_failures", "publish_blocked",
-                            "held_until"):
+                            "held_until", "resume_session", "resumes"):
                     meta.pop(key, None)  # a fresh start redoes the work too
                 write_task(path, meta, body)
                 shutil.move(str(path), str(PENDING / path.name))
@@ -2210,7 +2272,11 @@ def spec_digest(meta, body):
     """
     found = DISPATCHER_HEADING.search(body)
     spec = body[:found.start()] if found else body
-    parts = [f"{key}={meta.get(key, '')}" for key in DIGEST_KEYS] + [spec.strip()]
+    parts = [f"{key}={meta.get(key, '')}" for key in DIGEST_KEYS]
+    # what a follow-up pushes to, and the hops a build declares, are covered by the approval; left out when unset so
+    # an approval given before these keys existed still holds
+    parts += [f"{key}={meta[key]}" for key in ("follows", "chain", "chain_rounds") if meta.get(key)]
+    parts.append(spec.strip())
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
@@ -2266,6 +2332,10 @@ def approval_text(stem, meta, body):
         lines.append(f"repo: {meta['repo']} → the result is a draft pull request")
     if meta.get("proposed_by"):
         lines.append(f"Proposed by {meta['proposed_by']} (depth {meta.get('depth', '?')})")
+    if meta.get("follows"):
+        lines.append(f"Continues {meta['follows']}")
+    if meta.get("chain"):
+        lines.append(f"chain: {meta['chain']}, up to {meta.get('chain_rounds', '1')} round(s) of independent testing")
     lines += ["", f"👍 run it · 👎 drop it   (or /approve {stem} · /reject {stem})"]
     return "\n".join(lines)
 
@@ -2450,11 +2520,10 @@ def task_status(stem):
     for marker, text in (("pending_publish", "finished and checked; waiting to publish"), ("held_until", f"held until {meta.get('held_until')}")):
         if meta.get(marker):
             lines.append(text)
-    outcomes = list(re.finditer(r"^## (Result \(.*?\)|Attempt \d+ Feedback.*?|Dependency Failed.*?|Invalid Task.*?|Cancelled.*?|Publish failed.*?)$\s*(.*?)(?=^## |\Z)",
-                                body, re.M | re.S))
-    if outcomes:
-        last = outcomes[-1]
-        lines.append(f"{last.group(1).split(' (')[0].lower()}: {short(' '.join(last.group(2).split()), 600)}")
+    if label in FINISHED and (record := load_outcome(stem)):
+        lines.append("outcome: " + outcomes.describe(record) + (f", ${record['cost_usd']:.2f}" if record.get("cost_usd") else ""))
+    if section := last_section(body):
+        lines.append(f"{section[0].split(' (')[0].lower()}: {short(' '.join(section[1].split()), 600)}")
     return True, "\n".join(lines)
 
 
@@ -2563,6 +2632,837 @@ def queued_like(prefix, needle=""):
     return None
 
 
+# ------------------------------------------------ outcomes and follow-ups
+#
+# When a task ends, state/outcomes/<id>.json records what it produced (see taskq_lib/outcomes.py), and a task with
+# `follows: <id>` starts from that record. A pull request is only one kind of result: the same machinery continues a
+# research report, a delivered file or a failed attempt. The record is written by the dispatcher, never by the worker.
+
+FINISHED = ("done", "failed", "cancelled")
+REPORT_KEEP_CHARS = 200_000  # the report kept for a follow-up; longer ones are cut
+FOLLOW_REPORT_CHARS = 20_000  # how much of it a follow-up's worker is shown
+LAST_SECTION = re.compile(
+    r"^## (Result \(.*?\)|Attempt \d+ Feedback.*?|Dependency Failed.*?|Invalid Task.*?|Cancelled.*?|Publish failed.*?)$\s*(.*?)(?=^## |\Z)",
+    re.M | re.S)
+
+
+def outcome_path(stem):
+    return OUTCOMES / f"{safe_stem(stem)}.json"
+
+
+def report_path(stem):
+    return OUTCOMES / f"{safe_stem(stem)}.report.md"
+
+
+def read_outcome(stem):
+    try:
+        data = json.loads(outcome_path(stem).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_outcome(stem, record, report=None):
+    write_atomic(outcome_path(stem), json.dumps(record))
+    if report is not None:
+        write_atomic(report_path(stem), report[:REPORT_KEEP_CHARS])
+
+
+def task_cost(stem):
+    """Dollars this task's claude calls cost, from the usage log."""
+    return round(sum(cost for _, record, cost in usage_costs(usage_records()) if record.get("task") == stem), 4)
+
+
+def last_section(body):
+    """(heading, text) of the last result, feedback or failure section the dispatcher wrote into a task, or None."""
+    found = list(LAST_SECTION.finditer(body or ""))
+    return (found[-1].group(1), found[-1].group(2).strip()) if found else None
+
+
+def record_outcome(path, meta, status, report="", summary_text="", files=None, pr_url=None, message_ids=(), deferred=None):
+    """Write the outcome of the task that just ended. `report` is what it produced (the worker's answer);
+    `summary_text` is what the summary is cut from when that is not the report (a failure's feedback). Never raises:
+    a task that finished must not fail because its record could not be written."""
+    stem = path.stem
+    try:
+        text = redact_secrets((report or "").strip())
+        built = outcomes.build({"report": text, "files": files or [], "pr_url": pr_url, "branch": meta.get("branch"),
+                                "deferred": deferred})
+        worktree = worktree_path(work_stem(meta, stem)) if meta.get("repo") else None
+        record = {
+            "task": stem, "status": status, **built,
+            "summary": outcomes.summarize(redact_secrets(summary_text) if summary_text else text),
+            "session_id": meta.get("session_id"), "cwd": str(worktree) if worktree else task_cwd(meta),
+            "worktree": str(worktree) if worktree else None, "cost_usd": task_cost(stem), "finished": now_iso(),
+            "message_ids": [m for m in message_ids if m], "follows": meta.get("follows") or None,
+            "revisit": meta.get("revisit") or None, "revisit_task": meta.get("revisit_task") or None,
+        }
+        write_outcome(stem, record, text or redact_secrets(summary_text).strip())
+    except OSError as exc:
+        log.warning("Could not write the outcome of %s: %s", stem, exc)
+
+
+def derive_outcome(stem):
+    """The outcome of a finished task that never got one (it ended before outcomes existed, or was cancelled), worked
+    out from its file. None when the task is not finished or not in the queue."""
+    label, path = find_state(stem)
+    if label not in FINISHED:
+        return None
+    meta, body = parse_task(path)
+    meta = meta or {}
+    section = last_section(body)
+    text = section[1] if section else ""
+    done = label == "done"
+    built = outcomes.build({"report": text if done else "", "files": [], "pr_url": meta.get("pr_url"),
+                            "branch": meta.get("branch")})
+    return {
+        "task": stem, "status": label, **built, "summary": outcomes.summarize(text), "session_id": meta.get("session_id"),
+        "cwd": task_cwd(meta), "worktree": None, "cost_usd": None,  # not worked out: it would read the whole usage log
+        "finished": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime(ISO_FMT), "message_ids": [],
+        "follows": meta.get("follows") or None, "derived": True,
+    }
+
+
+def load_outcome(stem):
+    """The outcome of a finished task: its record, or one worked out from its file. None for a task that is not finished."""
+    stem = clean_stem(stem or "")
+    if not stem or not SAFE_NAME.match(stem):
+        return None
+    record = read_outcome(stem)
+    label, _ = find_state(stem)
+    if record is not None and (label in FINISHED or label is None):  # a retried task is not finished any more
+        return record
+    return derive_outcome(stem)
+
+
+def outcome_text(stem):
+    """The saved report of a finished task (or, for a failure, its last feedback), for a follow-up to read."""
+    try:
+        return report_path(stem).read_text()
+    except OSError:
+        label, path = find_state(stem)
+        section = last_section(parse_task(path)[1]) if label in FINISHED else None
+        return redact_secrets(section[1]) if section else ""
+
+
+def outcome_for_message(message_id):
+    """The task whose result was announced as Telegram message `message_id`, or None."""
+    if not message_id or not OUTCOMES.is_dir():
+        return None
+    for ledger in OUTCOMES.glob("*.json"):
+        try:
+            record = json.loads(ledger.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and message_id in (record.get("message_ids") or []):
+            return record.get("task")
+    return None
+
+
+def finished_tasks(limit=10):
+    """The stems of the last `limit` finished tasks (done, failed, cancelled), newest first."""
+    files = [p for directory in (DONE, FAILED, CANCELLED) for p in directory.glob("*.md")]
+    files.sort(key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+    return [p.stem for p in files[:limit]]
+
+
+def finished_tasks_text(limit=10):
+    """What /tasks and a bare /continue say: the last finished tasks and what each made."""
+    stems = finished_tasks(limit)
+    if not stems:
+        return "No finished tasks yet."
+    lines = [f"Last {len(stems)} finished task{'s' if len(stems) != 1 else ''}, newest first:"]
+    for stem in stems:
+        record = load_outcome(stem)
+        lines.append(f"- {stem}: {outcomes.describe(record) if record else '?'}")
+    lines.append("Reply to a result, or send /continue <id> <what to change>.")
+    return "\n".join(lines)
+
+
+def max_follow_depth():
+    return int(cfg("MAX_FOLLOW_DEPTH", "3") or 0)
+
+
+def parent_of(stem):
+    """The task `stem` follows, or None."""
+    path = find_task(stem)
+    meta = parse_task(path)[0] if path else None
+    parent = (meta or {}).get("follows") or (read_outcome(stem) or {}).get("follows")
+    return clean_stem(parent) if parent else None
+
+
+def follows_problems(meta):
+    """Why a task's `follows:` cannot be honoured (empty when it can, or when there is none)."""
+    parent = clean_stem((meta or {}).get("follows") or "")
+    if not parent:
+        return []
+    if not SAFE_NAME.match(parent):
+        return [f"follows '{parent}' is not a task id"]
+    label, _ = find_state(parent)
+    if label is not None and label not in FINISHED:
+        return [f"follows '{parent}', which is not finished (it is in tasks/{label}/)"]
+    if load_outcome(parent) is None:
+        return [f"follows '{parent}', which is not a task in the queue"]
+    depth, limit = followups.depth_of(parent, parent_of) + 1, max_follow_depth()
+    if limit > 0 and depth > limit:
+        return [f"this follow-up would be {depth} links deep, past MAX_FOLLOW_DEPTH={limit}"]
+    return []
+
+
+def count_followups(parent, excluding=None):
+    """Tasks that follow `parent`, wherever they have got to."""
+    return sum(1 for directory in TASK_DIRS for file in directory.glob("*.md")
+               if file.stem != excluding and (parse_task(file)[0] or {}).get("follows") == parent)
+
+
+def followup_cap_problem(parent, stem=None):
+    cap = int(cfg("MAX_FOLLOWUPS_PER_TASK", "5") or 0)
+    if cap > 0 and count_followups(parent, stem) >= cap:
+        return f"'{parent}' already has {cap} follow-ups (MAX_FOLLOWUPS_PER_TASK); start a new task instead"
+    return None
+
+
+def admit_followup(name, meta, body, force_gate=False):
+    """Put a follow-up through the same door as any task a program writes: it waits for approval if its tier says so,
+    or always when `force_gate` is set."""
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / f"{name}.md"
+        write_task(staged, meta, body)
+        return enqueue_task(str(staged), force_gate=force_gate)
+
+
+@audited("continue")
+def create_followup(parent, text, source="user", criteria=None):
+    """Queue a task that continues the finished task `parent` with the instruction `text`. Returns (ok, message).
+
+    From the person themself (`source="user"`: /continue, a reply to a result, a 👎) it runs without a second approval,
+    because it inherits the tools and places of a task they already let run and the instruction is theirs. Anything
+    else (a review comment, an issue, a date that came round, the coordinator) lands in proposed/ and waits for a 👍
+    whatever its tier: the text behind it was not typed by the person.
+    """
+    parent = clean_stem(parent or "")
+    text = (text or "").strip()
+    if not parent or not SAFE_NAME.match(parent):
+        return False, "Give a task id (see /tasks)."
+    label, path = find_state(parent)
+    if label is not None and label not in FINISHED:
+        return False, f"'{parent}' is not finished yet (it is in tasks/{label}/)."
+    record = load_outcome(parent)
+    if record is None:
+        return False, f"No task named '{parent}' (see /tasks)."
+    if path is None:
+        return False, f"'{parent}' is no longer in the queue, so there is nothing to continue from."
+    if not text:
+        return False, f"What should change? Send /continue {parent} <what to change>."
+    if "pr" in (record.get("kinds") or []) and record.get("merged"):
+        return False, f"The pull request of '{parent}' was merged; start a new task from main instead."
+    if problems := follows_problems({"follows": parent}):
+        return False, problems[0]
+    if problem := followup_cap_problem(parent):
+        return False, problem
+    parent_meta, parent_body = parse_task(path)
+    meta, body = followups.build(parent_meta or {}, parent_body, text, parent, criteria)
+    taken = {file.stem for directory in TASK_DIRS for file in directory.glob("*.md")}
+    name = followups.name_for(parent, taken)
+    ok, message = queue_confirmed(name, meta, body) if source == "user" else admit_followup(name, meta, body, force_gate=True)
+    if not ok:
+        return False, message
+    log.info("Follow-up %s of %s queued (%s)", name, parent, source)
+    return True, f"Queued {name}: it continues {parent}. {message if source != 'user' else 'It runs next.'}"
+
+
+def follow_note(meta):
+    """What the worker of a follow-up is told about the task it continues ('' for any other task)."""
+    parent = clean_stem((meta or {}).get("follows") or "")
+    record = load_outcome(parent) if parent else None
+    if record is None:
+        return ""
+    return followups.prompt_note(record, outcome_text(parent)[:FOLLOW_REPORT_CHARS])
+
+
+def continuing_pr(meta):
+    """The pull request a follow-up updates: the first one up its chain of `follows`, or None for any other task."""
+    parent, seen = clean_stem((meta or {}).get("follows") or ""), set()
+    while parent and parent not in seen:
+        seen.add(parent)
+        if ref := ((load_outcome(parent) or {}).get("refs") or {}).get("pr"):
+            return ref
+        parent = parent_of(parent)
+    return None
+
+
+def work_stem(meta, stem):
+    """The task whose worktree and branch `stem` works on: its own, or, for a follow-up on the same repo, the first task
+    of its chain, so the follow-up's commits land on the branch that already has the work."""
+    seen = {stem}
+    while meta and meta.get("repo") and (parent := clean_stem(meta.get("follows") or "")) and parent not in seen:
+        path = find_task(parent)
+        parent_meta = parse_task(path)[0] if path else None
+        if not parent_meta or parent_meta.get("repo") != meta.get("repo"):
+            break
+        seen.add(parent)
+        stem, meta = parent, parent_meta
+    return stem
+
+
+# ------------------------------------------------ what happens after a result: the feedback sources
+#
+# A source turns something that happened after a task finished into housekeeping or a candidate follow-up, and has its
+# own switch in FOLLOWUP_SOURCES. A candidate drawn from outside text (a review, an issue comment) always lands in
+# tasks/proposed/ for your 👍: its words go into the follow-up inside the <external_input> fence, only the authors in
+# FOLLOWUP_AUTHORS count, and the follow-up gets exactly its parent's tools. The queue never merges, closes, deletes a
+# remote branch or sends anything on your behalf here; the `merged` source only tidies what is local.
+
+FOLLOWUP_POLL_FILE = STATE / "followup_poll.json"  # {url: when it was last asked about}
+FOLLOWUP_SEEN_FILE = STATE / "followup_seen.json"  # {url: [keys of the comments already turned into a follow-up]}
+REVISITS_FILE = STATE / "revisits.json"  # {task: {"sent": when, "done": bool}}
+GH_POLL_TIMEOUT = 45
+REVISIT_TEXT = ("Time has passed since the last result. Check again whether anything has changed since then, and "
+                "report only what is different. If nothing changed, say so in one line.")
+
+
+def load_json(path, default):
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+    return data if isinstance(data, type(default)) else default
+
+
+def followup_sources():
+    return {name.strip().lower() for name in cfg("FOLLOWUP_SOURCES", "merged,pr,issue,revisit").split(",") if name.strip()}
+
+
+def gh_json(cwd, *args):
+    """The JSON a gh command printed, or None when it failed or printed something else (try again next poll)."""
+    proc = gh_run(cwd, *args, timeout=GH_POLL_TIMEOUT)
+    if proc.returncode != 0:
+        log.info("gh %s did not answer: %s", " ".join(args[:2]), tail(proc.stderr or proc.stdout, 200))
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return None
+
+
+def github_ref(url, kind):
+    """(owner/name, number) of a GitHub pull request or issue URL, else (None, None)."""
+    found = re.match(rf"https://github\.com/([A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*)/{kind}/(\d+)", url or "")
+    return (found.group(1), int(found.group(2))) if found else (None, None)
+
+
+def poll_due(key):
+    """True when `key` (a URL) may be asked about again: not before FOLLOWUP_POLL_MINUTES since the last time."""
+    minutes = float(cfg("FOLLOWUP_POLL_MINUTES", "10") or 0)
+    polled, now = load_json(FOLLOWUP_POLL_FILE, {}), time.time()
+    if minutes > 0 and now - float(polled.get(key) or 0) < minutes * 60:
+        return False
+    polled[key] = now
+    write_atomic(FOLLOWUP_POLL_FILE, json.dumps({k: v for k, v in polled.items() if now - float(v) < 30 * 86400}))
+    return True
+
+
+def all_outcomes():
+    """Every outcome record, newest first."""
+    records = []
+    for file in OUTCOMES.glob("*.json") if OUTCOMES.is_dir() else ():
+        try:
+            record = json.loads(file.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and record.get("task"):
+            records.append(record)
+    return sorted(records, key=lambda r: r.get("finished") or "", reverse=True)
+
+
+def flag_outcomes(stems, **flags):
+    for stem in stems:
+        if record := read_outcome(stem):
+            write_outcome(stem, {**record, **flags})
+
+
+def merge_wait(meta):
+    """('waiting' | 'closed', task) for the first `after_merge` task whose pull request has not merged; None when all have."""
+    for dep in [clean_stem(d) for d in (meta or {}).get("after_merge", "").split(",") if d.strip()]:
+        record = read_outcome(dep) or {}
+        if record.get("merged"):
+            continue
+        return ("closed" if record.get("closed") else "waiting"), dep
+    return None
+
+
+def pr_merged(repo, url, records, info):
+    """You merged a pull request: say so in its outcomes, and tidy what is local (its worktree and branch)."""
+    stems = [r["task"] for r in records]
+    flag_outcomes(stems, merged=True, merged_at=info.get("mergedAt") or now_iso())
+    branch = ((records[0].get("refs") or {}).get("pr") or {}).get("branch")
+    for record in records:
+        worktree = Path(record["worktree"]) if record.get("worktree") else None
+        if worktree and worktree.exists():
+            git_run(repo, "worktree", "remove", "--force", str(worktree))
+            shutil.rmtree(worktree, ignore_errors=True)
+    git_run(repo, "worktree", "prune")
+    if branch and branch.startswith("task/"):
+        git_run(repo, "branch", "-D", branch)
+    released = sorted(p.stem for p in PENDING.glob("*.md") if set(stems) & {clean_stem(d) for d in (parse_task(p)[0] or {}).get("after_merge", "").split(",")})
+    log.info("Pull request %s was merged; tidied %s, released %s", url, branch, ", ".join(released) or "nothing")
+    if released:
+        send_telegram(f"🔀 {url} was merged. Released: {', '.join(released)}.")
+
+
+def propose_from_batch(parent, batch, spec, criteria, url, source):
+    """Turn one batch of feedback into a proposal that follows `parent`. Returns True once it exists."""
+    ok, message = create_followup(parent, spec, source=source, criteria=criteria)
+    if not ok:
+        log.info("No follow-up for %s on %s: %s", batch["kind"], url, message)
+        report_once(f"followup-skipped|{url}", message, f"{url}: no follow-up made: {message}",
+                    f"ℹ️ New feedback on {url} did not become a follow-up: {message}")
+    return ok
+
+
+def pr_feedback(repo, url, info, parent):
+    """New review comments, comments and failing checks on an open pull request, as proposals that follow `parent`."""
+    authors = sources.parse_authors(cfg("FOLLOWUP_AUTHORS"))
+    slug, number = github_ref(url, "pull")
+    if not authors or not slug:
+        return
+    seen_all = load_json(FOLLOWUP_SEEN_FILE, {})
+    seen = set(seen_all.get(url, []))
+    fetched = {name: gh_json(repo, "api", f"repos/{slug}/{path}/{number}/{leaf}")
+               for name, path, leaf in (("reviews", "pulls", "reviews"), ("inline", "pulls", "comments"), ("talk", "issues", "comments"))}
+    as_list = lambda value: value if isinstance(value, list) else []  # noqa: E731
+    backlog = cfg("BACKLOG_FILE", "ROADMAP.md")
+    work = [(b, sources.review_spec(url, b, backlog), sources.REVIEW_CRITERIA)
+            for b in sources.review_batches(as_list(fetched["reviews"]), as_list(fetched["inline"]), authors, seen)]
+    work += [(b, sources.review_spec(url, b, backlog), sources.REVIEW_CRITERIA)
+             for b in sources.talk_batch(as_list(fetched["talk"]), authors, seen)]
+    work += [(b, sources.checks_spec(url, b), sources.CHECKS_CRITERIA)
+             for b in sources.checks_batch(info.get("statusCheckRollup"), info.get("headRefOid"), seen)]
+    for batch, spec, criteria in work:
+        if propose_from_batch(parent, batch, spec, criteria, url, "pr"):
+            seen_all[url] = sources.remember(seen_all.get(url, []), batch["keys"])
+            write_atomic(FOLLOWUP_SEEN_FILE, json.dumps(seen_all))
+
+
+def poll_pull_requests(on):
+    open_prs = {}
+    for record in all_outcomes():
+        ref = (record.get("refs") or {}).get("pr")
+        if ref and not record.get("merged") and not record.get("closed"):
+            open_prs.setdefault(ref["url"], []).append(record)
+    for url, records in open_prs.items():
+        parent = records[0]["task"]
+        path = find_task(parent)
+        meta = parse_task(path)[0] if path else None
+        if not meta or not meta.get("repo") or repo_problem(meta) or not poll_due(url):
+            continue
+        repo = repo_path(meta)
+        info = gh_json(repo, "pr", "view", url, "--json", "number,state,mergedAt,isDraft,headRefName,headRefOid,statusCheckRollup")
+        if not isinstance(info, dict):
+            continue
+        state = str(info.get("state") or "").upper()
+        if state == "MERGED":
+            if "merged" in on:
+                pr_merged(repo, url, records, info)
+        elif state == "CLOSED":  # nothing to tidy and nothing more to ask: stop polling it
+            flag_outcomes([r["task"] for r in records], closed=True)
+        elif "pr" in on:
+            pr_feedback(repo, url, info, parent)
+
+
+def poll_issues():
+    authors = sources.parse_authors(cfg("FOLLOWUP_AUTHORS"))
+    if not authors:
+        return
+    for record in all_outcomes():
+        for ref in (record.get("refs") or {}).get("issue") or []:
+            url, slug_number = ref["url"], github_ref(ref["url"], "issues")
+            if not slug_number[0] or url in (record.get("issues_closed") or []) or not poll_due(url):
+                continue
+            info = gh_json(BASE, "issue", "view", url, "--json", "state,number")
+            if not isinstance(info, dict):
+                continue
+            if str(info.get("state") or "").upper() != "OPEN":
+                flag_outcomes([record["task"]], issues_closed=[*(record.get("issues_closed") or []), url])
+                continue
+            seen_all = load_json(FOLLOWUP_SEEN_FILE, {})
+            comments = gh_json(BASE, "api", f"repos/{slug_number[0]}/issues/{slug_number[1]}/comments")
+            for batch in sources.talk_batch(comments if isinstance(comments, list) else [], authors, set(seen_all.get(url, [])),
+                                            kind="issue comment"):
+                if propose_from_batch(record["task"], batch, sources.issue_spec(url, batch), sources.ISSUE_CRITERIA, url, "issue"):
+                    seen_all[url] = sources.remember(seen_all.get(url, []), batch["keys"])
+                    write_atomic(FOLLOWUP_SEEN_FILE, json.dumps(seen_all))
+
+
+def queue_revisit_task(stem, ref):
+    """Run the task file `ref` (under tasks/) again because the revisit time came, instead of asking."""
+    template = (BASE / ref).resolve()
+    if not template.is_relative_to(TASKS.resolve()) or not template.is_file():
+        log.warning("revisit_task %s of %s is not a file under tasks/", ref, stem)
+        return False
+    probe = TASKS / f".revisit-{os.getpid()}.md"
+    probe.write_text(template.read_text().replace("__QUEUE_DIR__", str(BASE)))
+    try:
+        meta, body = parse_task(probe)
+    finally:
+        probe.unlink(missing_ok=True)
+    if meta is None:
+        return False
+    for key in ("schedule", "last_run"):
+        meta.pop(key, None)
+    meta["attempts"] = "0"
+    ok, message = admit_followup(f"{stem}-revisit-{datetime.now().strftime('%Y%m%d-%H%M%S')}", meta, body)
+    log.info("Revisit of %s: %s", stem, message)
+    return ok
+
+
+def poll_revisits():
+    state, now = load_json(REVISITS_FILE, {}), datetime.now(timezone.utc)
+    for record in all_outcomes():
+        stem, spec = record["task"], record.get("revisit")
+        seconds = sources.duration_seconds(spec) if spec else None
+        if not seconds or record.get("status") != "done" or stem in state:
+            continue
+        try:
+            due = datetime.strptime(record["finished"], ISO_FMT).replace(tzinfo=timezone.utc) + timedelta(seconds=seconds)
+        except (KeyError, ValueError):
+            continue
+        if now < due:
+            continue
+        state[stem] = {"sent": now_iso()}
+        write_atomic(REVISITS_FILE, json.dumps(state))
+        if record.get("revisit_task") and queue_revisit_task(stem, record["revisit_task"]):
+            continue
+        send_telegram(f"⏰ Time to look again at {stem}: {record.get('summary') or '(no summary)'}",
+                      rows=[[("Continue", "revisit", stem), ("Done", "revisit_done", stem)]])
+
+
+def revisit_continue(stem):
+    """The Continue button on a revisit nudge: a proposal that follows the task and asks what changed."""
+    return create_followup(stem, REVISIT_TEXT, source="revisit")
+
+
+def revisit_done(stem):
+    state = load_json(REVISITS_FILE, {})
+    state[clean_stem(stem)] = {**state.get(clean_stem(stem), {}), "done": True}
+    write_atomic(REVISITS_FILE, json.dumps(state))
+    return True, f"Okay. I won't bring {stem} up again."
+
+
+def poll_followups():
+    """Ask about everything that can still change after a result. Each source is separate, switched on in
+    FOLLOWUP_SOURCES, and a failure in one never stops the cycle."""
+    on = followup_sources()
+    for names, run in ((("merged", "pr"), lambda: poll_pull_requests(on)), (("issue",), poll_issues), (("revisit",), poll_revisits)):
+        if on & set(names):
+            try:
+                run()
+            except Exception:  # noqa: BLE001 - housekeeping must never fail a cycle
+                log.exception("Follow-up source %s failed", "/".join(names))
+
+
+def backlog_items(meta, stem):
+    """The lines a repo task added to BACKLOG_FILE in its worktree, compared with what its branch already had pushed."""
+    name = cfg("BACKLOG_FILE", "ROADMAP.md")
+    keep = work_stem(meta, stem)
+    worktree, branch, repo = worktree_path(keep), branch_name(keep), repo_path(meta)
+    if not (worktree / ".git").exists():
+        return []
+    since = base_ref(repo, meta)
+    if continuing_pr(meta) and git_run(worktree, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}").returncode == 0:
+        since = f"origin/{branch}"
+    git_run(worktree, "add", "-A", "--", name)
+    diff = git_run(worktree, "diff", since, "--", name).stdout
+    return [line[1:].strip()[:200] for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++")
+            and line[1:].strip()][:20]
+
+
+def backlog_text():
+    """What /backlog says: items tasks deferred (with the file and commit) and proposals still waiting for a 👍."""
+    lines = []
+    for record in all_outcomes():
+        ref = (record.get("refs") or {}).get("deferred")
+        if not ref:
+            continue
+        pr = ((record.get("refs") or {}).get("pr") or {}).get("url")
+        lines.append(f"- {record['task']}: {ref['file']} @ {str(ref.get('commit') or '?')[:7]}" + (f" ({pr})" if pr else ""))
+        lines += [f"    {item}" for item in (ref.get("items") or [])[:5]]
+        if len(lines) > 40:
+            break
+    waiting = sorted(p.stem for p in PROPOSED.glob("*.md"))
+    if waiting:
+        lines.append(f"Waiting for your 👍 ({len(waiting)}): " + ", ".join(waiting[:10]) + (" ..." if len(waiting) > 10 else ""))
+    return "Backlog\n" + "\n".join(lines) if lines else "Nothing deferred and nothing waiting for a 👍."
+
+
+# ------------------------------------------------ long-running tasks: resume, extend, stop, stall
+#
+# A timeout is not a failure of the work. While a worker call runs, CallControl watches its stream: it remembers the
+# claude session (also written to the task file at once, so a crash can still resume it), counts tool calls (progress),
+# lets /extend and /stop reach the call through state/control/<id>.json, and raises one alert when the call goes quiet.
+
+CONTROL = STATE / "control"  # one <task>.json per running task; the bridge writes it, the dispatcher reads it
+RESUME_PROMPT = (
+    "You ran out of time (or were interrupted) before you finished. Carry on from exactly where you stopped; do not "
+    "start over. Finish the task as it was first described. If it is already finished, say so and give the final report."
+)
+RESUME_GONE_RE = re.compile(r"no conversation found|session.{0,40}(?:not found|expired|does not exist)", re.I)
+PARTIAL_KEEP = 3000  # characters of what a worker had said so far, kept when it is stopped
+
+
+def control_path(stem):
+    return CONTROL / f"{safe_stem(stem)}.json"
+
+
+def read_control(stem):
+    return load_json(control_path(stem), {})
+
+
+def write_control(stem, data):
+    write_atomic(control_path(stem), json.dumps(data))
+
+
+def clear_control(stem):
+    control_path(stem).unlink(missing_ok=True)
+
+
+def running_task(stem):
+    path = ACTIVE / f"{clean_stem(stem or '')}.md"
+    return path if SAFE_NAME.match(path.stem or "/") and path.is_file() else None
+
+
+@audited("extend")
+def request_extend(stem, minutes):
+    """Give the running task more time, up to MAX_TIMEOUT_MINUTES in all. Returns (ok, message)."""
+    stem = clean_stem(stem or "")
+    if not (path := running_task(stem)):
+        return False, f"'{stem}' is not running right now."
+    try:
+        asked = float(minutes) * 60
+    except (TypeError, ValueError):
+        return False, "Give the number of minutes to add."
+    if asked <= 0:
+        return False, "Give a number of minutes above 0."
+    base = float((parse_task(path)[0] or {}).get("timeout_minutes") or cfg("DEFAULT_TIMEOUT_MINUTES", "30")) * 60
+    cap = float(cfg("MAX_TIMEOUT_MINUTES", "240")) * 60
+    control = read_control(stem)
+    have = float(control.get("extend_s") or 0)
+    add = min(asked, max(0.0, cap - base - have))
+    if add <= 0:
+        return False, f"{stem} already has the most time it can get ({cap / 60:g} minutes, MAX_TIMEOUT_MINUTES)."
+    write_control(stem, {**control, "extend_s": have + add})
+    note = f" (capped at {cap / 60:g} minutes)" if add < asked else ""
+    return True, f"Added {add / 60:g} minutes to {stem}; it now has {(base + have + add) / 60:g}{note}."
+
+
+@audited("stop")
+def request_stop(stem):
+    """End the running task cleanly. What it had said stays as a result you can continue. Returns (ok, message)."""
+    stem = clean_stem(stem or "")
+    if not running_task(stem):
+        return False, f"'{stem}' is not running right now."
+    write_control(stem, {**read_control(stem), "stop": True})
+    return True, f"Stopping {stem}. It ends within a few seconds and keeps what it had so far."
+
+
+@audited("wait")
+def request_wait(stem):
+    """Keep waiting on a quiet task: the quiet timer starts again. Returns (ok, message)."""
+    stem = clean_stem(stem or "")
+    if not running_task(stem):
+        return False, f"'{stem}' is not running right now."
+    write_control(stem, {**read_control(stem), "snooze_at": now_iso() + f"/{time.monotonic():.3f}"})
+    return True, f"Okay, I'll keep waiting on {stem}."
+
+
+def remember_session(path, session_id):
+    """Write the session of the running worker into its task file now, so a crash or a restart can resume it."""
+    try:
+        meta, body = parse_task(path)
+        if meta is not None and path.exists():
+            meta["session_id"] = meta["resume_session"] = session_id
+            write_task(path, meta, body)
+    except OSError as exc:
+        log.warning("Could not record the session of %s: %s", path.name, exc)
+
+
+def stream_tail(path, limit=40):
+    """The last steps of a worker's stream as plain lines (the tool and its target, or what it said): what it had done."""
+    lines = []
+    try:
+        raw_lines = path.read_text().splitlines()[-600:]
+    except OSError:
+        return ""
+    for raw in raw_lines:
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        if info := describe_event(event):
+            lines.append(f"- {info['tool']} {info.get('target') or ''}".rstrip())
+        elif isinstance(event, dict) and event.get("type") == "assistant":
+            said = " ".join(b.get("text", "") for b in (event.get("message") or {}).get("content") or []
+                            if isinstance(b, dict) and b.get("type") == "text").strip()
+            if said:
+                lines.append("- said: " + short(" ".join(said.split()), 200))
+    return "\n".join(lines[-limit:])
+
+
+class CallControl:
+    """The watcher of one worker call. It passes every event on to the live status message, and also: remembers the claude
+    session, counts tool calls (a call that made some made progress), applies /extend and /stop, and sends one alert when
+    the call has made no tool call for STALL_MINUTES."""
+
+    def __init__(self, inner, stem, on_session=None, clock=time.monotonic):
+        self.inner, self.stem, self.on_session, self.clock = inner, stem, on_session, clock
+        self.session_id = None
+        self.tools = 0
+        self.said = ""
+        self.last_tool = clock()
+        self.alerted = False
+        self.applied_s = 0.0
+        self.snoozed = None
+        self.next_poll = 0.0
+        self.stall_s = float(cfg("STALL_MINUTES", "10") or 0) * 60
+
+    def feed(self, event):
+        if isinstance(event, dict):
+            if (session := event.get("session_id")) and session != self.session_id:
+                self.session_id = session
+                if self.on_session:
+                    self.on_session(session)
+            if describe_event(event):
+                self.tools += 1
+                self.last_tool, self.alerted = self.clock(), False
+            if event.get("type") == "assistant":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        self.said = (self.said + "\n" + block.get("text", "")).strip()[-PARTIAL_KEEP:]
+        self.inner.feed(event)
+
+    def tick(self):
+        self.inner.tick()
+        quiet = self.clock() - self.last_tool
+        if self.stall_s > 0 and not self.alerted and quiet >= self.stall_s:
+            self.alerted = True
+            send_telegram(
+                f"⏳ {self.stem} has gone quiet: no tool call for {clock_text(quiet)}. It may be stuck or only thinking.",
+                rows=[[("Extend", "extend", self.stem), ("Stop", "stop", self.stem), ("Keep waiting", "wait", self.stem)]])
+
+    def poll(self):
+        """(seconds to add to the deadline, whether /stop was asked), looking at the control file about once a second."""
+        now = self.clock()
+        if now < self.next_poll:
+            return 0.0, False
+        self.next_poll = now + 1.0
+        control = read_control(self.stem)
+        total = float(control.get("extend_s") or 0)
+        extra, self.applied_s = total - self.applied_s, total
+        if control.get("snooze_at") and control["snooze_at"] != self.snoozed:
+            self.snoozed, self.last_tool, self.alerted = control["snooze_at"], now, False
+        return max(0.0, extra), bool(control.get("stop"))
+
+
+def stop_task(path, meta, body, control):
+    """/stop reached the running task: end it cleanly as cancelled, keep what it had said as a result to continue from."""
+    stem, said = path.stem, redact_secrets(control.said)
+    if control.session_id:
+        meta["session_id"] = control.session_id
+    meta.pop("resume_session", None)
+    body = body.rstrip("\n") + f"\n\n## Cancelled ({now_iso()})\n\nStopped from the phone while it was running.\n"
+    if said:
+        body += f"\nWhat it had said so far:\n\n{said}\n"
+    write_task(path, meta, body)
+    dest = CANCELLED / path.name
+    if dest.exists():
+        dest = CANCELLED / f"{path.stem}.cancelled-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+    shutil.move(str(path), str(dest))
+    clear_control(stem)
+    log.info("Task %s was stopped on request", path.name)
+    sent = send_report(f"⏹ Stopped: {path.name}\nYou can carry on from here with /continue {stem} <what to do next>.",
+                       said or "(it had said nothing yet)", task_id=stem)
+    record_outcome(path, meta, "cancelled", report=said, summary_text=said or "Stopped before it said anything.",
+                   message_ids=[sent.message_id])
+
+
+# ------------------------------------------------ chains: build, test, fix, test again
+#
+# A repo task with `chain: test` is followed by an independent tester on the same branch (read-only tools, the
+# playbook in .claude/skills/chain-tester/). A tester that finds problems gets a fixer queued, built here from the
+# approved build task and fixed wording, never from text a worker wrote; the findings travel inside the fence. The loop
+# ends when the tester finds nothing or `chain_rounds` (capped by MAX_CHAIN_ROUNDS) run out. One 👍 on the build covers
+# the hops it declared; a hop that needs a tool or a tier beyond the build's waits for a 👍 like any task.
+
+CHAIN_PLAYBOOK = BASE / ".claude" / "skills" / "chain-tester" / "SKILL.md"
+FENCED = re.compile(r"<external_input source=[^>]*>\n(.*?)\n</external_input>", re.S)
+
+
+def chain_playbook():
+    try:
+        text = CHAIN_PLAYBOOK.read_text()
+    except OSError:
+        return "Check each acceptance criterion by reading the changed files, and report what is wrong."
+    return re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.S).strip()
+
+
+def chain_stop(root, headline, detail=""):
+    send_report(headline, detail, task_id=f"{root}-chain") if detail else send_telegram(headline)
+
+
+def queue_chain_hop(role, parent, root, round_no, rounds, findings=None):
+    """Queue the next hop of a chain. Returns True when it was queued (or is waiting for a 👍)."""
+    root_path, parent_path = find_task(root), find_task(parent)
+    if root_path is None or parent_path is None:
+        chain_stop(root, f"⚠️ {root}: the chain stopped because a task in it is gone.")
+        return False
+    root_meta, root_body = parse_task(root_path)
+    meta, _ = followups.build(root_meta, root_body, "", parent)
+    meta.update({"chain_hop": role, "chain_round": str(round_no), "chain_root": root, "chain_rounds": str(rounds),
+                 "quiet": "true"})
+    if role == "tester":
+        meta["allowed_tools"] = chain.TESTER_TOOLS
+        for key in ("verify", "deliver"):
+            meta.pop(key, None)
+        body = chain.tester_body(chain_playbook(), root, extract_criteria(root_body) or "")
+    else:
+        body = chain.fixer_body(root, findings or "", round_no)
+    name = followups.name_for(parent, {file.stem for directory in TASK_DIRS for file in directory.glob("*.md")})
+    problem = (follows_problems(meta) or [None])[0] or followup_cap_problem(parent)
+    if problem:
+        left = findings or "\n".join(FENCED.findall(parse_task(parent_path)[1]))  # a fixer's body holds what it fixed
+        chain_stop(root, f"⚠️ {root}: the chain stopped before its next test: {problem}. "
+                         + ("The last findings:" if findings else "What the fixer was asked to fix:"), left)
+        return False
+    within = set(task_tools(meta)) <= set(task_tools(root_meta)) and tier_of(meta) <= tier_of(root_meta)
+    ok, message = queue_confirmed(name, meta, body) if within else admit_followup(name, meta, body, force_gate=True)
+    log.info("Chain of %s: %s hop %s %s (%s)", root, role, name, "queued" if within else "waits for a 👍", message)
+    if not ok:
+        chain_stop(root, f"⚠️ {root}: the chain stopped: {message}")
+    return ok
+
+
+def advance_chain(path, meta, worker_out):
+    """A task passed: when it is part of a chain, queue its next hop or end the chain with one message."""
+    stem, role = path.stem, meta.get("chain_hop")
+    if role is None:
+        if meta.get("chain") == "test" and meta.get("repo"):
+            rounds = chain.rounds_for(meta.get("chain_rounds"), int(cfg("MAX_CHAIN_ROUNDS", "2") or 1))
+            queue_chain_hop("tester", stem, stem, 1, rounds)
+        return
+    root, round_no, rounds = meta.get("chain_root") or stem, int(meta.get("chain_round") or 1), int(meta.get("chain_rounds") or 1)
+    if role == "fixer":
+        queue_chain_hop("tester", stem, root, round_no + 1, rounds)
+        return
+    clean, found = chain.split_findings(worker_out)
+    if clean:
+        chain_stop(root, f"✅ {root}: the independent tests passed" + (f" after {round_no} rounds." if round_no > 1 else "."))
+    elif round_no >= rounds:
+        chain_stop(root, f"⚠️ {root}: the independent tests still find problems after {rounds} round{'s' if rounds != 1 else ''}. "
+                         "The last findings:", found)
+    else:
+        queue_chain_hop("fixer", root, root, round_no, rounds, findings=found)
+
+
 # ------------------------------------------- worktrees and draft pull requests
 #
 # A task with `repo:` runs in its own git worktree on branch task/<id>. Only after
@@ -2656,6 +3556,7 @@ def base_ref(repo, meta):
 
 def prepare_worktree(meta, stem):
     """The task's worktree: new on the first attempt, the same one (with the last attempt's work) on a retry."""
+    stem = work_stem(meta, stem)  # a follow-up works where the task it continues did
     repo, branch, worktree = repo_path(meta), branch_name(stem), worktree_path(stem)
     git_run(repo, "worktree", "prune")
     if (worktree / ".git").exists():
@@ -2665,13 +3566,15 @@ def prepare_worktree(meta, stem):
     WORKTREES.mkdir(parents=True, exist_ok=True)
     if git_run(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0:
         git_need(repo, "worktree", "add", "-q", str(worktree), branch)  # branch left by an earlier run
+    elif meta.get("follows") and git_run(repo, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}").returncode == 0:
+        git_need(repo, "worktree", "add", "-q", "-b", branch, str(worktree), f"origin/{branch}")  # the pull request's branch, pushed earlier
     else:
         git_need(repo, "worktree", "add", "-q", "-b", branch, str(worktree), base_ref(repo, meta))
     return worktree
 
 
 def remove_worktree(meta, stem):
-    worktree = worktree_path(stem)
+    worktree = worktree_path(work_stem(meta, stem))
     if repo_path(meta) is not None and worktree.exists():
         git_run(repo_path(meta), "worktree", "remove", "--force", str(worktree))
     shutil.rmtree(worktree, ignore_errors=True)
@@ -2859,12 +3762,13 @@ def pull_request_info(cwd, ref):
     return info
 
 
-def pull_request_problems(cwd, info, branch, sha):
-    """Why `info` is not the draft pull request we meant to open (empty when it is), checked against the remote too."""
+def pull_request_problems(cwd, info, branch, sha, need_draft=True):
+    """Why `info` is not the draft pull request we meant to open (empty when it is), checked against the remote too.
+    A pull request a follow-up updates may have been marked ready by its owner since: `need_draft=False`."""
     problems = []
     if str(info.get("state")).upper() != "OPEN":
         problems.append(f"it is {str(info.get('state')).lower()}, not open")
-    if info.get("isDraft") is not True:
+    if need_draft and info.get("isDraft") is not True:
         problems.append("it is not a draft")
     if info.get("headRefName") != branch:
         problems.append(f"its head branch is {info.get('headRefName')!r}, not {branch!r}")
@@ -2878,15 +3782,30 @@ def pull_request_problems(cwd, info, branch, sha):
 def publish_draft_pr(path, meta, body, worker_out, verified):
     """Commit the worktree, push task/<id>, open a draft PR and check it is what we claim. Returns (status, detail):
     ok (the URL), nochange, held (open PR count), denied (the credentials cannot publish: why) or error (why)."""
-    stem, branch = path.stem, branch_name(path.stem)
-    worktree, repo, base = worktree_path(path.stem), repo_path(meta), meta.get("base") or "main"
+    stem = path.stem
+    branch, worktree = branch_name(work_stem(meta, stem)), worktree_path(work_stem(meta, stem))
+    repo, base = repo_path(meta), meta.get("base") or "main"
     title = pr_title(stem, body)
+    existing = continuing_pr(meta)  # a follow-up of a pull request updates that one and opens no other
     try:
         git_need(worktree, "add", "-A")
         if git_run(worktree, "status", "--porcelain").stdout.strip():
             git_need(worktree, "commit", "-q", "-m", f"{title}\n\nTask {stem}, done by the queue worker.")
-        if int(git_need(worktree, "rev-list", "--count", f"{base_ref(repo, meta)}..HEAD") or 0) == 0:
+        since = base_ref(repo, meta)
+        if existing and git_run(worktree, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}").returncode == 0:
+            since = f"origin/{branch}"  # only what this follow-up added counts as a change
+        if int(git_need(worktree, "rev-list", "--count", f"{since}..HEAD") or 0) == 0:
             return "nochange", ""
+        if existing:
+            info = pull_request_info(worktree, existing["url"])
+            if str(info.get("state")).upper() != "OPEN":  # nothing is pushed to a pull request nobody can see any more
+                raise GitError(f"the pull request {existing['url']} is {str(info.get('state')).lower()}, not open")
+            git_need(worktree, "push", "-q", "origin", branch, timeout=300)
+            sha = git_need(worktree, "rev-parse", "HEAD")
+            if problems := pull_request_problems(worktree, pull_request_info(worktree, existing["url"]), branch, sha,
+                                                 need_draft=False):
+                raise GitError(f"the pull request {existing['url']} did not check out: " + "; ".join(problems))
+            return "ok", existing["url"]
         cap = int(cfg("MAX_OPEN_PRS", "3") or 0)
         if cap > 0 and not meta.get("pr_url"):
             open_prs = open_pr_count(worktree)
@@ -2923,19 +3842,25 @@ def publish_draft_pr(path, meta, body, worker_out, verified):
 def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False):
     """A task passed verification and review. A repo task now becomes a draft PR; any other is simply done."""
     collect_proposals(path, meta)
-    if not meta.get("repo"):
+    if not meta.get("repo") or meta.get("chain_hop") == "tester":  # a tester changes nothing, so there is nothing to publish
         finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped)
         return
-    status, detail = publish_draft_pr(path, meta, body, worker_out, verified)
     stem = path.stem
+    added = backlog_items(meta, stem)  # before the commit, so it sees what the worker wrote to the backlog file
+    status, detail = publish_draft_pr(path, meta, body, worker_out, verified)
     if status == "ok":
         for key in ("pending_publish", "publish_failures", "publish_blocked", "pending_review", "review_failures",
                     "held_until"):
             meta.pop(key, None)
-        meta["pr_url"], meta["branch"] = detail, branch_name(stem)
+        meta["pr_url"], meta["branch"] = detail, branch_name(work_stem(meta, stem))
         clear_reported(f"pr-held|tasks/pending/{path.name}")
         clear_reported(f"publish-denied|tasks/pending/{path.name}")
-        finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped, pr_url=detail)
+        deferred = None
+        if added:
+            head = git_run(worktree_path(work_stem(meta, stem)), "rev-parse", "HEAD").stdout.strip()
+            deferred = {"file": cfg("BACKLOG_FILE", "ROADMAP.md"), "commit": head, "items": added}
+        finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped, pr_url=detail,
+                      deferred=deferred)
         remove_worktree(meta, stem)
     elif status == "nochange":
         for key in ("pending_publish", "publish_failures", "publish_blocked", "pending_review", "review_failures",
@@ -2984,8 +3909,9 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
         body = body.rstrip("\n") + f"\n\n## Publish failed ({now_iso()})\n\n{detail}\n"
         write_task(path, meta, body)
         shutil.move(str(path), str(FAILED / path.name))
-        send_report(f"❌ Task could not open a pull request: {path.name}\nThe work passed verification and review and is kept in {worktree_path(stem)}. Last error:",
-                    detail, task_id=stem, rows=retry_rows(stem))
+        sent = send_report(f"❌ Task could not open a pull request: {path.name}\nThe work passed verification and review and is kept in {worktree_path(work_stem(meta, stem))}. Last error:",
+                           detail, task_id=stem, rows=retry_rows(stem))
+        record_outcome(path, meta, "failed", summary_text=f"Could not open a pull request: {detail}", message_ids=[sent.message_id])
 
 
 # ---------------------------------------------------------------- proposals
@@ -3003,7 +3929,8 @@ PROPOSE_NOTE = (
 )
 TASK_DIRS = (PENDING, PROPOSED, ACTIVE, DONE, FAILED, CANCELLED, RECURRING)
 MANAGED_KEYS = ("tier", "pr_url", "branch", "pending_review", "review_failures", "pending_publish", "publish_failures",
-                "publish_blocked")
+                "publish_blocked", "session_id", "follows", "chain_hop", "chain_round", "chain_root", "resume_session",
+                "resumes")
 
 
 def proposal_limits():
@@ -3114,12 +4041,13 @@ def is_held(meta):
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
-def enqueue_task(arg):
+def enqueue_task(arg, force_gate=False):
     """Validate a task file another program wrote and drop it into the queue. Returns (ok, message).
 
     It arrives whole (a hard link from a temporary file next to pending/, so a watcher on pending/
     sees one event and never a half-written file) and never overwrites a task of the same name.
-    A task that needs approval goes to proposed/ and is announced, exactly as if pick_task had found it.
+    A task that needs approval goes to proposed/ and is announced, exactly as if pick_task had found it. With
+    `force_gate` it always waits there for a 👍, whatever its tier (a follow-up drawn from outside text).
     """
     path = Path(arg)
     if not path.is_file():
@@ -3132,7 +4060,9 @@ def enqueue_task(arg):
         return False, f"{path.name} is invalid:\n" + "\n".join(f"- {p}" for p in problems)
     if (existing := find_task(path.stem)) is not None:
         return False, f"{path.stem} is already in tasks/{existing.parent.name}/; pick another name"
-    gated = needs_approval(path, meta, body)
+    if meta.get("follows") and (problem := followup_cap_problem(clean_stem(meta["follows"]), path.stem)):
+        return False, f"{path.name} is invalid:\n- {problem}"
+    gated = force_gate or needs_approval(path, meta, body)
     destination = (PROPOSED if gated else PENDING) / path.name
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = TASKS / f".enqueue-{os.getpid()}-{path.name}.tmp"
@@ -3203,6 +4133,21 @@ def pick_task(skip=()):
                 log.info("Task %s is waiting on dependency %r", src.name, dep)
             blocked = "waiting"
             break
+        merge_key = f"merge-closed|tasks/pending/{src.name}"
+        if blocked is None and (waiting_on := merge_wait(meta)):
+            blocked = "waiting"
+            if waiting_on[0] == "closed":
+                report_once(
+                    merge_key, waiting_on[1],
+                    f"Task {src.name} waits for {waiting_on[1]!r} to merge, but its pull request was closed without merging",
+                    f"⚠️ {src.name} is waiting for '{waiting_on[1]}' to be merged, but that pull request was closed "
+                    "without merging, so it will never run. Cancel it, or reopen the pull request.",
+                    rows=[[("Cancel", "cancel", src.stem)]],
+                )
+            else:
+                log.info("Task %s is waiting for %r to be merged", src.name, waiting_on[1])
+        else:
+            clear_reported(merge_key)
         cancelled_key = f"cancelled-dependency|tasks/pending/{src.name}"
         if cancelled_dep is not None:
             report_once(
@@ -3236,10 +4181,11 @@ def handle_failure(path, meta, body, attempts, max_attempts, feedback):
         shutil.rmtree(staging_dir(path.stem), ignore_errors=True)  # a failed task's proposals are not trusted
         shutil.move(str(path), str(FAILED / path.name))
         log.error("Task %s FAILED permanently after %d/%d attempts", path.name, attempts, max_attempts)
-        send_report(
+        sent = send_report(
             f"❌ Task failed: {path.name}\nExhausted {max_attempts} attempts. Last feedback:", feedback,
             task_id=path.stem, rows=retry_rows(path.stem),
         )
+        record_outcome(path, meta, "failed", summary_text=feedback, message_ids=[sent.message_id])
     else:
         shutil.move(str(path), str(PENDING / path.name))
         log.info("Task %s failed review on attempt %d/%d; requeued with feedback", path.name, attempts, max_attempts)
@@ -3469,7 +4415,7 @@ def check_file(arg):
 
 
 def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False,
-                  pr_url=None):
+                  pr_url=None, deferred=None):
     """A task passed: record the result, move it to done/ and tell the user."""
     name = path.name
     result = worker_out.strip()
@@ -3494,12 +4440,22 @@ def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials,
         lines.append(notice)
     if pr_url:
         lines.append(f"🔀 Draft PR ready: {pr_url}")
+    sent = None
     if empty and meta.get("quiet") == "true":  # a quiet pass stays hidden, but a pass that did nothing says so in one line
-        send_telegram(f"ℹ️ {name} ran but produced nothing: the report was empty and no files came with it.")
+        sent = send_telegram(f"ℹ️ {name} ran but produced nothing: the report was empty and no files came with it.")
     elif meta.get("quiet") != "true" or pr_url:  # quiet tasks (the weekly improver) report only failures, and PR links
-        send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem, root=cwd)
+        sent = send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem, root=cwd)
     if notes:
         send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
+    root = Path(cwd).resolve()
+    reached = [{"path": str(file.relative_to(root)), "delivered": bool(sent and sent.message_id is not None and file not in sent.refused)}
+               for file in files]
+    record_outcome(path, meta, "done", report=worker_out, files=reached, pr_url=pr_url,
+                   message_ids=[sent.message_id] if sent else [], deferred=deferred)
+    try:
+        advance_chain(path, meta, worker_out)
+    except Exception:  # noqa: BLE001 - the task is done and recorded; a chain that cannot go on says so and stops
+        log.exception("Could not advance the chain after %s", name)
 
 
 def process_task(path):
@@ -3604,22 +4560,46 @@ def run_task(path, status=None):
         note = ""
         if meta.get("repo"):  # the dispatcher publishes; the worker may neither push nor call gh
             worker_cmd += ["--disallowedTools", "Bash(git push*),Bash(gh *)"]
-            note = REPO_NOTE.format(branch=branch_name(path.stem), base=meta.get("base") or "main")
+            note = REPO_NOTE.format(branch=branch_name(work_stem(meta, path.stem)), base=meta.get("base") or "main")
         if meta.get("propose") == "true":  # its own staging folder, and only that
             staging = staging_dir(path.stem)
             worker_cmd[worker_cmd.index("--allowedTools") + 1] = f"{tools},Write(/{staging}/**)"
             note += PROPOSE_NOTE.format(staging=staging, limit=proposal_limits()[1])
+        note += follow_note(meta)
+        fresh_prompt = WORKER_PREAMBLE + "\n\n" + note + body
+        resume = meta.get("resume_session")
+        prompt = RESUME_PROMPT if resume else fresh_prompt
+        if resume:
+            worker_cmd += ["--resume", resume]
+            log.info("Task %s: resuming claude session %s", name, resume)
+        clear_control(path.stem)
+        control = CallControl(status or QuietWatcher(), path.stem, on_session=lambda session: remember_session(path, session))
         try:
-            reply = run_claude(
-                worker_cmd, WORKER_PREAMBLE + "\n\n" + note + body, timeout_min * 60, cwd, transcript, "worker",
-                watcher=status or QuietWatcher(),
-            )
+            try:
+                reply = run_claude(worker_cmd, prompt, timeout_min * 60, cwd, transcript, "worker", watcher=control)
+            except ClaudeError as exc:
+                if not (resume and RESUME_GONE_RE.search(str(exc))):
+                    raise
+                # the session is gone: start again, told what the stream says it had done (inside the fence)
+                log.warning("Task %s: session %s is gone; starting fresh with the tail of its stream", name, resume)
+                meta.pop("resume_session", None)
+                del worker_cmd[worker_cmd.index("--resume"):worker_cmd.index("--resume") + 2]
+                steps = stream_tail(transcript.with_suffix(".stream.jsonl"))
+                earlier = ("Your earlier session was lost, so you are starting again. The steps it had taken, most recent last:\n"
+                           + fence.RULE + "\n" + fence.wrap(steps, "your earlier steps") + "\n\n") if steps else ""
+                control = CallControl(status or QuietWatcher(), path.stem, on_session=lambda session: remember_session(path, session))
+                reply = run_claude(worker_cmd, WORKER_PREAMBLE + "\n\n" + note + earlier + body, timeout_min * 60, cwd,
+                                   transcript, "worker", watcher=control)
         except RateLimited as exc:
+            if control.session_id:
+                meta["resume_session"] = control.session_id  # the pause is not the end of this work
             requeue_unconsumed(path, meta, body, attempts)
             log.warning("Task %s: usage limit; requeued without consuming an attempt", name)
             pause_queue(usage_limit_until(str(exc)), "usage limit")
             return
         except AuthError as exc:
+            if control.session_id:
+                meta["resume_session"] = control.session_id
             requeue_unconsumed(path, meta, body, attempts)
             log.warning("Task %s: requeued without consuming an attempt", name)
             mark_auth_failed(str(exc))
@@ -3630,7 +4610,19 @@ def run_task(path, status=None):
             if model_gone(exc.args[0], "worker", meta.get("value_class")) is None:
                 no_usable_model("worker")
             return
+        except TaskStopped:
+            stop_task(path, meta, body, control)
+            return
         except CallTimeout:
+            used = int(meta.get("resumes") or 0)
+            if control.tools and control.session_id and used < int(cfg("MAX_RESUMES", "3") or 0):
+                # it was making progress: the work is not lost, so no attempt is used and the next one resumes it
+                meta["resume_session"], meta["resumes"] = control.session_id, str(used + 1)
+                requeue_unconsumed(path, meta, body, attempts)
+                log.warning("Task %s: timed out after %d tool call(s); requeued to resume session %s, no attempt used",
+                            name, control.tools, control.session_id)
+                return
+            meta.pop("resume_session", None)
             handle_failure(
                 path, meta, body, attempts, max_attempts,
                 f"Worker timed out after {timeout_min:g} minutes without completing. "
@@ -3638,9 +4630,15 @@ def run_task(path, status=None):
             )
             return
         except ClaudeError as exc:
+            meta.pop("resume_session", None)
             handle_failure(path, meta, body, attempts, max_attempts, f"Worker invocation failed:\n{tail(str(exc))}")
             return
+        finally:
+            clear_control(path.stem)
+        meta.pop("resume_session", None)
         worker_out, denials = reply.text, reply.envelope.get("permission_denials") or []
+        if reply.envelope.get("session_id"):
+            meta["session_id"] = reply.envelope["session_id"]  # kept so a follow-up can say where the work came from
 
     if meta.get("repo") and (problem := diff_guard(Path(cwd), repo_path(meta), meta)):
         meta.pop("pending_review", None)  # the saved report described files that may not be published
@@ -3802,6 +4800,7 @@ def cycle():
     if daily_cap_reached():
         return 0
     announce_proposals()  # anything the coordinator left in proposed/
+    poll_followups()  # merged pull requests, new reviews and comments, revisit dates
     drain = cfg("DISPATCH_DRAIN") in ("1", "true", "yes")
     handled = set()  # a task that needs another attempt waits for the next run, not a tight loop
     while True:
@@ -3822,6 +4821,10 @@ if __name__ == "__main__":
             ok, message = actions[sys.argv[1]](sys.argv[2])
             print(message)
             sys.exit(0 if ok else 1)
+        if sys.argv[1] == "continue" and len(sys.argv) >= 4:
+            ok, message = create_followup(sys.argv[2], " ".join(sys.argv[3:]), source="coordinator")
+            print(message)
+            sys.exit(0 if ok else 1)
         if sys.argv[1] == "usage" and (len(sys.argv) == 2 or sys.argv[2:3] == ["--by"] and len(sys.argv) == 4):
             if len(sys.argv) == 4 and sys.argv[3] not in USAGE_GROUPS:
                 print(f"usage --by takes {'|'.join(USAGE_GROUPS)}", file=sys.stderr)
@@ -3833,6 +4836,8 @@ if __name__ == "__main__":
             "       dispatcher.py retry <task-id>   requeue a failed/cancelled task, attempts reset\n"
             "       dispatcher.py check <file>      validate a task or recurring template file\n"
             "       dispatcher.py enqueue <file>    validate a task file and drop it into the queue\n"
+            "       dispatcher.py continue <id> <what to change>\n"
+            "                                       queue a follow-up of a finished task (it waits for a thumbs-up)\n"
             "       dispatcher.py usage [--by day|label|model|agent]\n"
             "                                       claude calls, cost and turns by day and model (or one grouping)",
             file=sys.stderr,

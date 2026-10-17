@@ -63,7 +63,7 @@ DEFAULTS = {
 def role_of(prompt):
     if "strict automated reviewer" in prompt:
         return "review"
-    if prompt.startswith("You are running unattended"):
+    if prompt.startswith(("You are running unattended", "You ran out of time")):  # the second is a resumed worker
         return "worker"
     return "other"
 
