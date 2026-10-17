@@ -19,6 +19,10 @@ Built-in commands (answered instantly, no API cost):
     /cancel <task-id>  archive a pending task (or recurring template) to
                        tasks/cancelled/
     /retry <task-id>   requeue a failed/cancelled task with attempts reset
+    /voice [on|off]    spoken replies for typed messages too (a voice note always gets one)
+
+Voice notes are transcribed on this host (ffmpeg + whisper.cpp), answered like typed text marked [voice], and the
+reply opens with what was heard. A short status or spend question is answered with no model call.
 
 Replies are rendered with Telegram HTML formatting (markdown converted via
 dispatcher.md_to_telegram_html, plain-text fallback on rejection). Reacting
@@ -47,10 +51,12 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import NamedTuple
 
 import dispatcher
 from taskq_lib import buttons, memory, naming
+from taskq_lib import voice as voice_lib
 from dispatcher import (
     TELEGRAM_MAX,
     cfg,
@@ -376,11 +382,12 @@ def stop_text(stop):
     return "⏸ The queue is stopped. I kept your message and will answer it once it is back."
 
 
-def converse(prompt, state):
+def converse(prompt, state, turn=None):
     """One coordinator turn: run it and send the reply, or keep the prompt while the queue is stopped.
 
     A held prompt waits in state["held"] and replay_held() answers it after
-    the pause or the expired login clears. Returns True when the turn ran.
+    the pause or the expired login clears. `turn` is the voice note this answers, if any.
+    Returns True when the turn ran.
     """
     stop = dispatcher.current_stop()
     if stop is None:
@@ -390,10 +397,13 @@ def converse(prompt, state):
             stop = dispatcher.current_stop()
         else:
             log.info("Replying: %s", reply[:300])
-            send_replies([reply], state)
+            answer(reply, state, turn)
+            speak(reply, state, turn)
             return True
     state.setdefault("held", []).append({"text": prompt})
     log.info("Queue stopped (%s); holding the message until it is back", stop[0] if stop else "unknown")
+    if turn and turn.ack_id:
+        edit_formatted(turn.ack_id, voice_lib.echo(turn.heard))  # the note was heard even though the answer waits
     send_replies([stop_text(stop)], state)
     return False
 
@@ -423,6 +433,244 @@ def replay_held(state):
         log.info("Replaying held message: %s", snippet)
         send_replies([f"↩️ Re: “{snippet}”\n\n{reply}"], state)
         save_state(state)
+
+
+# ---------------------------------------------------------------- voice
+#
+# A voice note is downloaded, turned into text on this host (ffmpeg, then whisper.cpp), and from there it is a typed
+# message marked [voice]. Nothing leaves the house but the Telegram download. The programs run as argument lists with no
+# shell, and the file names are made here, never taken from Telegram.
+
+VOICE_DIR = BASE / "state" / "voice"
+SWEEP_EVERY = 600  # seconds between looks at the audio folder
+MAX_DOWNLOAD = 25 * 1024 * 1024
+LAST_SWEEP = None  # time.monotonic() of the last look; its zero point is the boot, so 0 would mean "just now" on a fresh host
+
+
+class VoiceTurn(NamedTuple):
+    ack_id: int | None  # the "Listening" message that the answer is edited into
+    heard: str  # what was said
+    audio: Path  # the downloaded note
+
+
+class VoiceError(Exception):
+    """Something between Telegram and the transcript failed; the text is what to tell the human."""
+
+
+def ffmpeg_bin():
+    return cfg("FFMPEG_BIN") or "ffmpeg"
+
+
+def speaker_ready():
+    return bool(cfg("TTS_BIN") and cfg("TTS_MODEL"))
+
+
+def run_tool(cmd, stdin=None):
+    """Run a voice program with no shell. Returns its stdout; raises VoiceError with the cause when it fails."""
+    timeout = dispatcher.number(cfg("VOICE_TIMEOUT_SECONDS"), 120.0)
+    name = Path(cmd[0]).name
+    try:
+        proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise VoiceError(f"{name} took longer than {timeout:.0f} seconds") from None
+    except OSError as exc:
+        raise VoiceError(f"{name} could not start ({type(exc).__name__})") from None
+    if proc.returncode != 0:
+        raise VoiceError(f"{name} exited {proc.returncode}: {(proc.stderr or '').strip()[-200:]}")
+    return proc.stdout or ""
+
+
+def sweep_voice(force=False):
+    """Delete audio older than VOICE_RETENTION_HOURS (default 24). Looks at most every SWEEP_EVERY seconds."""
+    global LAST_SWEEP
+    if not force and LAST_SWEEP is not None and time.monotonic() - LAST_SWEEP < SWEEP_EVERY:
+        return
+    LAST_SWEEP = time.monotonic()
+    if voice_lib.sweep(VOICE_DIR, dispatcher.number(cfg("VOICE_RETENTION_HOURS"), 24.0)):
+        log.info("Deleted voice audio older than %s hours", cfg("VOICE_RETENTION_HOURS", "24"))
+
+
+def download_voice(file_id, message_id):
+    """The note's audio saved under VOICE_DIR. Raises VoiceError."""
+    try:
+        info = api("getFile", {"file_id": file_id}, timeout=30)
+        file_path = str(info["file_path"])
+        if not re.fullmatch(r"[\w./-]+", file_path) or ".." in file_path:
+            raise ValueError("odd file path")
+        with urllib.request.urlopen(dispatcher.telegram_file_url(file_path), timeout=60) as resp:
+            data = resp.read(MAX_DOWNLOAD + 1)
+        if len(data) > MAX_DOWNLOAD:
+            raise ValueError("file too big")
+        VOICE_DIR.mkdir(parents=True, exist_ok=True)
+        target = VOICE_DIR / f"voice-{int(message_id or 0)}-{int(time.time())}{Path(file_path).suffix or '.oga'}"
+        target.write_bytes(data)
+    except Exception as exc:  # noqa: BLE001 - whatever went wrong, the human hears one sentence and the cause is logged
+        log.warning("Voice download failed: %s", type(exc).__name__)
+        raise VoiceError("I couldn't download that voice note.") from None
+    return target
+
+
+def transcribe(audio, seconds):
+    """What was said in the audio file. Raises VoiceError. Logs the real-time factor so the model size can be judged."""
+    wav = audio.with_suffix(".wav")
+    started = time.monotonic()
+    try:
+        run_tool(voice_lib.to_wav_cmd(ffmpeg_bin(), audio, wav))
+        said = run_tool(voice_lib.transcribe_cmd(cfg("WHISPER_BIN"), cfg("WHISPER_MODEL"), wav))
+    except VoiceError as exc:
+        log.warning("Transcription failed: %s", exc)
+        raise VoiceError("I couldn't transcribe that voice note.") from None
+    finally:
+        wav.unlink(missing_ok=True)
+    took = time.monotonic() - started
+    log.info("Transcribed %ss of audio in %.1fs (real-time factor %.2f)", seconds, took, took / seconds if seconds else 0)
+    return voice_lib.clean_transcript(said)
+
+
+def edit_formatted(message_id, text, state=None):
+    """Replace a message's text, formatted, or plain if Telegram rejects the formatting. True when it took."""
+    text = dispatcher.redact_secrets(text)
+    chat_id = cfg("TELEGRAM_CHAT_ID")
+    for extra in ({"text": md_to_telegram_html(text), "parse_mode": "HTML"}, {"text": text}):
+        try:
+            api("editMessageText", {"chat_id": chat_id, "message_id": message_id, **extra}, timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            log.info("editMessageText did not apply (%s)", type(exc).__name__)
+            continue
+        if state is not None:
+            record = state.setdefault("sent_messages", [])
+            record.append([message_id, text[:200]])
+            del record[:-20]
+        return True
+    return False
+
+
+def answer(text, state, turn=None):
+    """Send a reply. For a voice note it goes into the acknowledgement, after the line saying what was heard."""
+    if turn is None:
+        send_replies([text], state)
+        return
+    heard = voice_lib.echo(turn.heard)
+    combined = f"{heard}\n\n{text}"
+    if turn.ack_id and dispatcher.fits_in_message(dispatcher.redact_secrets(combined), limit=TELEGRAM_MAX):
+        if edit_formatted(turn.ack_id, combined, state):
+            return
+    if turn.ack_id:
+        edit_formatted(turn.ack_id, heard, state)  # a long reply comes as a preview and a file below the heard line
+        send_replies([text], state)
+    else:
+        send_replies([combined], state)
+
+
+def speak(reply, state, turn=None):
+    """Read the first sentence of a reply aloud, if this turn or /voice on asks for it. Never raises."""
+    if turn is None and not state.get("voice"):
+        return
+    line = voice_lib.spoken_summary(reply, int(dispatcher.number(cfg("VOICE_SUMMARY_CHARS"), 200.0)), dispatcher.redact_secrets)
+    if line:
+        say(line)
+
+
+def say(line):
+    """Send `line` as a voice message: piper makes a wav, ffmpeg turns it into Opus, sendVoice delivers it."""
+    if not speaker_ready():
+        return
+    VOICE_DIR.mkdir(parents=True, exist_ok=True)
+    stem = VOICE_DIR / f"say-{int(time.time() * 1000)}"
+    wav, ogg = stem.with_suffix(".wav"), stem.with_suffix(".ogg")
+    try:
+        run_tool(voice_lib.speak_cmd(cfg("TTS_BIN"), cfg("TTS_MODEL"), wav), stdin=line)
+        run_tool(voice_lib.to_opus_cmd(ffmpeg_bin(), wav, ogg))
+        if dispatcher.post_voice(ogg) is None:
+            log.warning("The spoken reply was not delivered")
+    except VoiceError as exc:
+        log.warning("Spoken reply skipped: %s", exc)  # the text reply is already out
+    finally:
+        wav.unlink(missing_ok=True)
+        ogg.unlink(missing_ok=True)
+
+
+def running_text():
+    """(text shown, sentence spoken) for "what's running?", from the queue folders."""
+    active = sorted(p.stem for p in dispatcher.ACTIVE.glob("*.md"))
+    waiting = [f"{len(list(folder.glob('*.md')))} {label}" for label, folder in
+               (("pending", dispatcher.PENDING), ("waiting for your thumbs-up", dispatcher.PROPOSED))
+               if any(folder.glob("*.md"))]
+    shown = ("Running: " + ", ".join(active)) if active else "Nothing is running."
+    if waiting:
+        shown += "\n" + ", ".join(waiting).capitalize() + "."
+    if not active:
+        return shown, "Nothing is running."
+    names = ", ".join(active[:3]) + (f" and {len(active) - 3} more" if len(active) > 3 else "")
+    return shown, f"{len(active)} task{'s are' if len(active) != 1 else ' is'} running: {names}."
+
+
+def spend_text():
+    """(text shown, sentence spoken) for "how much today?", from logs/usage.jsonl."""
+    summary = dispatcher.usage_summary()
+    today = next((line for line in summary.splitlines() if line.startswith("Today")), summary.splitlines()[0])
+    return summary, ", ".join(today.split(", ")[:2])
+
+
+QUICK_ANSWERS = {"running": running_text, "usage": spend_text}
+
+
+def voice_command(argument, state):
+    """The reply to /voice, /voice on and /voice off."""
+    argument = argument.lower()
+    if argument == "on":
+        if not speaker_ready():
+            return "Spoken replies need TTS_BIN and TTS_MODEL in .env (see the README), so I left them off."
+        state["voice"] = True
+        return "Spoken replies are on: each reply also comes as one spoken sentence. /voice off turns them off."
+    if argument == "off":
+        state["voice"] = False
+        return "Spoken replies are off. A voice note still gets one back."
+    now = "on" if state.get("voice") else "off"
+    return f"Spoken replies are {now}. Send /voice on or /voice off. A voice note always gets a spoken reply."
+
+
+def hear(msg, found, chat_id, state):
+    """Turn a voice note into text. Returns (transcript, VoiceTurn), or (None, None) after telling the human why not."""
+    if not cfg("WHISPER_BIN"):
+        send_replies(["Voice notes are not set up on this host: set WHISPER_BIN and WHISPER_MODEL in .env (see the README)."], state)
+        return None, None
+    limit = int(dispatcher.number(cfg("VOICE_MAX_SECONDS"), 300.0))
+    if limit and found["seconds"] > limit:
+        send_replies([f"That voice note is {found['seconds']} seconds long. I take up to {limit} seconds."], state)
+        return None, None
+    ack_id = None
+    try:  # the acknowledgement: edited into the answer later, so there is one message per exchange
+        sent = api("sendMessage", {"chat_id": chat_id, "text": "🎙 Listening…"}, timeout=15)
+        ack_id = sent.get("message_id") if isinstance(sent, dict) else None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not send the acknowledgement: %s", type(exc).__name__)
+    audio = None
+    try:
+        audio = download_voice(found["file_id"], msg.get("message_id"))
+        heard = transcribe(audio, found["seconds"])
+        if not heard:
+            raise VoiceError("I couldn't make out any speech in that voice note.")
+    except VoiceError as exc:
+        if audio:
+            audio.unlink(missing_ok=True)
+        if not (ack_id and edit_formatted(ack_id, str(exc))):
+            send_replies([str(exc)], state)
+        return None, None
+    if dispatcher.number(cfg("VOICE_RETENTION_HOURS"), 24.0) <= 0:
+        audio.unlink(missing_ok=True)
+    sweep_voice()
+    return heard, VoiceTurn(ack_id, heard, audio)
+
+
+def forget_turn(turn, chat_id):
+    """Take a voice note's traces away: the acknowledgement message and the audio."""
+    turn.audio.unlink(missing_ok=True)
+    if turn.ack_id:
+        try:
+            api("deleteMessage", {"chat_id": chat_id, "message_id": turn.ack_id}, timeout=10)
+        except Exception:  # noqa: BLE001
+            pass  # an old message may be refused; the reply still tells the human to rotate the secret
 
 
 # ---------------------------------------------------------------- handlers
@@ -820,13 +1068,21 @@ def handle_update(update, state):
             log.warning("Ignoring message from unauthorized chat %s or sender", chat_id or "(unknown)")
         return
     text = (msg.get("text") or "").strip()
-    if not text:
+    turn = None
+    if not text and (found := voice_lib.attachment(msg)):
+        text, turn = hear(msg, found, chat_id, state)
+        if not text:
+            return
+        text = text.lstrip("/ ") or text  # a spoken message is never a command
+    elif not text:
         send_replies(["I can only read text messages."], state)
         return
     if kinds := dispatcher.secret_kinds(text):  # before the log line, the model and the state file see it
         refuse_secret(msg, chat_id, kinds, state)
+        if turn:
+            forget_turn(turn, chat_id)
         return
-    log.info("Received: %s", text[:300])
+    log.info("Received%s: %s", " (voice)" if turn else "", text[:300])
     if text == "/new":
         state["session_id"] = None
         state["context_pct"] = None
@@ -898,6 +1154,9 @@ def handle_update(update, state):
         stem, _, change = text[len("/continue"):].strip().partition(" ")
         send_replies([continue_from(stem, change) if stem else dispatcher.finished_tasks_text()], state)
         return
+    if text == "/voice" or text.startswith("/voice "):
+        send_replies([voice_command(text[len("/voice"):].strip(), state)], state)
+        return
     if text == "/skip":
         dropped = state.pop("awaiting_followup", None)
         send_replies(["Dropped it." if dropped else "Nothing to skip."], state)
@@ -906,11 +1165,11 @@ def handle_update(update, state):
     if not text.startswith("/"):  # a command inside a reply is still a command
         if replied_to and (stem := dispatcher.outcome_for_message(replied_to)):  # a reply to a result: continue that task
             state.pop("awaiting_followup", None)
-            send_replies([continue_from(stem, text)], state)
+            answer(continue_from(stem, text), state, turn)
             return
         if stem := awaited_task(state):  # the answer to "what was wrong?"
             state.pop("awaiting_followup", None)
-            send_replies([continue_from(stem, text)], state)
+            answer(continue_from(stem, text), state, turn)
             return
     for command, act, icon in (("/approve", dispatcher.approve_task, "✅ "), ("/reject", dispatcher.reject_task, "🗑 ")):
         if text == command or text.startswith(command + " "):
@@ -922,6 +1181,17 @@ def handle_update(update, state):
             ok, result = act(target)
             send_replies([(icon if ok else "⚠️ ") + result], state)
             return
+    if kind := voice_lib.quick_kind(text):  # a short status or spend question: the state files know, no model needed
+        shown, said = QUICK_ANSWERS[kind]()
+        answer(shown, state, turn)
+        if turn or state.get("voice"):
+            say(said)
+        return
+    if turn:  # a typed message gets a 👀 reaction; a voice note's acknowledgement message turns into the answer
+        if turn.ack_id:
+            edit_formatted(turn.ack_id, f"{voice_lib.echo(turn.heard)}\n\n⏳ Working on it…")
+        converse(f"[voice] {text}", state, turn)
+        return
     # 👀 on the message plus a typing indicator while the coordinator runs.
     if dispatcher.current_stop() is None:
         for method, params in (
@@ -993,17 +1263,20 @@ def main():
             {"command": "continue", "description": "Carry on from a finished task: /continue <task-id> <what to change>"},
             {"command": "approve", "description": "Let a waiting task run: /approve <task-id>"},
             {"command": "reject", "description": "Drop a waiting task: /reject <task-id>"},
+            {"command": "voice", "description": "Spoken replies: /voice on or /voice off"},
             {"command": "new", "description": "Start a fresh coordinator conversation"},
         ])}, timeout=30)
     except Exception as exc:
         log.warning("setMyCommands failed: %s", exc)
 
     state = load_state()
+    sweep_voice(force=True)
     log.info("Coordinator bridge started (chat %s)", cfg("TELEGRAM_CHAT_ID"))
     backoff = 5
     while RUNNING:
         replay_held(state)  # messages kept while the queue was paused or the login expired
         announce_waiting()
+        sweep_voice()
         try:
             updates = api(
                 "getUpdates",

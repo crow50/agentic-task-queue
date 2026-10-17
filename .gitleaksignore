@@ -1,2 +1,4 @@
 # tests/test_secret_redaction.py pins the "password or token" pattern with a made-up value.
 0ab087f9deca6a4f8378b517d78eaca95816f653:tests/test_secret_redaction.py:generic-api-key:43
+# tests/test_voice_bot.py speaks a made-up token to check that a spoken secret is refused.
+f02f1e7aa50200c20248b3922fdd25df6770362e:tests/test_voice_bot.py:generic-api-key:140

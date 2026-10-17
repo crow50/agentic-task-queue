@@ -791,6 +791,27 @@ def publish_probe(ctx, path):
     return True, f"{permission} on origin"
 
 
+def check_voice(ctx, env, add):
+    """Voice is optional: nothing is checked until WHISPER_BIN or TTS_BIN is set, and a problem is only a warning."""
+    if not (env.get("WHISPER_BIN") or env.get("TTS_BIN")):
+        return
+
+    def usable(path, flag="-x"):
+        probe = ["test", flag, path] if "/" in path else ["which", path]
+        return ctx.system.run_as(ctx.user, probe).returncode == 0
+
+    def need(name, path, flag="-x"):
+        add(bool(path) and usable(path, flag), f"voice: {name}", path or "not set in .env", level=WARN, notify=False)
+
+    need("ffmpeg", env.get("FFMPEG_BIN") or "ffmpeg")
+    if env.get("WHISPER_BIN"):
+        need("whisper binary (WHISPER_BIN)", env["WHISPER_BIN"])
+        need("whisper model (WHISPER_MODEL)", env.get("WHISPER_MODEL", ""), "-r")
+    if env.get("TTS_BIN"):
+        need("speaker binary (TTS_BIN)", env["TTS_BIN"])
+        need("speaker voice (TTS_MODEL)", env.get("TTS_MODEL", ""), "-r")
+
+
 def run_checks(ctx):
     """A Result for every moving part. A FAIL is always worth a message; a WARN only if it says so."""
     results = []
@@ -887,6 +908,7 @@ def run_checks(ctx):
             ok, detail = False, f"{path} is not there"
         add(ok, f"publish access: {name}", detail)
 
+    check_voice(ctx, env, add)
     missing = [rel for rel in QUEUE_DIRS if ctx.system.run_as(ctx.user, ["test", "-w", str(ctx.base / rel)]).returncode]
     add(not missing, "queue folders writable", ", ".join(missing) or "all present")
     imports = ctx.system.run_as(ctx.user, [str(ctx.venv_python), "-c", "import httpx, tenacity, filelock"])

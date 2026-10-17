@@ -661,6 +661,74 @@ asked about at most every `FOLLOWUP_POLL_MINUTES`.
   or a tier beyond the build's waits for its own 👍. Every hop counts toward `MAX_FOLLOW_DEPTH` and
   `MAX_ATTEMPTS_PER_DAY`, and no hop opens a second pull request.
 
+## Voice
+
+Talk to the coordinator from Telegram and hear one sentence back. Everything runs on the Pi: audio never goes to a
+speech service, and only the transcript reaches the model. Voice is optional and off until `WHISPER_BIN` is set.
+
+- **Voice notes in.** Send a voice note (or an audio file). The bot answers at once with "🎙 Listening…", downloads the
+  note, converts it with ffmpeg and transcribes it with whisper.cpp. That message then becomes the answer: it opens
+  with `🎙 Heard: “…”`, so a mishearing is obvious, and the reply follows. The coordinator receives `[voice] <what you
+  said>`. The same sender check as text applies: a note from anyone else is ignored and never downloaded. A spoken key
+  or token is caught like a typed one: the note and the acknowledgement are deleted and the text goes nowhere.
+  Notes over `VOICE_MAX_SECONDS` (300) are refused without a download. Downloaded audio is kept
+  `VOICE_RETENTION_HOURS` (24; 0 = delete right after transcribing) in `state/voice/`.
+- **Spoken replies out.** After a voice note, or after `/voice on`, the reply also comes as a voice message: the first
+  sentence only (`VOICE_SUMMARY_CHARS`, 200), with code, links and symbols dropped. The full text is always there too, and a
+  long report is never read aloud. If piper or ffmpeg fails the text still arrives. Needs `TTS_BIN` and `TTS_MODEL`.
+  `/voice` shows the setting.
+- **Quick answers.** "What's running?" and "how much today?", typed or spoken, are answered from the state files and
+  `logs/usage.jsonl` with no model call. Only these short phrasings match (ten words or fewer); anything longer goes to the
+  coordinator. Typed messages keep the 👀 reaction as their acknowledgement; only voice notes use the edit-in-place message.
+- **Measure before choosing a model.** `python3 scripts/voice_bench.py note.oga` transcribes a real note three times and
+  prints the real-time factor (seconds of work per second of audio) with a verdict; `--say "Queued it."` times a spoken
+  sentence. The bridge logs the same factor for every note (`Transcribed 7s of audio in 2.1s`). `install.py --check` warns
+  when a configured tool or model file is missing.
+
+Setting it up on the Pi. Only the first command needs `sudo`: `/opt` is writable by the person who set the Pi up, and the
+`taskq` user only has to read and run what is put there. Do not move `whisper-cli` after building it (it finds its
+libraries in the build folder).
+
+```bash
+sudo apt install ffmpeg                       # cmake, gcc and git are already installed
+mkdir /opt/voice && cd /opt/voice
+
+git clone --depth 1 https://github.com/ggml-org/whisper.cpp
+cd whisper.cpp
+sh ./models/download-ggml-model.sh base.en-q5_1   # the quantized base model; tiny.en-q5_1 is the faster fallback
+cmake -B build && cmake --build build -j4 --config Release
+cd /opt/voice
+
+python3 -m venv piper
+piper/bin/pip install piper-tts
+piper/bin/python -m piper.download_voices en_US-lessac-medium --data-dir /opt/voice
+```
+
+Then in `.env` (edit it as the queue's user: `sudo -u taskq nano /opt/agentic-task-queue/.env`; a later line wins over an
+earlier one, so adding these at the end is safe):
+
+```
+WHISPER_BIN=/opt/voice/whisper.cpp/build/bin/whisper-cli
+WHISPER_MODEL=/opt/voice/whisper.cpp/models/ggml-base.en-q5_1.bin
+TTS_BIN=/opt/voice/piper/bin/piper
+TTS_MODEL=/opt/voice/en_US-lessac-medium.onnx
+```
+
+Check it by hand as `taskq` before relying on it (`sudo -u taskq <command>`), then `sudo python3 scripts/install.py --check`
+(the `voice:` lines), then `sudo systemctl restart claude-coordinator`, then `scripts/voice_bench.py` on a note you
+recorded, then send a voice note. The upstream pages for the tools are the whisper.cpp README and Piper's `docs/CLI.md`.
+
+A hands-free device (a push-to-talk button, then a wake word) is not built: it waits until voice notes prove useful.
+
+**One process or one call per turn (measured Oct 17, 2026, on the Pi).** A `claude -p --resume` turn on Haiku took
+3.4 to 4.3 s of wall time, of which the CLI itself reported about 1.1 s. One long-lived `claude -p --input-format
+stream-json` process took 0.9 s per turn once warm (2.8 s for the first), and after being killed a new process with
+`--resume <session_id>` kept the same session and remembered what it was told. So it is faster and survives a restart,
+by about 2.5 s a turn. The queue does not use it yet: a real coordinator turn has a median of 46 s (7 of 41 finished in
+under 10 s), the idle process holds about 230 MB, and it would change how rate limits, expired logins, per-call model
+fallback and timeouts are detected, which are now read from each call's exit code. Worth revisiting if short turns become
+the common case.
+
 ## Setup
 
 Prerequisites: a Debian/Ubuntu machine (a Raspberry Pi 4/5 with 64-bit Ubuntu

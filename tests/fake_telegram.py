@@ -92,6 +92,7 @@ class FakeTelegram:
         self.rejected = []  # (method, description) refused by strict mode
         self.strict = False
         self.updates = []  # served (once) by getUpdates
+        self.files = {}  # file_id -> bytes served by getFile and the /file/ download; unknown ids get b"OggS-fake"
         self._queued = {}
         self._next_message_id = 100
         self._lock = threading.Lock()
@@ -130,6 +131,10 @@ class FakeTelegram:
 
     def calls(self, method=None):
         return [r for r in self.requests if method is None or r.method == method]
+
+    def voices(self):
+        """The sendVoice requests, in order."""
+        return self.calls("sendVoice")
 
     def edits(self):
         """The editMessageText requests, in order."""
@@ -177,7 +182,10 @@ class FakeTelegram:
                 return 200, {"ok": True, "result": updates}
             if request.method == "getMe":
                 return 200, {"ok": True, "result": {"id": 1, "is_bot": True, "username": "fake_bot"}}
-            if request.method in ("sendMessage", "sendDocument", "editMessageText"):
+            if request.method == "getFile":
+                file_id = request.params.get("file_id", "")
+                return 200, {"ok": True, "result": {"file_id": file_id, "file_path": f"voice/{file_id}.oga"}}
+            if request.method in ("sendMessage", "sendDocument", "sendVoice", "editMessageText"):
                 self._next_message_id += 1
                 return 200, {"ok": True, "result": {"message_id": self._next_message_id}}
             return 200, {"ok": True, "result": True}
@@ -188,6 +196,14 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         url = urllib.parse.urlsplit(self.path)
+        download = re.fullmatch(r"/file/bot([^/]+)/voice/(.+)\.oga", url.path)
+        if download:  # a file download, as the Bot API serves it after getFile
+            data = self.server.fake.files.get(urllib.parse.unquote(download.group(2)), b"OggS-fake")
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         match = re.fullmatch(r"/bot([^/]+)/(\w+)", url.path)
         if not match:
             return self.reply(404, {"ok": False, "error_code": 404, "description": "Not Found"})
