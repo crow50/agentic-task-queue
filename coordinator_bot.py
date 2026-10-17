@@ -444,7 +444,7 @@ def replay_held(state):
 VOICE_DIR = BASE / "state" / "voice"
 SWEEP_EVERY = 600  # seconds between looks at the audio folder
 MAX_DOWNLOAD = 25 * 1024 * 1024
-LAST_SWEEP = 0.0
+LAST_SWEEP = None  # time.monotonic() of the last look; its zero point is the boot, so 0 would mean "just now" on a fresh host
 
 
 class VoiceTurn(NamedTuple):
@@ -483,7 +483,7 @@ def run_tool(cmd, stdin=None):
 def sweep_voice(force=False):
     """Delete audio older than VOICE_RETENTION_HOURS (default 24). Looks at most every SWEEP_EVERY seconds."""
     global LAST_SWEEP
-    if not force and time.monotonic() - LAST_SWEEP < SWEEP_EVERY:
+    if not force and LAST_SWEEP is not None and time.monotonic() - LAST_SWEEP < SWEEP_EVERY:
         return
     LAST_SWEEP = time.monotonic()
     if voice_lib.sweep(VOICE_DIR, dispatcher.number(cfg("VOICE_RETENTION_HOURS"), 24.0)):

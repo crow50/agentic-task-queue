@@ -161,6 +161,13 @@ class RetentionTests(VoiceCase):
         self.drive("bot.sweep_voice()")
         self.assertEqual(self.audio_files(), [])
 
+    def test_the_first_sweep_runs_even_when_the_host_booted_a_moment_ago(self):
+        self.handle(voice_msg())
+        for name in self.audio_files():
+            os.utime(self.sb.base / "state" / "voice" / name, (0, 0))
+        self.drive("import time; time.monotonic = lambda: 5.0\nbot.sweep_voice()")  # monotonic() counts from boot
+        self.assertEqual(self.audio_files(), [])
+
     def test_a_note_newer_than_the_retention_survives_the_sweep(self):
         self.handle(voice_msg())
         before = self.audio_files()
