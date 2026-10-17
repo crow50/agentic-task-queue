@@ -55,7 +55,7 @@ class BotActionTests(BotCase):
         self.handle(message("/cancel waiting", sender=CHAT))
         self.handle(message("/approve ghost", sender=CHAT))
         lines = actions(self.sb)
-        self.assertEqual([(l["action"], l["task"], l["ok"], l["source"]) for l in lines],
+        self.assertEqual([(x["action"], x["task"], x["ok"], x["source"]) for x in lines],
                          [("retry", "waiting", True, "telegram"), ("cancel", "waiting", True, "telegram"),
                           ("approve", "ghost", False, "telegram")])
 
