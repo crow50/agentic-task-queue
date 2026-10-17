@@ -698,3 +698,4 @@ Pi can't message you itself. No ping is sent while the login is expired.
   CI scans every pull request as well.
 - **New settings**: every setting read through `cfg("NAME")` must be listed in
   `.env.example`; a test enforces it.
+
