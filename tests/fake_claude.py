@@ -127,6 +127,7 @@ def main(argv):
             "oauth_token": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"),
             "gh_token": os.environ.get("GH_TOKEN"),
             "prompt": prompt,
+            "at": time.monotonic(),
             "exit": code,
         }) + "\n")
 

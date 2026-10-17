@@ -1115,6 +1115,12 @@ def telegram_url(method):
     return f"{base}/bot{cfg('TELEGRAM_BOT_TOKEN')}/{method}"
 
 
+def telegram_file_url(file_path):
+    """Where Telegram serves a file after getFile gave its path."""
+    base = cfg("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+    return f"{base}/file/bot{cfg('TELEGRAM_BOT_TOKEN')}/{file_path}"
+
+
 def telegram_configured():
     if cfg("TELEGRAM_BOT_TOKEN") and cfg("TELEGRAM_CHAT_ID"):
         return True
@@ -1229,6 +1235,25 @@ def post_document(name, source):
         return False
     log.info("Telegram document %s sent", name)
     return True
+
+
+def post_voice(source):
+    """sendVoice with the Opus/Ogg file at `source` (a Path). Returns the sent message's id, or None if Telegram refused it."""
+    try:
+        with source.open("rb") as content:
+            reply = httpx.post(
+                telegram_url("sendVoice"), data={"chat_id": cfg("TELEGRAM_CHAT_ID")},
+                files={"voice": (source.name, content, "audio/ogg")}, timeout=120,
+            )
+        reply.raise_for_status()
+        payload = reply.json()
+        if payload.get("ok") is not True:
+            raise ValueError("Telegram answered ok: false")
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        cause = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__  # the URL holds the token
+        log.warning("Telegram voice message failed: %s", cause)
+        return None
+    return (payload.get("result") or {}).get("message_id") or 0
 
 
 # ------------------------------------------------------------- live status
