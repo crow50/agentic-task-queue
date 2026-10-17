@@ -722,10 +722,15 @@ def repo_targets(ctx):
 
 
 def publish_probe(ctx, path):
-    """(ok, detail): can the queue user write to this checkout's remote? The same two questions the dispatcher asks."""
+    """(ok, detail): can the queue user write to this checkout's remote? The same two questions the dispatcher asks (the role, then a dry-run push)."""
     env = ctx.env()
     gh = shlex.split(env.get("GH_BIN") or "gh")
     extra = {"GH_TOKEN": env["GH_TOKEN"]} if env.get("GH_TOKEN") else {}
+    git_extra = dict(extra, GIT_TERMINAL_PROMPT="0")
+    if extra:  # what the dispatcher registers, so an https push is signed with the same token
+        git_extra.update(GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="credential.https://github.com.helper", GIT_CONFIG_VALUE_0="",
+                         GIT_CONFIG_KEY_1="credential.https://github.com.helper",
+                         GIT_CONFIG_VALUE_1=f"!{' '.join(gh)} auth git-credential")
     proc = ctx.system.run_as(ctx.user, [*gh, "repo", "view", "--json", "viewerPermission"],
                              extra_env=extra, cwd=path, timeout=60)
     if proc.returncode != 0:
@@ -736,10 +741,11 @@ def publish_probe(ctx, path):
         permission = ""
     if permission not in PUBLISH_PERMISSIONS:
         return False, f"the token has {permission or 'no'} permission; {PUBLISH_FIX}"
-    remote = ctx.system.run_as(ctx.user, ["git", "-C", str(path), "ls-remote", "origin", "HEAD"],
-                               extra_env=extra, timeout=60)
+    # The role is the person's, not the token's; only a push tells. A dry run asks the remote without sending anything.
+    remote = ctx.system.run_as(ctx.user, ["git", "-C", str(path), "push", "--dry-run", "origin",
+                                          "HEAD:refs/heads/taskq-publish-probe"], extra_env=git_extra, timeout=60)
     if remote.returncode != 0:
-        return False, f"git ls-remote origin failed: {(remote.stderr or remote.stdout).strip()[-120:]}"
+        return False, f"git push --dry-run origin failed ({(remote.stderr or remote.stdout).strip()[-120:]}); {PUBLISH_FIX}"
     return True, f"{permission} on origin"
 
 

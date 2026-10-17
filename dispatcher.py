@@ -2306,8 +2306,11 @@ def gh_run(cwd, *args, timeout=120):
         return subprocess.CompletedProcess(command, 124, "", f"{type(exc).__name__}: {exc}")
 
 
+PROBE_BRANCH = "taskq-publish-probe"  # named in a --dry-run push, never created
+
+
 def publish_probe(repo):
-    """(ok, detail): can this checkout's credentials write to its remote? One `gh repo view` and one `git ls-remote`."""
+    """(ok, detail): can this checkout's credentials write to its remote? One `gh repo view` and one `git push --dry-run`."""
     proc = gh_run(repo, "repo", "view", "--json", "viewerPermission", timeout=60)
     if proc.returncode != 0:
         return False, f"gh repo view failed: {tail(proc.stderr or proc.stdout, 300)}"
@@ -2317,9 +2320,11 @@ def publish_probe(repo):
         permission = ""
     if permission not in PUBLISH_PERMISSIONS:
         return False, f"the token has {permission or 'no'} permission on the repository; it needs WRITE"
-    remote = git_run(repo, "ls-remote", "origin", "HEAD", timeout=60)
+    # The role above is the person's; a fine-grained token with Contents read-only still reports it. Only the
+    # remote's answer to a push says whether this token may write, and a dry run asks without sending anything.
+    remote = git_run(repo, "push", "--dry-run", "origin", f"HEAD:refs/heads/{PROBE_BRANCH}", timeout=60)
     if remote.returncode != 0:
-        return False, f"git ls-remote origin failed: {tail(remote.stderr or remote.stdout, 300)}"
+        return False, f"git push --dry-run origin failed: {tail(remote.stderr or remote.stdout, 300)}"
     return True, ""
 
 
