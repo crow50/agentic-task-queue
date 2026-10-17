@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
-from taskq_lib import accounting, alerts, buttons, models, naming
+from taskq_lib import accounting, alerts, buttons, followups, models, naming, outcomes
 
 try:
     import filelock
@@ -88,6 +88,7 @@ PROPOSED = TASKS / "proposed"  # waiting for your 👍 before they may run
 LOGS = BASE / "logs"
 STATE = BASE / "state"
 WORKTREES = BASE / "worktrees"  # one git worktree per task that sets repo:
+OUTCOMES = STATE / "outcomes"  # one <task>.json per finished task: what it produced, so a follow-up starts from what is true
 APPROVALS = STATE / "approvals"  # one <task>.json per task that needed approval; claude cannot write state/
 LOCKFILE = BASE / "dispatcher.lock"
 PAUSED_FILE = STATE / "paused_until"  # first line: ISO UTC time; second line: why
@@ -363,6 +364,8 @@ FRONTMATTER_KEYS = {
     "repo": (False, False, None),  # a git checkout (name under REPOS_DIR or absolute path): worktree + draft pull request
     "base": (False, False, None),  # branch the task branch starts from (default main)
     "propose": (False, False, ("true", "false")),  # true: the worker may write follow-up proposals
+    "follows": (False, False, None),  # the task this one continues (checked by follows_problems()); see create_followup()
+    "session_id": (False, False, None),  # managed by the dispatcher: the worker's claude session, kept for a follow-up
     "branch": (False, False, None),  # managed by the dispatcher
     "pr_url": (False, False, None),  # managed by the dispatcher
     "pending_publish": (False, False, None),  # managed by the dispatcher
@@ -604,6 +607,7 @@ def validate_task(meta, body, template=False):
             problems.append(f"deliver path '{ref}' is outside the task's cwd")
     if meta.get("verify") and (problem := verify_problem(meta["verify"])):
         problems.append(problem)
+    problems += follows_problems(meta)
     if meta.get("review") in ("skip", "skip-if-verified") and not meta.get("verify"):
         problems.append(f"review: {meta['review']} needs a verify command; nothing else would check the result")
     if template:
@@ -1355,35 +1359,45 @@ def fit_preview(prefix, text, suffix):
         size = int(size * 0.8)
 
 
+class Sent(NamedTuple):
+    message_id: int  # of the first message: 0 when Telegram sent none back, None when nothing was sent
+    refused: list  # the `files` Telegram did not accept, as the paths that were given
+
+
 def send_report(title, text, files=(), task_id="report", root=None, rows=None):
     """Tell the user something. A long `text` becomes a preview plus `<task_id>.md`; `files` follow as documents.
 
     A file Telegram did not accept is named in a follow-up as "not delivered: <path>" (relative to `root` when given).
+    Returns a Sent: the id of the message, which a reply to it can be traced back by, and the files that were refused.
 
     The one way the dispatcher sends done, failed and dependency notices, so
     nothing depends on a path only the machine running the queue can see.
     """
     if not telegram_configured():
-        return
+        return Sent(None, [])
     body = f"{title}\n\n{text}" if title and text else title or text
     attachments = []
     if fits_in_message(body):
-        post_message(body, rows)
+        message_id = send_message_id(body, rows=rows)
     else:
         name = f"{task_id}.md"
         prefix = f"{title}\n\n" if title else ""
-        post_message(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"), rows)
-        attachments.append((f"the full report ({name})", name, redact_secrets(text).encode()))
+        message_id = send_message_id(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"), rows=rows)
+        attachments.append((f"the full report ({name})", name, redact_secrets(text).encode(), None))
     root = Path(root).resolve() if root else None
-    attachments += [(str(path.relative_to(root)) if root and path.is_relative_to(root) else path.name, path.name, path)
+    attachments += [(str(path.relative_to(root)) if root and path.is_relative_to(root) else path.name, path.name, path, path)
                     for path in map(Path, files)]
-    for label, name, source in attachments:
+    refused = []
+    for label, name, source, given in attachments:
         if not post_document(name, source):
             post_message(f"⚠️ Couldn't attach {label}: Telegram refused the upload.\nnot delivered: {label}")
+            if given is not None:
+                refused.append(given)
+    return Sent(message_id, refused)
 
 
 def send_telegram(text, rows=None):
-    send_report("", text, rows=rows)
+    return send_report("", text, rows=rows)
 
 
 # ---------------------------------------------------------------- limits, login, once-only reports
@@ -2210,7 +2224,8 @@ def spec_digest(meta, body):
     """
     found = DISPATCHER_HEADING.search(body)
     spec = body[:found.start()] if found else body
-    parts = [f"{key}={meta.get(key, '')}" for key in DIGEST_KEYS] + [spec.strip()]
+    parts = [f"{key}={meta.get(key, '')}" for key in DIGEST_KEYS] + ([f"follows={meta['follows']}"] if meta.get("follows") else [])
+    parts.append(spec.strip())
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
@@ -2450,11 +2465,10 @@ def task_status(stem):
     for marker, text in (("pending_publish", "finished and checked; waiting to publish"), ("held_until", f"held until {meta.get('held_until')}")):
         if meta.get(marker):
             lines.append(text)
-    outcomes = list(re.finditer(r"^## (Result \(.*?\)|Attempt \d+ Feedback.*?|Dependency Failed.*?|Invalid Task.*?|Cancelled.*?|Publish failed.*?)$\s*(.*?)(?=^## |\Z)",
-                                body, re.M | re.S))
-    if outcomes:
-        last = outcomes[-1]
-        lines.append(f"{last.group(1).split(' (')[0].lower()}: {short(' '.join(last.group(2).split()), 600)}")
+    if label in FINISHED and (record := load_outcome(stem)):
+        lines.append("outcome: " + outcomes.describe(record) + (f", ${record['cost_usd']:.2f}" if record.get("cost_usd") else ""))
+    if section := last_section(body):
+        lines.append(f"{section[0].split(' (')[0].lower()}: {short(' '.join(section[1].split()), 600)}")
     return True, "\n".join(lines)
 
 
@@ -2563,6 +2577,275 @@ def queued_like(prefix, needle=""):
     return None
 
 
+# ------------------------------------------------ outcomes and follow-ups
+#
+# When a task ends, state/outcomes/<id>.json records what it produced (see taskq_lib/outcomes.py), and a task with
+# `follows: <id>` starts from that record. A pull request is only one kind of result: the same machinery continues a
+# research report, a delivered file or a failed attempt. The record is written by the dispatcher, never by the worker.
+
+FINISHED = ("done", "failed", "cancelled")
+REPORT_KEEP_CHARS = 200_000  # the report kept for a follow-up; longer ones are cut
+FOLLOW_REPORT_CHARS = 20_000  # how much of it a follow-up's worker is shown
+LAST_SECTION = re.compile(
+    r"^## (Result \(.*?\)|Attempt \d+ Feedback.*?|Dependency Failed.*?|Invalid Task.*?|Cancelled.*?|Publish failed.*?)$\s*(.*?)(?=^## |\Z)",
+    re.M | re.S)
+
+
+def outcome_path(stem):
+    return OUTCOMES / f"{safe_stem(stem)}.json"
+
+
+def report_path(stem):
+    return OUTCOMES / f"{safe_stem(stem)}.report.md"
+
+
+def read_outcome(stem):
+    try:
+        data = json.loads(outcome_path(stem).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_outcome(stem, record, report=None):
+    write_atomic(outcome_path(stem), json.dumps(record))
+    if report is not None:
+        write_atomic(report_path(stem), report[:REPORT_KEEP_CHARS])
+
+
+def task_cost(stem):
+    """Dollars this task's claude calls cost, from the usage log."""
+    return round(sum(cost for _, record, cost in usage_costs(usage_records()) if record.get("task") == stem), 4)
+
+
+def last_section(body):
+    """(heading, text) of the last result, feedback or failure section the dispatcher wrote into a task, or None."""
+    found = list(LAST_SECTION.finditer(body or ""))
+    return (found[-1].group(1), found[-1].group(2).strip()) if found else None
+
+
+def record_outcome(path, meta, status, report="", summary_text="", files=None, pr_url=None, message_ids=()):
+    """Write the outcome of the task that just ended. `report` is what it produced (the worker's answer);
+    `summary_text` is what the summary is cut from when that is not the report (a failure's feedback). Never raises:
+    a task that finished must not fail because its record could not be written."""
+    stem = path.stem
+    try:
+        text = redact_secrets((report or "").strip())
+        built = outcomes.build({"report": text, "files": files or [], "pr_url": pr_url, "branch": meta.get("branch")})
+        worktree = worktree_path(work_stem(meta, stem)) if meta.get("repo") else None
+        record = {
+            "task": stem, "status": status, **built,
+            "summary": outcomes.summarize(redact_secrets(summary_text) if summary_text else text),
+            "session_id": meta.get("session_id"), "cwd": str(worktree) if worktree else task_cwd(meta),
+            "worktree": str(worktree) if worktree else None, "cost_usd": task_cost(stem), "finished": now_iso(),
+            "message_ids": [m for m in message_ids if m], "follows": meta.get("follows") or None,
+        }
+        write_outcome(stem, record, text or redact_secrets(summary_text).strip())
+    except OSError as exc:
+        log.warning("Could not write the outcome of %s: %s", stem, exc)
+
+
+def derive_outcome(stem):
+    """The outcome of a finished task that never got one (it ended before outcomes existed, or was cancelled), worked
+    out from its file. None when the task is not finished or not in the queue."""
+    label, path = find_state(stem)
+    if label not in FINISHED:
+        return None
+    meta, body = parse_task(path)
+    meta = meta or {}
+    section = last_section(body)
+    text = section[1] if section else ""
+    done = label == "done"
+    built = outcomes.build({"report": text if done else "", "files": [], "pr_url": meta.get("pr_url"),
+                            "branch": meta.get("branch")})
+    return {
+        "task": stem, "status": label, **built, "summary": outcomes.summarize(text), "session_id": meta.get("session_id"),
+        "cwd": task_cwd(meta), "worktree": None, "cost_usd": task_cost(stem),
+        "finished": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime(ISO_FMT), "message_ids": [],
+        "follows": meta.get("follows") or None, "derived": True,
+    }
+
+
+def load_outcome(stem):
+    """The outcome of a finished task: its record, or one worked out from its file. None for a task that is not finished."""
+    stem = clean_stem(stem or "")
+    if not stem or not SAFE_NAME.match(stem):
+        return None
+    record = read_outcome(stem)
+    label, _ = find_state(stem)
+    if record is not None and (label in FINISHED or label is None):  # a retried task is not finished any more
+        return record
+    return derive_outcome(stem)
+
+
+def outcome_text(stem):
+    """The saved report of a finished task (or, for a failure, its last feedback), for a follow-up to read."""
+    try:
+        return report_path(stem).read_text()
+    except OSError:
+        label, path = find_state(stem)
+        section = last_section(parse_task(path)[1]) if label in FINISHED else None
+        return redact_secrets(section[1]) if section else ""
+
+
+def outcome_for_message(message_id):
+    """The task whose result was announced as Telegram message `message_id`, or None."""
+    if not message_id or not OUTCOMES.is_dir():
+        return None
+    for ledger in OUTCOMES.glob("*.json"):
+        try:
+            record = json.loads(ledger.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(record, dict) and message_id in (record.get("message_ids") or []):
+            return record.get("task")
+    return None
+
+
+def finished_tasks(limit=10):
+    """The stems of the last `limit` finished tasks (done, failed, cancelled), newest first."""
+    files = [p for directory in (DONE, FAILED, CANCELLED) for p in directory.glob("*.md")]
+    files.sort(key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+    return [p.stem for p in files[:limit]]
+
+
+def finished_tasks_text(limit=10):
+    """What /tasks and a bare /continue say: the last finished tasks and what each made."""
+    stems = finished_tasks(limit)
+    if not stems:
+        return "No finished tasks yet."
+    lines = [f"Last {len(stems)} finished task{'s' if len(stems) != 1 else ''}, newest first:"]
+    for stem in stems:
+        record = load_outcome(stem)
+        lines.append(f"- {stem}: {outcomes.describe(record) if record else '?'}")
+    lines.append("Reply to a result, or send /continue <id> <what to change>.")
+    return "\n".join(lines)
+
+
+def max_follow_depth():
+    return int(cfg("MAX_FOLLOW_DEPTH", "3") or 0)
+
+
+def parent_of(stem):
+    """The task `stem` follows, or None."""
+    path = find_task(stem)
+    meta = parse_task(path)[0] if path else None
+    parent = (meta or {}).get("follows") or (read_outcome(stem) or {}).get("follows")
+    return clean_stem(parent) if parent else None
+
+
+def follows_problems(meta):
+    """Why a task's `follows:` cannot be honoured (empty when it can, or when there is none)."""
+    parent = clean_stem((meta or {}).get("follows") or "")
+    if not parent:
+        return []
+    if not SAFE_NAME.match(parent):
+        return [f"follows '{parent}' is not a task id"]
+    label, _ = find_state(parent)
+    if label is not None and label not in FINISHED:
+        return [f"follows '{parent}', which is not finished (it is in tasks/{label}/)"]
+    if load_outcome(parent) is None:
+        return [f"follows '{parent}', which is not a task in the queue"]
+    depth, limit = followups.depth_of(parent, parent_of) + 1, max_follow_depth()
+    if limit > 0 and depth > limit:
+        return [f"this follow-up would be {depth} links deep, past MAX_FOLLOW_DEPTH={limit}"]
+    return []
+
+
+def count_followups(parent, excluding=None):
+    """Tasks that follow `parent`, wherever they have got to."""
+    return sum(1 for directory in TASK_DIRS for file in directory.glob("*.md")
+               if file.stem != excluding and (parse_task(file)[0] or {}).get("follows") == parent)
+
+
+def followup_cap_problem(parent, stem=None):
+    cap = int(cfg("MAX_FOLLOWUPS_PER_TASK", "5") or 0)
+    if cap > 0 and count_followups(parent, stem) >= cap:
+        return f"'{parent}' already has {cap} follow-ups (MAX_FOLLOWUPS_PER_TASK); start a new task instead"
+    return None
+
+
+def admit_followup(name, meta, body):
+    """Put a follow-up through the same door as any task a program writes: it waits for approval if its tier says so."""
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / f"{name}.md"
+        write_task(staged, meta, body)
+        return enqueue_task(str(staged))
+
+
+@audited("continue")
+def create_followup(parent, text, source="user"):
+    """Queue a task that continues the finished task `parent` with the instruction `text`. Returns (ok, message).
+
+    From the person themself (`source="user"`: /continue, a reply to a result, a 👎) it runs without a second approval,
+    because it inherits the tools and places of a task they already let run and the instruction is theirs. Anything else
+    goes through the approval gate like any task a program wrote.
+    """
+    parent = clean_stem(parent or "")
+    text = (text or "").strip()
+    if not parent or not SAFE_NAME.match(parent):
+        return False, "Give a task id (see /tasks)."
+    label, path = find_state(parent)
+    if label is not None and label not in FINISHED:
+        return False, f"'{parent}' is not finished yet (it is in tasks/{label}/)."
+    record = load_outcome(parent)
+    if record is None:
+        return False, f"No task named '{parent}' (see /tasks)."
+    if path is None:
+        return False, f"'{parent}' is no longer in the queue, so there is nothing to continue from."
+    if not text:
+        return False, f"What should change? Send /continue {parent} <what to change>."
+    if "pr" in (record.get("kinds") or []) and record.get("merged"):
+        return False, f"The pull request of '{parent}' was merged; start a new task from main instead."
+    if problems := follows_problems({"follows": parent}):
+        return False, problems[0]
+    if problem := followup_cap_problem(parent):
+        return False, problem
+    parent_meta, parent_body = parse_task(path)
+    meta, body = followups.build(parent_meta or {}, parent_body, text, parent)
+    taken = {file.stem for directory in TASK_DIRS for file in directory.glob("*.md")}
+    name = followups.name_for(parent, taken)
+    ok, message = queue_confirmed(name, meta, body) if source == "user" else admit_followup(name, meta, body)
+    if not ok:
+        return False, message
+    log.info("Follow-up %s of %s queued (%s)", name, parent, source)
+    return True, f"Queued {name}: it continues {parent}. {message if source != 'user' else 'It runs next.'}"
+
+
+def follow_note(meta):
+    """What the worker of a follow-up is told about the task it continues ('' for any other task)."""
+    parent = clean_stem((meta or {}).get("follows") or "")
+    record = load_outcome(parent) if parent else None
+    if record is None:
+        return ""
+    return followups.prompt_note(record, outcome_text(parent)[:FOLLOW_REPORT_CHARS])
+
+
+def continuing_pr(meta):
+    """The pull request a follow-up updates: the first one up its chain of `follows`, or None for any other task."""
+    parent, seen = clean_stem((meta or {}).get("follows") or ""), set()
+    while parent and parent not in seen:
+        seen.add(parent)
+        if ref := ((load_outcome(parent) or {}).get("refs") or {}).get("pr"):
+            return ref
+        parent = parent_of(parent)
+    return None
+
+
+def work_stem(meta, stem):
+    """The task whose worktree and branch `stem` works on: its own, or, for a follow-up on the same repo, the first task
+    of its chain, so the follow-up's commits land on the branch that already has the work."""
+    seen = {stem}
+    while meta and meta.get("repo") and (parent := clean_stem(meta.get("follows") or "")) and parent not in seen:
+        path = find_task(parent)
+        parent_meta = parse_task(path)[0] if path else None
+        if not parent_meta or parent_meta.get("repo") != meta.get("repo"):
+            break
+        seen.add(parent)
+        stem, meta = parent, parent_meta
+    return stem
+
+
 # ------------------------------------------- worktrees and draft pull requests
 #
 # A task with `repo:` runs in its own git worktree on branch task/<id>. Only after
@@ -2656,6 +2939,7 @@ def base_ref(repo, meta):
 
 def prepare_worktree(meta, stem):
     """The task's worktree: new on the first attempt, the same one (with the last attempt's work) on a retry."""
+    stem = work_stem(meta, stem)  # a follow-up works where the task it continues did
     repo, branch, worktree = repo_path(meta), branch_name(stem), worktree_path(stem)
     git_run(repo, "worktree", "prune")
     if (worktree / ".git").exists():
@@ -2665,13 +2949,15 @@ def prepare_worktree(meta, stem):
     WORKTREES.mkdir(parents=True, exist_ok=True)
     if git_run(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0:
         git_need(repo, "worktree", "add", "-q", str(worktree), branch)  # branch left by an earlier run
+    elif meta.get("follows") and git_run(repo, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}").returncode == 0:
+        git_need(repo, "worktree", "add", "-q", "-b", branch, str(worktree), f"origin/{branch}")  # the pull request's branch, pushed earlier
     else:
         git_need(repo, "worktree", "add", "-q", "-b", branch, str(worktree), base_ref(repo, meta))
     return worktree
 
 
 def remove_worktree(meta, stem):
-    worktree = worktree_path(stem)
+    worktree = worktree_path(work_stem(meta, stem))
     if repo_path(meta) is not None and worktree.exists():
         git_run(repo_path(meta), "worktree", "remove", "--force", str(worktree))
     shutil.rmtree(worktree, ignore_errors=True)
@@ -2859,12 +3145,13 @@ def pull_request_info(cwd, ref):
     return info
 
 
-def pull_request_problems(cwd, info, branch, sha):
-    """Why `info` is not the draft pull request we meant to open (empty when it is), checked against the remote too."""
+def pull_request_problems(cwd, info, branch, sha, need_draft=True):
+    """Why `info` is not the draft pull request we meant to open (empty when it is), checked against the remote too.
+    A pull request a follow-up updates may have been marked ready by its owner since: `need_draft=False`."""
     problems = []
     if str(info.get("state")).upper() != "OPEN":
         problems.append(f"it is {str(info.get('state')).lower()}, not open")
-    if info.get("isDraft") is not True:
+    if need_draft and info.get("isDraft") is not True:
         problems.append("it is not a draft")
     if info.get("headRefName") != branch:
         problems.append(f"its head branch is {info.get('headRefName')!r}, not {branch!r}")
@@ -2878,15 +3165,30 @@ def pull_request_problems(cwd, info, branch, sha):
 def publish_draft_pr(path, meta, body, worker_out, verified):
     """Commit the worktree, push task/<id>, open a draft PR and check it is what we claim. Returns (status, detail):
     ok (the URL), nochange, held (open PR count), denied (the credentials cannot publish: why) or error (why)."""
-    stem, branch = path.stem, branch_name(path.stem)
-    worktree, repo, base = worktree_path(path.stem), repo_path(meta), meta.get("base") or "main"
+    stem = path.stem
+    branch, worktree = branch_name(work_stem(meta, stem)), worktree_path(work_stem(meta, stem))
+    repo, base = repo_path(meta), meta.get("base") or "main"
     title = pr_title(stem, body)
+    existing = continuing_pr(meta)  # a follow-up of a pull request updates that one and opens no other
     try:
         git_need(worktree, "add", "-A")
         if git_run(worktree, "status", "--porcelain").stdout.strip():
             git_need(worktree, "commit", "-q", "-m", f"{title}\n\nTask {stem}, done by the queue worker.")
-        if int(git_need(worktree, "rev-list", "--count", f"{base_ref(repo, meta)}..HEAD") or 0) == 0:
+        since = base_ref(repo, meta)
+        if existing and git_run(worktree, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}").returncode == 0:
+            since = f"origin/{branch}"  # only what this follow-up added counts as a change
+        if int(git_need(worktree, "rev-list", "--count", f"{since}..HEAD") or 0) == 0:
             return "nochange", ""
+        if existing:
+            info = pull_request_info(worktree, existing["url"])
+            if str(info.get("state")).upper() != "OPEN":  # nothing is pushed to a pull request nobody can see any more
+                raise GitError(f"the pull request {existing['url']} is {str(info.get('state')).lower()}, not open")
+            git_need(worktree, "push", "-q", "origin", branch, timeout=300)
+            sha = git_need(worktree, "rev-parse", "HEAD")
+            if problems := pull_request_problems(worktree, pull_request_info(worktree, existing["url"]), branch, sha,
+                                                 need_draft=False):
+                raise GitError(f"the pull request {existing['url']} did not check out: " + "; ".join(problems))
+            return "ok", existing["url"]
         cap = int(cfg("MAX_OPEN_PRS", "3") or 0)
         if cap > 0 and not meta.get("pr_url"):
             open_prs = open_pr_count(worktree)
@@ -2932,7 +3234,7 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
         for key in ("pending_publish", "publish_failures", "publish_blocked", "pending_review", "review_failures",
                     "held_until"):
             meta.pop(key, None)
-        meta["pr_url"], meta["branch"] = detail, branch_name(stem)
+        meta["pr_url"], meta["branch"] = detail, branch_name(work_stem(meta, stem))
         clear_reported(f"pr-held|tasks/pending/{path.name}")
         clear_reported(f"publish-denied|tasks/pending/{path.name}")
         finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped, pr_url=detail)
@@ -2984,8 +3286,9 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
         body = body.rstrip("\n") + f"\n\n## Publish failed ({now_iso()})\n\n{detail}\n"
         write_task(path, meta, body)
         shutil.move(str(path), str(FAILED / path.name))
-        send_report(f"❌ Task could not open a pull request: {path.name}\nThe work passed verification and review and is kept in {worktree_path(stem)}. Last error:",
-                    detail, task_id=stem, rows=retry_rows(stem))
+        sent = send_report(f"❌ Task could not open a pull request: {path.name}\nThe work passed verification and review and is kept in {worktree_path(work_stem(meta, stem))}. Last error:",
+                           detail, task_id=stem, rows=retry_rows(stem))
+        record_outcome(path, meta, "failed", summary_text=f"Could not open a pull request: {detail}", message_ids=[sent.message_id])
 
 
 # ---------------------------------------------------------------- proposals
@@ -3003,7 +3306,7 @@ PROPOSE_NOTE = (
 )
 TASK_DIRS = (PENDING, PROPOSED, ACTIVE, DONE, FAILED, CANCELLED, RECURRING)
 MANAGED_KEYS = ("tier", "pr_url", "branch", "pending_review", "review_failures", "pending_publish", "publish_failures",
-                "publish_blocked")
+                "publish_blocked", "session_id", "follows")
 
 
 def proposal_limits():
@@ -3132,6 +3435,8 @@ def enqueue_task(arg):
         return False, f"{path.name} is invalid:\n" + "\n".join(f"- {p}" for p in problems)
     if (existing := find_task(path.stem)) is not None:
         return False, f"{path.stem} is already in tasks/{existing.parent.name}/; pick another name"
+    if meta.get("follows") and (problem := followup_cap_problem(clean_stem(meta["follows"]), path.stem)):
+        return False, f"{path.name} is invalid:\n- {problem}"
     gated = needs_approval(path, meta, body)
     destination = (PROPOSED if gated else PENDING) / path.name
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -3236,10 +3541,11 @@ def handle_failure(path, meta, body, attempts, max_attempts, feedback):
         shutil.rmtree(staging_dir(path.stem), ignore_errors=True)  # a failed task's proposals are not trusted
         shutil.move(str(path), str(FAILED / path.name))
         log.error("Task %s FAILED permanently after %d/%d attempts", path.name, attempts, max_attempts)
-        send_report(
+        sent = send_report(
             f"❌ Task failed: {path.name}\nExhausted {max_attempts} attempts. Last feedback:", feedback,
             task_id=path.stem, rows=retry_rows(path.stem),
         )
+        record_outcome(path, meta, "failed", summary_text=feedback, message_ids=[sent.message_id])
     else:
         shutil.move(str(path), str(PENDING / path.name))
         log.info("Task %s failed review on attempt %d/%d; requeued with feedback", path.name, attempts, max_attempts)
@@ -3494,12 +3800,18 @@ def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials,
         lines.append(notice)
     if pr_url:
         lines.append(f"🔀 Draft PR ready: {pr_url}")
+    sent = None
     if empty and meta.get("quiet") == "true":  # a quiet pass stays hidden, but a pass that did nothing says so in one line
-        send_telegram(f"ℹ️ {name} ran but produced nothing: the report was empty and no files came with it.")
+        sent = send_telegram(f"ℹ️ {name} ran but produced nothing: the report was empty and no files came with it.")
     elif meta.get("quiet") != "true" or pr_url:  # quiet tasks (the weekly improver) report only failures, and PR links
-        send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem, root=cwd)
+        sent = send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem, root=cwd)
     if notes:
         send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
+    root = Path(cwd).resolve()
+    reached = [{"path": str(file.relative_to(root)), "delivered": bool(sent and sent.message_id is not None and file not in sent.refused)}
+               for file in files]
+    record_outcome(path, meta, "done", report=worker_out, files=reached, pr_url=pr_url,
+                   message_ids=[sent.message_id] if sent else [])
 
 
 def process_task(path):
@@ -3604,11 +3916,12 @@ def run_task(path, status=None):
         note = ""
         if meta.get("repo"):  # the dispatcher publishes; the worker may neither push nor call gh
             worker_cmd += ["--disallowedTools", "Bash(git push*),Bash(gh *)"]
-            note = REPO_NOTE.format(branch=branch_name(path.stem), base=meta.get("base") or "main")
+            note = REPO_NOTE.format(branch=branch_name(work_stem(meta, path.stem)), base=meta.get("base") or "main")
         if meta.get("propose") == "true":  # its own staging folder, and only that
             staging = staging_dir(path.stem)
             worker_cmd[worker_cmd.index("--allowedTools") + 1] = f"{tools},Write(/{staging}/**)"
             note += PROPOSE_NOTE.format(staging=staging, limit=proposal_limits()[1])
+        note += follow_note(meta)
         try:
             reply = run_claude(
                 worker_cmd, WORKER_PREAMBLE + "\n\n" + note + body, timeout_min * 60, cwd, transcript, "worker",
@@ -3641,6 +3954,8 @@ def run_task(path, status=None):
             handle_failure(path, meta, body, attempts, max_attempts, f"Worker invocation failed:\n{tail(str(exc))}")
             return
         worker_out, denials = reply.text, reply.envelope.get("permission_denials") or []
+        if reply.envelope.get("session_id"):
+            meta["session_id"] = reply.envelope["session_id"]  # kept so a follow-up can say where the work came from
 
     if meta.get("repo") and (problem := diff_guard(Path(cwd), repo_path(meta), meta)):
         meta.pop("pending_review", None)  # the saved report described files that may not be published

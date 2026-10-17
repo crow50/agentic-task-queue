@@ -467,6 +467,10 @@ def handle_reaction(reaction, state):
     if (verdict := dispatcher.apply_reaction(reaction.get("message_id"), emoji)) is not None:
         send_replies([verdict], state)  # an approval announcement: handled in code, no coordinator turn
         return
+    if emoji == "👎" and (stem := dispatcher.outcome_for_message(reaction.get("message_id"))):
+        state["awaiting_followup"] = {"task": stem, "at": dispatcher.now_iso()}  # the next message says what was wrong
+        send_replies([f"What was wrong with {stem}? Reply with what to change, or send /skip."], state)
+        return
     snippet = next(
         (s for mid, s in reversed(state.get("sent_messages", []))
          if mid == reaction.get("message_id")),
@@ -763,6 +767,25 @@ def send_menu():
         log.error("Could not send the menu: %s", exc)
 
 
+FOLLOWUP_WAIT = timedelta(minutes=60)  # how long a 👎 waits for its answer
+
+
+def continue_from(stem, text):
+    """The reply to /continue, to a reply on a result and to the answer to a 👎: queue a follow-up. No model is called."""
+    ok, message = dispatcher.create_followup(stem, text, source="user")
+    return ("↪️ " if ok else "⚠️ ") + message
+
+
+def awaited_task(state):
+    """The task a 👎 is waiting to hear about, or None when nothing is awaited or it has gone stale."""
+    waiting = state.get("awaiting_followup")
+    try:
+        asked = datetime.strptime(waiting["at"], dispatcher.ISO_FMT).replace(tzinfo=timezone.utc)
+        return waiting["task"] if datetime.now(timezone.utc) - asked < FOLLOWUP_WAIT else None
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
 def refuse_secret(msg, chat_id, kinds, state):
     """A message that holds a key or token: not logged, not stored, not sent to the model. Delete it and say why, once."""
     log.warning("Dropped message %s: it looked like a %s", msg.get("message_id"), " and a ".join(kinds))
@@ -841,6 +864,27 @@ def handle_update(update, state):
         ok, result = dispatcher.retry_task(target)
         send_replies([("🔁 " if ok else "⚠️ ") + result], state)
         return
+    if text == "/tasks":
+        send_replies([dispatcher.finished_tasks_text()], state)
+        return
+    if text == "/continue" or text.startswith("/continue "):
+        stem, _, change = text[len("/continue"):].strip().partition(" ")
+        send_replies([continue_from(stem, change) if stem else dispatcher.finished_tasks_text()], state)
+        return
+    if text == "/skip":
+        dropped = state.pop("awaiting_followup", None)
+        send_replies(["Dropped it." if dropped else "Nothing to skip."], state)
+        return
+    replied_to = (msg.get("reply_to_message") or {}).get("message_id")
+    if not text.startswith("/"):  # a command inside a reply is still a command
+        if replied_to and (stem := dispatcher.outcome_for_message(replied_to)):  # a reply to a result: continue that task
+            state.pop("awaiting_followup", None)
+            send_replies([continue_from(stem, text)], state)
+            return
+        if stem := awaited_task(state):  # the answer to "what was wrong?"
+            state.pop("awaiting_followup", None)
+            send_replies([continue_from(stem, text)], state)
+            return
     for command, act, icon in (("/approve", dispatcher.approve_task, "✅ "), ("/reject", dispatcher.reject_task, "🗑 ")):
         if text == command or text.startswith(command + " "):
             target = text[len(command):].strip()
@@ -915,6 +959,8 @@ def main():
             {"command": "usage", "description": "What today and this week cost"},
             {"command": "cancel", "description": "Archive a pending task: /cancel <task-id>"},
             {"command": "retry", "description": "Requeue a failed/cancelled task: /retry <task-id>"},
+            {"command": "tasks", "description": "The last finished tasks and what each made"},
+            {"command": "continue", "description": "Carry on from a finished task: /continue <task-id> <what to change>"},
             {"command": "approve", "description": "Let a waiting task run: /approve <task-id>"},
             {"command": "reject", "description": "Drop a waiting task: /reject <task-id>"},
             {"command": "new", "description": "Start a fresh coordinator conversation"},
