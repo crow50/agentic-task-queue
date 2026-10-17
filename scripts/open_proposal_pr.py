@@ -12,6 +12,8 @@ the model, decides what happens to it:
    coordinator/CLAUDE.md.template, models.json (the model table; the tests check it is valid), a *new* tests/test_*.py, or a file under .claude/skills/.
    dispatcher.py, tests that already exist, .github/, scripts/ and everything else
    are refused, and so are deletes, renames, mode changes and binary patches.
+   (One exception: the bridge's "Name your assistant" button passes `--allow` for coordinator/identity.md and
+   .env.example, and sets TASKQ_NAME_PR=1. Without both, `--allow` is refused.)
 2. The patch is applied in a temporary git worktree cut from <remote>/<base>, so
    the running checkout is never touched, and CMD (default: unittest
    discover with the checkout's .venv python) must pass there.
@@ -24,6 +26,7 @@ for the queue. Stdlib only.
 """
 
 import argparse
+import os
 import re
 import shlex
 import shutil
@@ -33,6 +36,8 @@ import tempfile
 from pathlib import Path
 
 EDITABLE = {"worker_preamble.md", "coordinator/CLAUDE.md.template", "models.json"}
+NAME_PATHS = {"coordinator/identity.md", ".env.example"}  # what `--allow` may add, and only for the bridge's naming flow
+NAME_ENV = "TASKQ_NAME_PR"
 SKILLS_PREFIX = ".claude/skills/"
 NEW_TEST = re.compile(r"tests/test_[A-Za-z0-9_]+\.py")
 TEST_TIMEOUT_S = 1800
@@ -65,8 +70,8 @@ def tail(text, lines=20):
     return "\n".join(text.strip().splitlines()[-lines:])
 
 
-def check_paths(repo, patch):
-    """Refuse the patch unless every file it touches is one the improver may change."""
+def check_paths(repo, patch, allowed=()):
+    """Refuse the patch unless every file it touches is one the improver may change (or one `allowed` adds)."""
     numstat = git(repo, "apply", "--numstat", str(patch))
     if numstat.returncode != 0:
         raise Rejected(f"not a valid patch: {numstat.stderr.strip()[-300:]}")
@@ -93,7 +98,7 @@ def check_paths(repo, patch):
         raise Rejected("the patch changes no files")
 
     for path in paths:
-        editable = path in EDITABLE
+        editable = path in EDITABLE or path in allowed
         skill = path.startswith(SKILLS_PREFIX) and ".." not in Path(path).parts
         new_test = bool(NEW_TEST.fullmatch(path)) and path in created
         if not (editable or skill or new_test):
@@ -189,7 +194,13 @@ def main(argv):
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--test-cmd", help="default: unittest discover with the checkout's .venv python")
     parser.add_argument("--gh", default="gh")
+    parser.add_argument("--allow", action="append", default=[], metavar="PATH",
+                        help=f"also allow this path ({', '.join(sorted(NAME_PATHS))} only); the bridge's naming flow uses it "
+                             f"and needs {NAME_ENV}=1 in the environment")
     args = parser.parse_args(argv)
+    if args.allow and (os.environ.get(NAME_ENV) != "1" or not set(args.allow) <= NAME_PATHS):
+        print(f"--allow is only for the assistant-naming flow: {', '.join(sorted(NAME_PATHS))} with {NAME_ENV}=1", file=sys.stderr)
+        return 2
 
     patch = Path(args.patch).resolve()
     if not patch.is_file():
@@ -203,7 +214,7 @@ def main(argv):
     args.test_cmd = args.test_cmd or default_test_cmd(repo)
 
     try:
-        check_paths(repo, patch)
+        check_paths(repo, patch, set(args.allow))
         url = open_pr(args, repo, patch)
     except Rejected as exc:
         file_away(patch, "rejected", ".reason", str(exc))

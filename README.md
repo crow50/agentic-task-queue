@@ -537,6 +537,65 @@ cron dispatcher picks them up. It never implements anything itself.
   `claude`, keeps your message in `coordinator/state.json`, and answers it
   when the queue is back. `/status`, `/cancel`, `/retry` and `/new` still work.
 
+## Numbers and controls
+
+What everything costs, a warning before a limit, and the same controls as buttons on your phone.
+
+### Numbers
+
+- `logs/usage.jsonl` has a line per claude call with `session_id`, `cost_usd` (what the call added to its session's
+  running total, so a resumed coordinator session is not counted twice) and `context_pct` (how full the model's window
+  was). `python3 dispatcher.py usage` prints cost by day and model; `usage --by day|label|model|agent` groups one way
+  and adds a `tokens` column (billed input, cache writes and output; cache reads are left out). Rows written before
+  the fix are summed by their rise in file order for the coordinator and by their total for everything else.
+- `/usage` in Telegram says the same for today and the last 7 days. `/status <task-id>` shows one task's state, tier,
+  attempts and outcome. Neither calls a model.
+- Alerts, each sent once a day per condition and each off at 0 (the installer turns on the first two):
+  `CONTEXT_WARN_PCT` (a worker over it means the task is too big, so the message names the task),
+  `CONTEXT_ROTATE_PCT` (see below), `DAILY_COST_BUDGET_USD` and `DAILY_TOKEN_BUDGET` (your own numbers; the queue cannot
+  see your plan's real limit, and a budget alert does not stop the queue). A recurring template that has not run within
+  two of its periods raises one "has not run since ..." alert, and a quiet task that ran but produced nothing says so in
+  one line.
+- **Session rotation.** When the coordinator's context reaches `CONTEXT_ROTATE_PCT`, the next message first runs one
+  short call that writes the key facts to `coordinator/memory/session.md`, then starts a fresh session (seeded from
+  `CLAUDE.md`, which imports that file) and tells you in one line. `COORDINATOR_MEMORY_MAX_KB` keeps the memory folder
+  bounded by dropping the oldest lines of `session.md`; `MEMORY.md` and `preferences.md` are never trimmed.
+
+### Savings (each is a switch, measure before keeping it)
+
+- `review: skip-if-verified` skips the review when the `verify:` command passed **and** every acceptance criterion line
+  carries `[verify]` (the author's statement that the command checks it). `max_turns: N` stops a worker that runs away
+  and tells the next attempt why. The worker preamble comes first in every prompt and the task-specific text after it,
+  so prompt caching hits.
+- `models.json` says which model does which job, with an ordered fallback chain per role (and value class) and a
+  `chat`/`code` tag per model. `model: auto` takes the chain's first usable model. When the account answers "model not
+  supported", the call uses no attempt, you get one notice, and the next run uses the next model in the chain (for 24
+  hours). `install.py --check` makes one tiny call to every model in the table and warns about the ones your account
+  cannot use. The weekly improver may propose edits to the table as a pull request.
+- `scripts/golden.py --route <name>` runs the five tasks in `tests/golden/` (each with a `verify:` command, one a
+  research task that must explain every exclusion, one whose worker claims success without doing anything and must
+  fail) and prints pass rate, cost per pass and time. Against the fake claude (the default, and what CI does) it tests
+  the plumbing; with `--real` it spends real usage, so run it by hand, on the Pi, with a route per setting:
+  `golden.py --route baseline --route savings --real` also prints what the second costs as a share of the first.
+
+### Menu and buttons
+
+- `/menu` sends one message with buttons: Status, Usage, Pause or Resume, Run learning review, Create skill from a task,
+  Name your assistant. Telegram's `/` list also gets `/menu`, `/status` and `/usage`. A tap passes the same sender check
+  as a message, is always answered, and edits the menu message to show what happened. Buttons enqueue files; they never
+  call a model, except the naming exchange.
+- Anything that spends shows the average cost of that kind of run from `usage.jsonl` and needs a second tap, Confirm.
+  The tap is also the approval of that exact task, so the approval gate does not hold it again. Two taps make one task.
+  The learning review and `skill-from-task` are both `quiet: true`: if the improver finds nothing, you hear nothing.
+- Every notice for a condition carries the button for the obvious next step: Approve and Reject on a task waiting for
+  approval, Resume on a pause or an expired login, Retry and Open on a failed task, Retry and Cancel on a held or blocked
+  pull request, Open on a missed run. Each condition is said once; one that is still true a day later is said once more
+  with the time that has passed.
+- `ASSISTANT_NAME` (default `taskq`) is what the menu and `/usage` call the assistant, and `coordinator/identity.md`
+  says how it talks. "Name your assistant" asks the coordinator for three names with a reason each (or lets it choose),
+  sets `ASSISTANT_NAME` in `.env`, and opens a pull request that changes only `coordinator/identity.md` and the
+  `.env.example` default.
+
 ## Setup
 
 Prerequisites: a Debian/Ubuntu machine (a Raspberry Pi 4/5 with 64-bit Ubuntu

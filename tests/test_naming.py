@@ -41,9 +41,10 @@ class PatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             naming.name_patch(IDENTITY, "X=1\n", "Juno")
 
-    def test_shipped_files_carry_the_default_the_patch_edits(self):
-        self.assertIn("My name is **taskq**.", IDENTITY)
-        self.assertRegex(ENV_EXAMPLE, r"(?m)^ASSISTANT_NAME=taskq$")
+    def test_shipped_files_carry_the_lines_the_patch_edits_and_they_agree(self):
+        name = naming.IDENTITY_LINE.search(IDENTITY).group(0)[len("My name is **"):-len("**.")]
+        self.assertIsNotNone(naming.clean(name))
+        self.assertRegex(ENV_EXAMPLE, rf"(?m)^ASSISTANT_NAME={name}$")
 
 
 class ProposalTests(unittest.TestCase):
