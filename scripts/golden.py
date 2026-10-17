@@ -11,8 +11,12 @@ what its calls spent. A task counts as right when it ends the way its `expect:` 
 whose fake worker only claims success is right when it FAILS. `fake_only: true` tasks are skipped with --real.
 
 With the fake claude the money is made up and only the plumbing is tested. With --real the run spends real
-usage: run it by hand, on the Pi, with the savings off and then on. Stdlib only; the dispatcher it starts needs
-the queue's libraries, so run this with the queue's own python.
+usage: run it by hand, on the Pi, with the savings off and then on, as the queue user:
+
+    sudo -u taskq .venv/bin/python scripts/golden.py --route baseline --route savings --real
+
+Stdlib only. The dispatcher it starts runs under the checkout's .venv python when there is one. With --real the
+claude binary and login token come from the environment, else from the checkout's .env (so `sudo` is not a problem).
 """
 
 import argparse
@@ -30,6 +34,32 @@ GOLDEN = REPO / "tests" / "golden"
 FAKE_CLAUDE = REPO / "tests" / "fake_claude.py"
 GOLDEN_ONLY_KEYS = ("expect", "fake_only")  # for this script; the dispatcher would reject them
 WORKER, REVIEWER = "claude-sonnet-5", "claude-haiku-4-5-20251001"
+
+
+def queue_python():
+    """The python to start the dispatcher with: the checkout's venv (it has the libraries), else this one."""
+    venv = REPO / ".venv" / "bin" / "python3"
+    return str(venv) if venv.exists() else sys.executable
+
+
+def read_env(path):
+    """KEY=VALUE lines of a .env file as a dict; comments, blanks and surrounding quotes are dropped."""
+    found = {}
+    if not path.exists():
+        return found
+    for line in path.read_text().splitlines():
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if sep and key and not key.startswith("#"):
+            found[key] = value.strip().strip("\"'")
+    return found
+
+
+def real_settings(environ, queue_env):
+    """The claude binary and login token for a --real run: the environment first, then the queue's .env."""
+    claude = environ.get("CLAUDE_BIN") or shutil.which("claude") or queue_env.get("CLAUDE_BIN") or ""
+    token = environ.get("CLAUDE_CODE_OAUTH_TOKEN") or queue_env.get("CLAUDE_CODE_OAUTH_TOKEN") or ""
+    return {"CLAUDE_BIN": claude, **({"CLAUDE_CODE_OAUTH_TOKEN": token} if token else {})}
 
 
 def split_task(path):
@@ -64,10 +94,7 @@ def make_queue(root, route, real):
                 "DEFAULT_TIMEOUT_MINUTES": "30" if real else "1", "REVIEW_TIMEOUT_MINUTES": "10" if real else "1",
                 **route.get("env", {})}
     if real:
-        claude = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or ""
-        settings["CLAUDE_BIN"] = claude
-        if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
-            settings["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+        settings.update(real_settings(os.environ, read_env(REPO / ".env")))
     else:
         settings["CLAUDE_BIN"] = str(FAKE_CLAUDE)
     (base / ".env").write_text("".join(f"{k}={v}\n" for k, v in settings.items()))
@@ -104,7 +131,7 @@ def run_one(base, task_dir, route, real, root):
     started = time.monotonic()
     outcome, error = None, ""
     for _ in range(int(frontmatter.get("max_attempts", 3)) + 1):
-        proc = subprocess.run([sys.executable, str(base / "dispatcher.py")], cwd=base, env=env,
+        proc = subprocess.run([queue_python(), str(base / "dispatcher.py")], cwd=base, env=env,
                               capture_output=True, text=True, timeout=3600)
         if proc.returncode != 0:
             lines = (proc.stderr or proc.stdout).strip().splitlines()
@@ -170,6 +197,10 @@ def main(argv=None):
         for task_dir in golden_tasks():
             print(f"task  {task_dir.name}")
         return 0
+    if args.real and not real_settings(os.environ, read_env(REPO / ".env"))["CLAUDE_BIN"]:
+        print("--real needs the claude binary: set CLAUDE_BIN in the environment or in .env, or put claude on PATH",
+              file=sys.stderr)
+        return 2
     names = args.route or ["baseline"]
     unknown = [n for n in names if n not in routes]
     if unknown:
