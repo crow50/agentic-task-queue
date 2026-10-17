@@ -9,6 +9,11 @@
 Every request is recorded. By default each method answers {"ok": true, ...};
 queue_response() makes the next call to a method fail or return something else,
 e.g. a 400 to exercise the HTML-to-plain-text fallback.
+
+With telegram.strict = True it also refuses what the real Bot API refuses, with the real
+wording: text that is empty or longer than 4096 characters (counted as Python characters; whether Telegram counts UTF-16 units is unverified,
+after HTML parsing), and HTML with an unsupported or unbalanced tag. Rejected requests are
+recorded in telegram.rejected as (method, description).
 """
 
 import json
@@ -17,7 +22,57 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+TEXT_LIMIT = 4096
+HTML_TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre", "blockquote",
+             "tg-spoiler", "tg-emoji", "span"}
+
+
+class _HtmlCheck(HTMLParser):
+    """Telegram's HTML subset: allowed tags only, each closed in order. .text is what the reader sees."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack, self.parts, self.error = [], [], None
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in HTML_TAGS:
+            self.error = self.error or f"Unsupported start tag \"{tag}\""
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack[-1] != tag:
+            self.error = self.error or f"Unmatched end tag \"{tag}\""
+        else:
+            self.stack.pop()
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    @property
+    def text(self):
+        return "".join(self.parts)
+
+
+def strict_error(request):
+    """Why the real Bot API would answer 400 to this request, or None."""
+    if request.method not in ("sendMessage", "editMessageText"):
+        return None
+    text = request.params.get("text", "")
+    if request.params.get("parse_mode") == "HTML":
+        check = _HtmlCheck()
+        check.feed(text)
+        check.close()
+        if check.error or check.stack:
+            return "can't parse entities: " + (check.error or f"Can't find end tag for \"{check.stack[-1]}\"")
+        text = check.text
+    if not text.strip():
+        return "message text is empty"
+    if len(text) > TEXT_LIMIT:
+        return "message is too long"
+    return None
 
 
 @dataclass
@@ -28,11 +83,14 @@ class Request:
     params: dict  # decoded form / JSON / query parameters
     body: bytes  # raw body, for multipart uploads
     at: float = field(default_factory=time.monotonic)  # when it arrived, for rate-limit assertions
+    accepted: bool = True  # False when strict mode refused it (or a queued response failed it)
 
 
 class FakeTelegram:
     def __init__(self):
         self.requests = []
+        self.rejected = []  # (method, description) refused by strict mode
+        self.strict = False
         self.updates = []  # served (once) by getUpdates
         self._queued = {}
         self._next_message_id = 100
@@ -82,6 +140,10 @@ class FakeTelegram:
 
     def respond(self, request):
         with self._lock:
+            if self.strict and (problem := strict_error(request)):
+                request.accepted = False
+                self.rejected.append((request.method, problem))
+                return 400, {"ok": False, "error_code": 400, "description": f"Bad Request: {problem}"}
             queued = self._queued.get(request.method)
             if queued:
                 return queued.pop(0)

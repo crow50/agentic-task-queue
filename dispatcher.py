@@ -336,6 +336,7 @@ FRONTMATTER_KEYS = {
     "pending_publish": (False, False, None),  # managed by the dispatcher
     "held_until": (False, False, None),  # managed by the dispatcher: not before this time
     "publish_failures": (False, False, None),  # managed by the dispatcher
+    "publish_blocked": (False, False, None),  # managed by the dispatcher: the credentials cannot publish; wait for the probe
     "proposed_by": (False, False, None),  # managed by the dispatcher
     "depth": (False, False, _whole_number(0)),  # managed by the dispatcher
     "schedule": (False, True, None),  # checked by check_schedule()
@@ -904,7 +905,43 @@ def run_claude(cmd, prompt, timeout_s, cwd, transcript, label, retries=None, wat
 # ---------------------------------------------------------------- telegram
 
 
+# ------------------------------------------------------------------- secrets
+#
+# One list of what a secret looks like, used three ways: the diff guard refuses a commit
+# that adds one, the Telegram bridge refuses to read or keep a message that holds one, and
+# every message sent to Telegram is redacted first. Better a false alarm than a leaked key.
+
+SECRET_PATTERNS = (
+    ("GitHub token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
+    ("Anthropic key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{16,}")),
+    ("Telegram bot token", re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b")),
+    ("Notion token", re.compile(r"\bntn_[A-Za-z0-9]{20,}")),
+    ("DigitalOcean token", re.compile(r"\bdop_v1_[A-Za-z0-9]{20,}")),
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("private key", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
+    ("password or token", re.compile(
+        r"(?P<keep>(?:token|secret|password|api[_-]?key)[\"']?\s*[:=]\s*[\"']?)[A-Za-z0-9/+_=.\-]{16,}", re.I)),
+)
+
+
+def secret_kinds(text):
+    """The kinds of secret `text` appears to contain, in the order of SECRET_PATTERNS. Never the values."""
+    return [kind for kind, pattern in SECRET_PATTERNS if pattern.search(text)]
+
+
+def redact_secrets(text):
+    """`text` with every secret replaced by [redacted <kind>] (a generic assignment keeps its name)."""
+    for kind, pattern in SECRET_PATTERNS:
+        text = pattern.sub(lambda m, kind=kind: (m.groupdict().get("keep") or "") + f"[redacted {kind}]", text)
+    return text
+
+
 TELEGRAM_MAX = 4096
+
+
+def clip_for_telegram(text, limit=TELEGRAM_MAX):
+    """`text` cut so it fits one message; a last resort for senders that have no attachment to fall back on."""
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
 def md_to_telegram_html(text):
@@ -961,6 +998,7 @@ def send_message_id(raw, formatted=True):
     when nothing was sent. The id is what editMessageText and reactions refer to.
     """
     chat_id = cfg("TELEGRAM_CHAT_ID")
+    raw = clip_for_telegram(redact_secrets(raw))  # a worker that prints a key must not forward it to a phone
     variants = [({"chat_id": chat_id, "text": md_to_telegram_html(raw), "parse_mode": "HTML"}, True)] if formatted else []
     variants.append(({"chat_id": chat_id, "text": raw}, False))
     for params, is_html in variants:
@@ -993,7 +1031,7 @@ def post_message(raw):
 def edit_message(message_id, raw):
     """editMessageText as plain text. True when done (or harmlessly unchanged), False on failure,
     or the seconds Telegram asked us to wait after a 429."""
-    data = urllib.parse.urlencode({"chat_id": cfg("TELEGRAM_CHAT_ID"), "message_id": message_id, "text": raw}).encode()
+    data = urllib.parse.urlencode({"chat_id": cfg("TELEGRAM_CHAT_ID"), "message_id": message_id, "text": redact_secrets(raw)}).encode()
     try:
         urllib.request.urlopen(telegram_url("editMessageText"), data, timeout=30).close()
         return True
@@ -1022,7 +1060,9 @@ def post_document(name, source):
                 files={"document": (name, content)}, timeout=120,
             )
         reply.raise_for_status()
-    except (httpx.HTTPError, OSError) as exc:
+        if reply.json().get("ok") is not True:  # only Telegram's own "ok" counts as sent
+            raise ValueError("Telegram answered ok: false")
+    except (httpx.HTTPError, OSError, ValueError) as exc:
         # httpx puts the request URL, which contains the bot token, in its messages: log only the cause.
         cause = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
         log.warning("Telegram document %s failed: %s", name, cause)
@@ -1179,6 +1219,11 @@ def start_status(path, meta):
     )
 
 
+def fits_in_message(text, limit=REPORT_INLINE_MAX):
+    """True when `text` can go out as one message, in its HTML form and its plain-text fallback, """
+    return len(text) <= limit and len(md_to_telegram_html(text)) <= TELEGRAM_MAX
+
+
 def fit_preview(prefix, text, suffix):
     """prefix + the start of text + suffix, cut at a line break so the HTML form fits one message.
 
@@ -1196,8 +1241,10 @@ def fit_preview(prefix, text, suffix):
         size = int(size * 0.8)
 
 
-def send_report(title, text, files=(), task_id="report"):
+def send_report(title, text, files=(), task_id="report", root=None):
     """Tell the user something. A long `text` becomes a preview plus `<task_id>.md`; `files` follow as documents.
+
+    A file Telegram did not accept is named in a follow-up as "not delivered: <path>" (relative to `root` when given).
 
     The one way the dispatcher sends done, failed and dependency notices, so
     nothing depends on a path only the machine running the queue can see.
@@ -1206,17 +1253,19 @@ def send_report(title, text, files=(), task_id="report"):
         return
     body = f"{title}\n\n{text}" if title and text else title or text
     attachments = []
-    if len(body) <= REPORT_INLINE_MAX and len(md_to_telegram_html(body)) <= TELEGRAM_MAX:
+    if fits_in_message(body):
         post_message(body)
     else:
         name = f"{task_id}.md"
         prefix = f"{title}\n\n" if title else ""
         post_message(fit_preview(prefix, text, f"\n\n[Preview — the full report is attached as {name}]"))
-        attachments.append((f"the full report ({name})", name, text.encode()))
-    attachments += [(path.name, path.name, path) for path in map(Path, files)]
+        attachments.append((f"the full report ({name})", name, redact_secrets(text).encode()))
+    root = Path(root).resolve() if root else None
+    attachments += [(str(path.relative_to(root)) if root and path.is_relative_to(root) else path.name, path.name, path)
+                    for path in map(Path, files)]
     for label, name, source in attachments:
         if not post_document(name, source):
-            post_message(f"⚠️ Couldn't attach {label}: Telegram refused the upload.")
+            post_message(f"⚠️ Couldn't attach {label}: Telegram refused the upload.\nnot delivered: {label}")
 
 
 def send_telegram(text):
@@ -1725,7 +1774,8 @@ def retry_task(stem):
                 meta, body = parse_task(path)
                 meta = meta or {}
                 meta["attempts"] = "0"
-                for key in ("pending_review", "review_failures", "pending_publish", "publish_failures", "held_until"):
+                for key in ("pending_review", "review_failures", "pending_publish", "publish_failures", "publish_blocked",
+                            "held_until"):
                     meta.pop(key, None)  # a fresh start redoes the work too
                 write_task(path, meta, body)
                 shutil.move(str(path), str(PENDING / path.name))
@@ -2136,6 +2186,74 @@ def prune_worktrees():
             log.warning("could not prune worktree %s: %s", worktree.name, exc)
 
 
+DIFF_GUARD_DENY_DEFAULT = ".venv/,venv/,node_modules/,__pycache__/,*.pyc,.env,*.pem,id_rsa*,*.sqlite"
+GUARD_LISTED_MAX = 20  # findings named in the feedback; the rest are counted
+
+
+def denied_path(path, patterns):
+    """True when `path` matches a DIFF_GUARD_DENY entry: `name/` is a folder anywhere in the path, anything else a file glob."""
+    parts = path.split("/")
+    for pattern in patterns:
+        if pattern.endswith("/"):
+            if any(fnmatch.fnmatch(part, pattern.rstrip("/")) for part in parts[:-1]):
+                return True
+        elif fnmatch.fnmatch(parts[-1], pattern) or fnmatch.fnmatch(path, pattern):
+            return True
+    return False
+
+
+def diff_guard(worktree, repo, meta):
+    """Scan what the worker changed against the branch point, before anything is committed.
+
+    Returns feedback for the worker when something must not be published, else "". The feedback
+    names paths and kinds of secret, never a value. Deleted lines are not scanned.
+    """
+    patterns = [p.strip() for p in cfg("DIFF_GUARD_DENY", DIFF_GUARD_DENY_DEFAULT).split(",") if p.strip()]
+    max_kb = float(cfg("DIFF_GUARD_MAX_KB", "1024"))
+    try:
+        git_need(worktree, "add", "-A")
+        base = git_need(worktree, "merge-base", base_ref(repo, meta), "HEAD")
+        changes = git_need(worktree, "-c", "core.quotepath=off", "diff", "--cached", "--name-status", "--no-renames", "-z", base)
+        tokens = [t for t in changes.split("\0") if t]
+        changed = list(zip(tokens[::2], tokens[1::2]))
+        problems = []
+        for status, path in changed:
+            if denied_path(path, patterns):
+                problems.append(f"- {path}: on the deny list (DIFF_GUARD_DENY)")
+            elif status == "A":
+                size_kb = int(git_need(worktree, "cat-file", "-s", f":{path}")) / 1024
+                if size_kb > max_kb:
+                    problems.append(f"- {path}: {size_kb:.0f} KB is over the {max_kb:g} KB limit for an added file (DIFF_GUARD_MAX_KB)")
+        flagged = {path for _, path in changed if any(path in problem for problem in problems)}
+        diff = git_need(worktree, "-c", "core.quotepath=off", "diff", "--cached", "-U0", "--no-color", "--no-renames", "--text", base)
+    except (GitError, ValueError) as exc:
+        return f"The dispatcher could not check the change before committing it ({exc}). Make sure the repository is healthy."
+    found, path, header = {}, None, False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path, header = None, True
+        elif header and line.startswith("+++ "):
+            path = line[4:].removeprefix("b/") if line != "+++ /dev/null" else None
+        elif line.startswith("@@"):
+            header = False
+        elif not header and line.startswith("+") and path and path not in flagged:
+            for kind in secret_kinds(line[1:]):
+                found.setdefault(path, [])
+                if kind not in found[path]:
+                    found[path].append(kind)
+    problems += [f"- {path}: an added line looks like a {', '.join(kinds)} (the value is not repeated here)"
+                 for path, kinds in found.items()]
+    if not problems:
+        return ""
+    shown = "\n".join(problems[:GUARD_LISTED_MAX]) + (f"\n- ...and {len(problems) - GUARD_LISTED_MAX} more" if len(problems) > GUARD_LISTED_MAX else "")
+    return (
+        "The dispatcher refused to commit this change, so nothing was pushed and no pull request was opened:\n"
+        f"{shown}\n"
+        "Delete these files or lines from the working tree. If a file is a build or environment folder, add its "
+        "path to .gitignore as well. Never put a key or token in a file; read it from the environment."
+    )
+
+
 def pr_title(stem, body):
     for line in body.splitlines():
         line = line.strip().lstrip("#").strip()
@@ -2156,21 +2274,95 @@ def pr_body(stem, body, worker_out, verified):
 
 
 def open_pr_count(cwd):
-    command = [*shlex.split(cfg("GH_BIN", "gh")), "pr", "list", "--state", "open", "--limit", "100", "--json", "headRefName",
-               "--jq", '[.[] | select(.headRefName | startswith("task/"))] | length']
+    proc = gh_run(cwd, "pr", "list", "--state", "open", "--limit", "100", "--json", "headRefName",
+                  "--jq", '[.[] | select(.headRefName | startswith("task/"))] | length')
     try:
-        proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=120, env=publish_env())
         if proc.returncode == 0:
             return int(proc.stdout.strip() or 0)
         detail = tail(proc.stderr or proc.stdout, 300)
-    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+    except ValueError as exc:
         detail = f"{type(exc).__name__}: {exc}"
     raise GitError(f"could not count open pull requests: {detail}")
 
 
+PUBLISH_AUTH_RE = re.compile(
+    r"\b40[13]\b|permission to \S+ denied|permission denied \(publickey|authentication failed|bad credentials|"
+    r"could not read (?:username|password)|resource not accessible|invalid username or token|requires authentication",
+    re.I,
+)
+PUBLISH_PERMISSIONS = ("WRITE", "MAINTAIN", "ADMIN")
+
+
+def publish_auth_problem(text):
+    """True when git or gh output says the credentials cannot do the job (a 401 or 403): a retry never helps."""
+    return bool(PUBLISH_AUTH_RE.search(text or ""))
+
+
+def gh_run(cwd, *args, timeout=120):
+    command = [*shlex.split(cfg("GH_BIN", "gh")), *args]
+    try:
+        return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=publish_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(command, 124, "", f"{type(exc).__name__}: {exc}")
+
+
+def publish_probe(repo):
+    """(ok, detail): can this checkout's credentials write to its remote? One `gh repo view` and one `git ls-remote`."""
+    proc = gh_run(repo, "repo", "view", "--json", "viewerPermission", timeout=60)
+    if proc.returncode != 0:
+        return False, f"gh repo view failed: {tail(proc.stderr or proc.stdout, 300)}"
+    try:
+        permission = str(json.loads(proc.stdout).get("viewerPermission") or "").upper()
+    except (ValueError, AttributeError):
+        permission = ""
+    if permission not in PUBLISH_PERMISSIONS:
+        return False, f"the token has {permission or 'no'} permission on the repository; it needs WRITE"
+    remote = git_run(repo, "ls-remote", "origin", "HEAD", timeout=60)
+    if remote.returncode != 0:
+        return False, f"git ls-remote origin failed: {tail(remote.stderr or remote.stdout, 300)}"
+    return True, ""
+
+
+def remote_slug(repo):
+    """owner/name of the checkout's origin on GitHub, else the folder name."""
+    url = git_run(repo, "remote", "get-url", "origin").stdout.strip()
+    match = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$", url)
+    return match.group(1) if match else Path(repo).name
+
+
+def pull_request_info(cwd, ref):
+    """What `gh pr view` says about a pull request (a URL or a branch name). Raises GitError if it cannot say."""
+    proc = gh_run(cwd, "pr", "view", ref, "--json", "url,state,isDraft,headRefName")
+    if proc.returncode != 0:
+        raise GitError(f"gh pr view could not find the pull request: {tail(proc.stderr or proc.stdout, 300)}")
+    try:
+        info = json.loads(proc.stdout)
+    except ValueError:
+        info = None
+    if not isinstance(info, dict):
+        raise GitError(f"gh pr view gave no usable answer: {tail(proc.stdout, 200)}")
+    return info
+
+
+def pull_request_problems(cwd, info, branch, sha):
+    """Why `info` is not the draft pull request we meant to open (empty when it is), checked against the remote too."""
+    problems = []
+    if str(info.get("state")).upper() != "OPEN":
+        problems.append(f"it is {str(info.get('state')).lower()}, not open")
+    if info.get("isDraft") is not True:
+        problems.append("it is not a draft")
+    if info.get("headRefName") != branch:
+        problems.append(f"its head branch is {info.get('headRefName')!r}, not {branch!r}")
+    remote = git_run(cwd, "ls-remote", "origin", f"refs/heads/{branch}")
+    found = remote.stdout.split()[0] if remote.returncode == 0 and remote.stdout.split() else ""
+    if found != sha:
+        problems.append("the remote branch is not at the commit that was pushed")
+    return problems
+
+
 def publish_draft_pr(path, meta, body, worker_out, verified):
-    """Commit the worktree, push task/<id> and open a draft PR. Returns (status, detail):
-    ok (the URL), nochange, held (open PR count), or error (why)."""
+    """Commit the worktree, push task/<id>, open a draft PR and check it is what we claim. Returns (status, detail):
+    ok (the URL), nochange, held (open PR count), denied (the credentials cannot publish: why) or error (why)."""
     stem, branch = path.stem, branch_name(path.stem)
     worktree, repo, base = worktree_path(path.stem), repo_path(meta), meta.get("base") or "main"
     title = pr_title(stem, body)
@@ -2186,24 +2378,31 @@ def publish_draft_pr(path, meta, body, worker_out, verified):
             if open_prs >= cap:
                 return "held", str(open_prs)
         git_need(worktree, "push", "-q", "-u", "origin", branch, timeout=300)
+        sha = git_need(worktree, "rev-parse", "HEAD")
         with tempfile.TemporaryDirectory() as tmp:
             body_file = Path(tmp) / "body.md"
             body_file.write_text(pr_body(stem, body, worker_out, verified))
-            command = [*shlex.split(cfg("GH_BIN", "gh")), "pr", "create", "--draft", "--base", base, "--head", branch,
-                       "--title", title, "--body-file", str(body_file)]
-            try:
-                proc = subprocess.run(command, cwd=worktree, capture_output=True, text=True, timeout=120, env=publish_env())
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                proc = subprocess.CompletedProcess(command, 124, "", f"{type(exc).__name__}: {exc}")
+            proc = gh_run(worktree, "pr", "create", "--draft", "--base", base, "--head", branch,
+                          "--title", title, "--body-file", str(body_file))
         if proc.returncode != 0:
-            git_run(worktree, "push", "-q", "origin", "--delete", branch)  # no PR: don't leave a dangling branch
-            raise GitError(f"gh pr create failed: {tail(proc.stderr or proc.stdout, 400)}")
-        url = next((line.strip() for line in reversed(proc.stdout.splitlines()) if line.strip()), "")
-        if not url.startswith("http"):
-            raise GitError(f"gh pr create printed no URL: {tail(proc.stdout, 200)}")
-        return "ok", url
+            try:  # an earlier try may have opened it and failed only at the check below: use it, never delete its branch
+                info = pull_request_info(worktree, branch)
+            except GitError:
+                info = None
+            if info is None or str(info.get("state")).upper() != "OPEN":
+                git_run(worktree, "push", "-q", "origin", "--delete", branch)  # no PR: don't leave a dangling branch
+                raise GitError(f"gh pr create failed: {tail(proc.stderr or proc.stdout, 400)}")
+            url = info.get("url") or ""
+        else:
+            url = next((line.strip() for line in reversed(proc.stdout.splitlines()) if line.strip()), "")
+            if not url.startswith("http"):
+                raise GitError(f"gh pr create printed no URL: {tail(proc.stdout, 200)}")
+            info = pull_request_info(worktree, url)
+        if problems := pull_request_problems(worktree, info, branch, sha):
+            raise GitError(f"the pull request {url} did not check out: " + "; ".join(problems))
+        return "ok", info.get("url") or url
     except (GitError, ValueError) as exc:
-        return "error", str(exc)
+        return ("denied" if publish_auth_problem(str(exc)) else "error"), str(exc)
 
 
 def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified=None, skipped=False):
@@ -2215,18 +2414,34 @@ def conclude_pass(path, meta, body, attempts, max_attempts, worker_out, denials,
     status, detail = publish_draft_pr(path, meta, body, worker_out, verified)
     stem = path.stem
     if status == "ok":
-        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures", "held_until"):
+        for key in ("pending_publish", "publish_failures", "publish_blocked", "pending_review", "review_failures",
+                    "held_until"):
             meta.pop(key, None)
         meta["pr_url"], meta["branch"] = detail, branch_name(stem)
         clear_reported(f"pr-held|tasks/pending/{path.name}")
+        clear_reported(f"publish-denied|tasks/pending/{path.name}")
         finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials, cwd, verified, skipped, pr_url=detail)
         remove_worktree(meta, stem)
     elif status == "nochange":
-        for key in ("pending_publish", "publish_failures", "pending_review", "review_failures", "held_until"):
+        for key in ("pending_publish", "publish_failures", "publish_blocked", "pending_review", "review_failures",
+                    "held_until"):
             meta.pop(key, None)
         handle_failure(path, meta, body, attempts, max_attempts,
                        "The worker made no changes to the repository, so there is nothing to open a pull request for. "
                        "Make the change the task describes.")
+    elif status == "denied":  # a setup problem: keep the work, use no attempt, say what to fix once, wait for the probe
+        meta["pending_publish"], meta["publish_blocked"] = "1", "1"
+        meta.pop("held_until", None)
+        park_report(path, meta, body, attempts, worker_out, denials)
+        slug = remote_slug(repo_path(meta))
+        report_once(
+            f"publish-denied|tasks/pending/{path.name}", "denied",
+            f"Task {stem}: the credentials cannot publish to {slug}: {detail}",
+            f"🔑 {path.name} is finished and checked, but the token cannot publish it to {slug}. In .env, GH_TOKEN "
+            "needs Contents and Pull requests set to read and write on that one repository. Nothing is lost: the "
+            "work is kept and publishes by itself on the next run once the token works. This is the only message "
+            "about it.",
+        )
     elif status == "held":
         meta["pending_publish"] = "1"
         if until := hold_until():
@@ -2270,7 +2485,8 @@ PROPOSE_NOTE = (
     "proposals: they wait for the human's approval before anything runs. Do not write to tasks/pending/.\n\n"
 )
 TASK_DIRS = (PENDING, PROPOSED, ACTIVE, DONE, FAILED, CANCELLED, RECURRING)
-MANAGED_KEYS = ("tier", "pr_url", "branch", "pending_review", "review_failures", "pending_publish", "publish_failures")
+MANAGED_KEYS = ("tier", "pr_url", "branch", "pending_review", "review_failures", "pending_publish", "publish_failures",
+                "publish_blocked")
 
 
 def proposal_limits():
@@ -2435,6 +2651,14 @@ def pick_task(skip=()):
         meta, body = parse_task(src)
         if meta and is_held(meta):  # a held PR or a failed publish: not before its time
             continue
+        if meta and meta.get("publish_blocked") and not repo_problem(meta):
+            ok, detail = publish_probe(repo_path(meta))
+            if not ok:  # still broken: one cheap probe per run, no push, no message (it was said once)
+                log.info("Task %s: publishing is still blocked (%s)", src.name, detail)
+                continue
+            meta.pop("publish_blocked", None)
+            write_task(src, meta, body)
+            log.info("Task %s: the publish probe passed; publishing", src.name)
         blocked = None
         cancelled_dep = None
         for dep in dep_names(meta):
@@ -2694,7 +2918,7 @@ def finish_passed(path, meta, body, attempts, max_attempts, worker_out, denials,
         lines.append(f"🔀 Draft PR ready: {pr_url}")
     files, notes = collect_deliverables(meta, cwd)
     if meta.get("quiet") != "true" or pr_url:  # quiet tasks (the weekly improver) report only failures, and PR links
-        send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem)
+        send_report("\n".join(lines), worker_out.strip(), files=files, task_id=path.stem, root=cwd)
     if notes:
         send_telegram("⚠️ Not delivered:\n" + "\n".join(f"- {note}" for note in notes))
 
@@ -2825,6 +3049,14 @@ def run_task(path, status=None):
             handle_failure(path, meta, body, attempts, max_attempts, f"Worker invocation failed:\n{tail(str(exc))}")
             return
         worker_out, denials = reply.text, reply.envelope.get("permission_denials") or []
+
+    if meta.get("repo") and (problem := diff_guard(Path(cwd), repo_path(meta), meta)):
+        meta.pop("pending_review", None)  # the saved report described files that may not be published
+        meta.pop("review_failures", None)
+        meta.pop("pending_publish", None)
+        log.warning("Task %s: diff guard refused the change", name)
+        handle_failure(path, meta, body, attempts, max_attempts, problem)
+        return
 
     verified, verification = None, ""
     if meta.get("verify"):

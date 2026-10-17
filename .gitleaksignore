@@ -1,0 +1,2 @@
+# tests/test_secret_redaction.py pins the "password or token" pattern with a made-up value.
+0ab087f9deca6a4f8378b517d78eaca95816f653:tests/test_secret_redaction.py:generic-api-key:43

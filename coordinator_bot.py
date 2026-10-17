@@ -110,48 +110,43 @@ def tg_api(method, params=None, timeout=60):
 api = tg_api  # module-level indirection so tests can substitute a fake
 
 
-def chunk_message(text, limit=TELEGRAM_MAX):
-    """Split a long reply into <=limit chunks, preferring line boundaries."""
-    chunks = []
-    text = text.strip()
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        chunks.append(text[:cut].rstrip("\n"))
-        text = text[cut:].lstrip("\n")
-    if text:
-        chunks.append(text)
-    return chunks
-
-
 def send_replies(texts, state=None):
-    """Send texts as formatted Telegram messages, plain-text fallback per chunk.
+    """Send texts as formatted Telegram messages, plain-text fallback per message.
 
-    When state is given, each sent message is recorded in
-    state["sent_messages"] as [message_id, snippet] so a later reaction to it
-    can be traced back to what it said (caller persists via save_state).
+    A text that does not fit one message goes out as a preview plus reply.md, never as a run of fragments.
+    When state is given, each sent message is recorded in state["sent_messages"] as [message_id, snippet]
+    so a later reaction to it can be traced back to what it said (caller persists via save_state).
     """
     chat_id = cfg("TELEGRAM_CHAT_ID")
-    for text in texts:
-        for chunk in chunk_message(text):
+
+    def send_one(chunk):
+        try:
+            sent = api(
+                "sendMessage",
+                {"chat_id": chat_id, "text": md_to_telegram_html(chunk), "parse_mode": "HTML"},
+                timeout=30,
+            )
+        except Exception as exc:
+            log.warning("Formatted send failed (%s); retrying as plain text", exc)
             try:
-                sent = api(
-                    "sendMessage",
-                    {"chat_id": chat_id, "text": md_to_telegram_html(chunk), "parse_mode": "HTML"},
-                    timeout=30,
-                )
+                sent = api("sendMessage", {"chat_id": chat_id, "text": chunk}, timeout=30)
             except Exception as exc:
-                log.warning("Formatted send failed (%s); retrying as plain text", exc)
-                try:
-                    sent = api("sendMessage", {"chat_id": chat_id, "text": chunk}, timeout=30)
-                except Exception as exc:
-                    log.error("sendMessage failed: %s", exc)
-                    continue
-            if state is not None and isinstance(sent, dict) and sent.get("message_id"):
-                record = state.setdefault("sent_messages", [])
-                record.append([sent["message_id"], chunk[:200]])
-                del record[:-20]
+                log.error("sendMessage failed: %s", exc)
+                return
+        if state is not None and isinstance(sent, dict) and sent.get("message_id"):
+            record = state.setdefault("sent_messages", [])
+            record.append([sent["message_id"], chunk[:200]])
+            del record[:-20]
+
+    for text in texts:
+        text = dispatcher.redact_secrets(text)
+        if dispatcher.fits_in_message(text, limit=TELEGRAM_MAX):
+            send_one(text)
+            continue
+        name = "reply.md"
+        send_one(dispatcher.fit_preview("", text, f"\n\n[Preview - the full reply is attached as {name}]"))
+        if not dispatcher.post_document(name, text.encode()):
+            send_one(f"⚠️ Couldn't attach the full reply ({name}): Telegram refused the upload.\nnot delivered: {name}")
 
 
 # ---------------------------------------------------------------- state
@@ -202,6 +197,9 @@ def run_coordinator(prompt, session_id):
         claude_bin, "-p",
         "--model", cfg("COORDINATOR_MODEL", "claude-sonnet-5"),
         "--allowedTools", cfg("COORDINATOR_ALLOWED_TOOLS") or default_allowed_tools(),
+        # Claude only touches files under its working directory (coordinator/) and these folders: without them
+        # a write to tasks/pending/ is refused as outside the sandbox, whatever --allowedTools says.
+        "--add-dir", str(BASE / "tasks"), "--add-dir", str(BASE / "logs"),
         "--output-format", "json",
     ]
     if session_id:
@@ -403,6 +401,20 @@ def handle_reaction(reaction, state):
     converse(prompt, state)
 
 
+def refuse_secret(msg, chat_id, kinds, state):
+    """A message that holds a key or token: not logged, not stored, not sent to the model. Delete it and say why, once."""
+    log.warning("Dropped message %s: it looked like a %s", msg.get("message_id"), " and a ".join(kinds))
+    record = state.setdefault("redacted", [])
+    record.append({"message_id": msg.get("message_id"), "kinds": kinds, "at": dispatcher.now_iso()})
+    del record[:-20]
+    try:
+        api("deleteMessage", {"chat_id": chat_id, "message_id": msg.get("message_id")}, timeout=10)
+    except Exception:
+        pass  # Telegram may refuse (an old message, a group without the right); the reply still tells the user to rotate it
+    send_replies([f"That looked like a {kinds[0]}. I did not read or keep it. Put it in `.env` and rotate it, "
+                  "since it sat in this chat."], state)
+
+
 def handle_update(update, state):
     if update.get("message_reaction"):
         handle_reaction(update["message_reaction"], state)
@@ -416,6 +428,9 @@ def handle_update(update, state):
     text = (msg.get("text") or "").strip()
     if not text:
         send_replies(["I can only read text messages."], state)
+        return
+    if kinds := dispatcher.secret_kinds(text):  # before the log line, the model and the state file see it
+        refuse_secret(msg, chat_id, kinds, state)
         return
     log.info("Received: %s", text[:300])
     if text == "/new":

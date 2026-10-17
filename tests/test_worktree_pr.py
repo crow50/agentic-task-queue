@@ -155,7 +155,7 @@ class DraftPullRequestTests(PrCase):
 
         for call in self.sb.gh_calls():
             self.assertEqual(call["argv"][0], "pr")
-            self.assertIn(call["argv"][1], ("list", "create"))
+            self.assertIn(call["argv"][1], ("list", "create", "view"))  # view: Phase 7 checks the PR it just opened
             self.assertNotIn("merge", call["argv"])
             self.assertNotIn("ready", call["argv"])
 
