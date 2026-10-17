@@ -921,12 +921,17 @@ SECRET_PATTERNS = (
     ("private key", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
     ("password or token", re.compile(
         r"(?P<keep>(?:token|secret|password|api[_-]?key)[\"']?\s*[:=]\s*[\"']?)[A-Za-z0-9/+_=.\-]{16,}", re.I)),
+    # The same words with the value just after them in a sentence ("here is the token 51c0..."): 32 or more
+    # letters and digits with at least one of each, so a task id or a plain word is not taken for one.
+    ("password or token", re.compile(
+        r"(?P<keep>\b(?:token|secret|password|passwd|(?:api[ _-]?)?key)\b(?:\s+(?:is|was|=|:))?[\s\"'`]+)"
+        r"(?=[A-Za-z0-9/+_=]*\d)(?=[A-Za-z0-9/+_=]*[A-Za-z])[A-Za-z0-9/+_=]{32,}\b", re.I)),
 )
 
 
 def secret_kinds(text):
     """The kinds of secret `text` appears to contain, in the order of SECRET_PATTERNS. Never the values."""
-    return [kind for kind, pattern in SECRET_PATTERNS if pattern.search(text)]
+    return list(dict.fromkeys(kind for kind, pattern in SECRET_PATTERNS if pattern.search(text)))
 
 
 def redact_secrets(text):
