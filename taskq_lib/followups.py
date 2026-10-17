@@ -22,8 +22,12 @@ def _criteria(body):
     return match.group(1).strip() if match else ""
 
 
-def build(parent_meta, parent_body, text, parent_stem):
-    """(frontmatter, body) of a task that continues `parent_stem` and asks for `text`."""
+DEFAULT_CRITERION = "- The requested change is made."
+
+
+def build(parent_meta, parent_body, text, parent_stem, criteria=None):
+    """(frontmatter, body) of a task that continues `parent_stem` and asks for `text`. `criteria` are the new acceptance
+    criteria (bullet lines); the parent's still hold after them."""
     meta = {key: parent_meta[key] for key in INHERITED if parent_meta.get(key)}
     meta.update({"follows": parent_stem, "attempts": "0"})
     earlier = _criteria(parent_body)
@@ -31,7 +35,7 @@ def build(parent_meta, parent_body, text, parent_stem):
     body = (
         f"# Follow-up to {parent_stem}\n\n"
         + (f"The earlier task was: {heading.group(1).strip()}\n\n" if heading else "")
-        + f"{text.strip()}\n\n## Acceptance Criteria\n- The requested change is made.\n"
+        + f"{text.strip()}\n\n## Acceptance Criteria\n{(criteria or DEFAULT_CRITERION).strip()}\n"
         + (earlier + "\n" if earlier else "")
     )
     return meta, body

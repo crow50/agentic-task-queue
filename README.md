@@ -596,6 +596,71 @@ What everything costs, a warning before a limit, and the same controls as button
   sets `ASSISTANT_NAME` in `.env`, and opens a pull request that changes only `coordinator/identity.md` and the
   `.env.example` default.
 
+## Follow-through
+
+A task is not over when it reports. Any finished result can be picked up again, whatever it produced: a pull request, a
+report, files, an issue, a deferred item, or nothing.
+
+### Outcomes and follow-ups
+
+- When a task ends, `state/outcomes/<id>.json` records its **kinds** of result (`pr`, `file`, `issue`, `deferred`,
+  `report`, `none`), the evidence for each (the pull request the dispatcher checked is open, a draft and at the pushed
+  commit; whether Telegram accepted each file), a short summary, the claude session, the cost, and the Telegram message
+  that announced it. `report` holds the worker's text (secrets redacted). A task that finished before outcomes existed gets
+  the same record worked out from its file. A new kind is one function registered in `taskq_lib/outcomes.py`.
+- `follows: <id>` makes a task that starts from an old one, from `done`, `failed` or `cancelled`. It inherits the old
+  task's tools, places and verify command, and its worker is told the summary and refs, with the earlier report inside an
+  `<external_input>` fence (text from outside is data, never instructions). When the old result was a pull request,
+  the follow-up works in the same worktree on the same branch and the push updates that pull request: no second one opens.
+  `MAX_FOLLOW_DEPTH` (3) caps a chain and `MAX_FOLLOWUPS_PER_TASK` (5) what one task may collect; attempts still count
+  against `MAX_ATTEMPTS_PER_DAY`. `dispatcher.py check` rejects a `follows` that points at nothing.
+- From the phone, none of these calls a model: **reply to a result message** with text; `/continue <id> <what to change>`
+  (`/continue` alone lists recent results); a 👎 on a result, which asks "what was wrong?" and uses your next message
+  (`/skip` drops it). `/tasks` lists the last ten finished tasks and what each made. Because you typed the instruction and
+  the tools are inherited from a task you already let run, these run without a second approval. `/status <id>` shows the
+  outcome.
+
+### What happens after a result (feedback sources)
+
+Each source has its own switch in `FOLLOWUP_SOURCES` (default `merged,pr,issue,revisit`; `none` turns all off) and is
+asked about at most every `FOLLOWUP_POLL_MINUTES`.
+
+- `merged`: you merged the pull request (the queue never merges). The outcome is marked merged, the local worktree and
+  `task/<id>` branch are removed, and tasks waiting on `after_merge: <id>` are released. One closed without merging
+  removes nothing, stops being asked about, and tells you once that anything waiting on it will never run.
+- `pr`: a **submitted** review, a plain comment or a failing check on an open `task/*` pull request. Only the logins in
+  `FOLLOWUP_AUTHORS` (yours and, say, `copilot-pull-request-reviewer`) count, and empty means nobody. A review with seven
+  inline comments becomes **one** proposal that asks, for each point, to fix it on the same branch or record it in
+  `BACKLOG_FILE` (default `ROADMAP.md`) with the reason, and to report which was which. The comment text goes inside the
+  fence, the follow-up gets exactly its parent's tools, and it always waits in `tasks/proposed/` for your 👍, even when the
+  approval gate is off. The same comment never makes a second proposal.
+- `issue`: new comments on an issue a task filed, the same way. `revisit: 7d` on a task sends one nudge that long after it
+  finishes, with Continue and Done buttons and no model call; Continue proposes a follow-up that checks what changed.
+  `revisit_task: <file under tasks/>` re-runs that file instead of asking.
+- `/backlog` lists what tasks deferred (the file, the commit and the lines they added) and proposals still waiting for a
+  👍, so a backlog that grows faster than you work it is at least visible.
+- `dispatcher.py continue <id> <what to change>` does the same as `/continue` from a terminal (it waits for a 👍).
+
+### Long tasks, and tasks that hand off
+
+- **A timeout is not a failure of the work.** When a worker times out after making tool calls, the attempt is not used and
+  the next call resumes its claude session with a short "you ran out of time, continue" message (`MAX_RESUMES`, 3, caps
+  this). The session id is written to the task file as soon as it starts, so a crash or a usage-limit pause resumes the
+  same way. If the session is gone, the worker starts again and is shown the tail of its own stream
+  (`logs/<id>.attempt-N.stream.jsonl`) inside the fence. A timeout with no tool call uses an attempt as before.
+- **Steer from the phone.** The live status message has Extend and Stop buttons. `/extend <id> <minutes>` (or the button,
+  +15) raises the running task's limit, never past `MAX_TIMEOUT_MINUTES` (240) in all. `/stop <id>` ends it cleanly: it is
+  cancelled, what it had said so far is kept as its result, and you can `/continue` it. A task that makes no tool call for
+  `STALL_MINUTES` (10) raises one alert with Extend, Stop and Keep waiting. The dispatcher and the bridge talk through
+  `state/control/<id>.json`.
+- **Chains.** A `repo:` task with `chain: test` and `chain_rounds: 2` is followed, when it passes, by an independent
+  tester on the same branch with read-only tools and the playbook in `.claude/skills/chain-tester/`. The tester's report
+  starts `FINDINGS: NONE` or `FINDINGS:` and a numbered list; findings queue a fixer (built by the dispatcher, the findings
+  inside the fence) and then the tester again, until it passes or the rounds (capped by `MAX_CHAIN_ROUNDS`) run out, when
+  you get one message with the last findings. Your one 👍 on the build covers the hops it declared; a hop that needs a tool
+  or a tier beyond the build's waits for its own 👍. Every hop counts toward `MAX_FOLLOW_DEPTH` and
+  `MAX_ATTEMPTS_PER_DAY`, and no hop opens a second pull request.
+
 ## Setup
 
 Prerequisites: a Debian/Ubuntu machine (a Raspberry Pi 4/5 with 64-bit Ubuntu

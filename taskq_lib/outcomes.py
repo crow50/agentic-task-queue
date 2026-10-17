@@ -8,7 +8,7 @@ a kind (a calendar draft, say) means registering one more function; nothing else
 import re
 
 KINDS = {}
-ISSUE_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/issues/\d+")
+ISSUE_URL = re.compile(r"https://github\.com/[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*/issues/\d+")
 SUMMARY_CHARS = 600
 
 
@@ -38,6 +38,12 @@ def _issues(facts):
     urls = list(dict.fromkeys(ISSUE_URL.findall(facts.get("report") or "")))
     # the worker said so; nothing has checked that the issue exists
     return [{"url": url, "claimed": True} for url in urls] or None
+
+
+@kind("deferred")
+def _deferred(facts):
+    # lines a task added to the repo's backlog file instead of fixing them: where they are and in which commit
+    return facts.get("deferred") or None
 
 
 @kind("report")
@@ -73,6 +79,8 @@ def describe(outcome):
             parts.append("files " + ", ".join(f["path"] for f in ref))
         elif name == "issue" and ref:
             parts.append("issue " + ", ".join(i["url"] for i in ref))
+        elif name == "deferred" and ref:
+            parts.append(f"deferred items in {ref['file']}")
         elif name == "report":
             parts.append("a report")
         elif name == "none":
