@@ -1,0 +1,5 @@
+{
+  "baseline": {"about": "the queue as it is: review after every verified task"},
+  "savings": {"about": "review: skip-if-verified and a turn limit on every task", "frontmatter": {"review": "skip-if-verified", "max_turns": "40"}},
+  "haiku": {"about": "the cheaper model for the worker", "model": "claude-haiku-4-5-20251001"}
+}

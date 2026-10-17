@@ -45,6 +45,7 @@ class LoopCase(unittest.TestCase):
             target = self.repo / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / rel, target)
+        shutil.copytree(REPO / "taskq_lib", self.repo / "taskq_lib", ignore=shutil.ignore_patterns("__pycache__"))
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "base")
         self.git("remote", "add", "origin", f"git@github.com:{SLUG}.git")  # what status parses

@@ -465,8 +465,9 @@ class FailedCallsLogTests(LimitsCase):
 # ---------------------------------------------------------------- 6. usage log
 
 
-USAGE_KEYS = {"time", "label", "model", "exit", "status", "total_cost_usd", "num_turns", "duration_ms",
-              "usage", "modelUsage", "permission_denials", "terminal_reason", "is_error"}
+USAGE_KEYS = {"time", "label", "task", "model", "exit", "status", "total_cost_usd", "num_turns", "duration_ms",
+              "usage", "modelUsage", "permission_denials", "terminal_reason", "is_error",
+              "session_id", "cost_usd", "context_tokens", "context_pct"}
 
 
 class UsageLogTests(LimitsCase):

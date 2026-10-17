@@ -46,6 +46,7 @@ import urllib.parse
 import urllib.request
 
 import dispatcher
+from taskq_lib import memory
 from dispatcher import (
     TELEGRAM_MAX,
     cfg,
@@ -189,13 +190,13 @@ def extract_session_id(stdout):
     return None
 
 
-def run_coordinator(prompt, session_id):
+def run_coordinator(prompt, session_id, model=None):
     claude_bin = resolve_claude_bin()
     if claude_bin is None:
         raise RuntimeError("no claude binary found — set CLAUDE_BIN in .env")
     cmd = [
         claude_bin, "-p",
-        "--model", cfg("COORDINATOR_MODEL", "claude-sonnet-5"),
+        "--model", model or cfg("COORDINATOR_MODEL", "claude-sonnet-5"),
         "--allowedTools", cfg("COORDINATOR_ALLOWED_TOOLS") or default_allowed_tools(),
         # Claude only touches files under its working directory (coordinator/) and these folders: without them
         # a write to tasks/pending/ is refused as outside the sandbox, whatever --allowedTools says.
@@ -218,41 +219,116 @@ def run_coordinator(prompt, session_id):
 def coordinator_call(text, session_id):
     """One coordinator call with usage logging, retried with backoff on a transient rate limit.
 
-    Returns (proc, status, message) as classify_call judged it. Retries used
-    up, the last result is returned for the caller to treat as a limit.
+    Returns (proc, status, message, record) as classify_call judged it, record being the usage line logged for
+    the call. Retries used up, the last result is returned for the caller to treat as a limit.
     """
-    model = cfg("COORDINATOR_MODEL", "claude-sonnet-5")
-
-    def attempt():
-        proc = run_coordinator(text, session_id)
+    def attempt(model):
+        proc = run_coordinator(text, session_id, model)
         out, err = proc.stdout or "", proc.stderr or ""
         status, message = dispatcher.classify_call(proc.returncode, out, err)
-        dispatcher.log_usage("coordinator", model, proc.returncode, status, dispatcher.parse_envelope(out))
+        record = dispatcher.log_usage("coordinator", model, proc.returncode, status, dispatcher.parse_envelope(out),
+                                      resumed_from=session_id)
         if status != "ok":
             dispatcher.log_failed_call("coordinator", proc.returncode, out, err)
-        result = (proc, status, message)
+        result = (proc, status, message, record)
         if status == "rate_limited" and dispatcher.parse_reset_time(message) is None:
             raise dispatcher.TransientLimit(message, result)
         return result
 
+    wanted = cfg("COORDINATOR_MODEL", "claude-sonnet-5")
+    for _ in range(4):  # a model the account cannot use hands over to the next one in models.json
+        model = dispatcher.resolve_model(wanted, "coordinator")
+        if model is None:
+            raise RuntimeError("no usable model for the coordinator in models.json")
+        try:
+            result = dispatcher.rate_limit_retrying("coordinator")(attempt, model)
+        except dispatcher.TransientLimit as exc:
+            return exc.payload
+        if result[1] != "model":
+            return result
+        dispatcher.model_gone(model, "coordinator")
+    return result
+
+
+ROTATE_PROMPT = (
+    "[Session rotation] This conversation is nearly out of room, so a fresh session starts with the next message. "
+    "Rewrite memory/session.md (keep it under 60 lines) with what the fresh session must not forget: decisions made, "
+    "tasks you queued or are waiting on, anything the human asked for that is not finished, and how they said they "
+    "want things done. Durable preferences also belong in memory/MEMORY.md as usual. Reply with only the word: saved"
+)
+MEMORY_NOTES = "session.md"  # the rolling notes a rotation writes; CLAUDE.md imports it
+
+
+def cap_memory():
+    """Hold coordinator/memory/ to COORDINATOR_MEMORY_MAX_KB (0 = no limit) by dropping the oldest lines of the
+    rolling notes. The curated files are never touched. Returns False when they alone are over the limit."""
+    limit = int(dispatcher.number(cfg("COORDINATOR_MEMORY_MAX_KB")) * 1024)
+    folder = COORD_DIR / "memory"
+    if limit <= 0 or not folder.is_dir():
+        return True
+    notes = folder / MEMORY_NOTES
+    others = sum(p.stat().st_size for p in folder.iterdir() if p.is_file() and p != notes)
+    if notes.is_file():
+        text = notes.read_text()
+        trimmed = memory.trim_to_fit(text, limit - others)
+        if trimmed != text:
+            dispatcher.write_atomic(notes, trimmed)
+            log.info("Trimmed %s to fit COORDINATOR_MEMORY_MAX_KB=%s", MEMORY_NOTES, cfg("COORDINATOR_MEMORY_MAX_KB"))
+    return others <= limit
+
+
+def rotation_due(state):
+    line = dispatcher.number(cfg("CONTEXT_ROTATE_PCT"))
+    pct = state.get("context_pct")
+    return bool(line > 0 and state.get("session_id") and pct is not None and pct >= line)
+
+
+def rotate_session(state):
+    """Save the session's key facts, then forget the session. Returns the one line to tell the human, or None if
+    the saving call failed (the session is kept, and nothing is retried until the next call reads its context again).
+
+    Raises CoordinatorBlocked when a usage limit or an expired login stopped the saving call."""
+    pct = state.get("context_pct")
+    state["context_pct"] = None  # whatever happens, this crossing is dealt with once
     try:
-        return dispatcher.rate_limit_retrying("coordinator")(attempt)
-    except dispatcher.TransientLimit as exc:
-        return exc.payload
+        proc, status, message, _ = coordinator_call(ROTATE_PROMPT, state["session_id"])
+    except (subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
+        log.warning("Session rotation: the saving call failed (%s); keeping the session", type(exc).__name__)
+        return None
+    if status == "auth":
+        dispatcher.mark_auth_failed(message, notify=False)
+        raise CoordinatorBlocked("auth")
+    if status == "rate_limited":
+        dispatcher.pause_queue(dispatcher.usage_limit_until(message), "usage limit", notify=False)
+        raise CoordinatorBlocked("paused")
+    if proc.returncode != 0:
+        log.warning("Session rotation: the saving call exited %d; keeping the session", proc.returncode)
+        return None
+    state["session_id"] = None
+    fits = cap_memory()
+    log.info("Rotated the coordinator session (context was %.0f%%)", pct)
+    return (f"Started a fresh session (context was {pct:.0f}%)."
+            + ("" if fits else " The memory folder is over its limit; trim coordinator/memory/."))
 
 
 def ask_coordinator(text, state):
-    """Run the coordinator, handling resume failure and rate limits. Returns the reply.
+    """Run the coordinator, handling resume failure, rate limits and session rotation. Returns the reply.
 
     Raises CoordinatorBlocked, after writing the shared pause or auth-failed
     file, when a usage limit or an expired login means nothing can run: the
     caller keeps the message instead of losing it.
     """
+    note = rotate_session(state) if rotation_due(state) else None
+    reply = ask_in_session(text, state)
+    return f"{note}\n\n{reply}" if note else reply
+
+
+def ask_in_session(text, state):
     session_id = state.get("session_id")
     tried_fresh = False
     while True:
         try:
-            proc, status, message = coordinator_call(text, session_id)
+            proc, status, message, record = coordinator_call(text, session_id)
         except subprocess.TimeoutExpired:
             log.error("Coordinator call timed out")
             return "⚠️ The coordinator timed out. Try again, or /new for a fresh session."
@@ -270,6 +346,7 @@ def ask_coordinator(text, state):
             sid = extract_session_id(out)
             if sid:
                 state["session_id"] = sid
+            state["context_pct"] = record.get("context_pct")
             return extract_result(out).strip() or "(the coordinator sent an empty reply)"
         combined = f"{out}\n{err}"
         if session_id and not tried_fresh and re.search(r"session|conversation", combined, re.I):
@@ -435,6 +512,7 @@ def handle_update(update, state):
     log.info("Received: %s", text[:300])
     if text == "/new":
         state["session_id"] = None
+        state["context_pct"] = None
         send_replies(["Starting a fresh conversation."], state)
         return
     if text == "/status":

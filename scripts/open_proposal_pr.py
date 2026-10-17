@@ -9,7 +9,7 @@ improver (tasks/examples/weekly-improver.md) writes the patch; this script, not
 the model, decides what happens to it:
 
 1. Every file it touches must be one the improver may change: worker_preamble.md,
-   coordinator/CLAUDE.md.template, a *new* tests/test_*.py, or a file under .claude/skills/.
+   coordinator/CLAUDE.md.template, models.json (the model table; the tests check it is valid), a *new* tests/test_*.py, or a file under .claude/skills/.
    dispatcher.py, tests that already exist, .github/, scripts/ and everything else
    are refused, and so are deletes, renames, mode changes and binary patches.
 2. The patch is applied in a temporary git worktree cut from <remote>/<base>, so
@@ -32,7 +32,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-EDITABLE = {"worker_preamble.md", "coordinator/CLAUDE.md.template"}
+EDITABLE = {"worker_preamble.md", "coordinator/CLAUDE.md.template", "models.json"}
 SKILLS_PREFIX = ".claude/skills/"
 NEW_TEST = re.compile(r"tests/test_[A-Za-z0-9_]+\.py")
 TEST_TIMEOUT_S = 1800

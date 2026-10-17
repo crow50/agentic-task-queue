@@ -463,6 +463,45 @@ def probe(ctx, claude_bin, token):
     return True, "ok"
 
 
+UNSUPPORTED_MODEL_RE = re.compile(
+    r"issue with the selected model|model[^\n]{0,60}(not supported|unsupported|not.?found|does not exist|may not exist"
+    r"|no access|not available)|(unsupported|unknown|invalid) model",
+    re.I,
+)  # the same wording dispatcher.py treats as "the account cannot use this model"
+
+
+def table_models(ctx):
+    """Every model named in models.json, once each, in the order the table lists them."""
+    try:
+        table = json.loads((ctx.base / "models.json").read_text())
+        chains = [chain for by_class in table["roles"].values() for chain in by_class.values()]
+    except (OSError, ValueError, KeyError, AttributeError):
+        return []
+    return list(dict.fromkeys(m for chain in chains if isinstance(chain, list) for m in chain if isinstance(m, str)))
+
+
+def model_probe(ctx, claude_bin, token, model):
+    """One real one-word call on `model`: "ok", "unsupported", or an error line (a limit or login problem, say)."""
+    proc = ctx.system.run_as(
+        ctx.user, [claude_bin, "-p", "--model", model, "--output-format", "json"],
+        input="Reply with the single word: ok", extra_env={"CLAUDE_CODE_OAUTH_TOKEN": token},
+        cwd=ctx.base / "workspace", timeout=120)
+    text = f"{proc.stdout}\n{proc.stderr}"
+    failed = proc.returncode != 0
+    if not failed:
+        try:
+            envelope = json.loads(proc.stdout.strip().splitlines()[-1])
+            failed = isinstance(envelope, dict) and bool(envelope.get("is_error"))
+        except (ValueError, IndexError):
+            pass
+    if not failed:
+        return "ok"
+    if UNSUPPORTED_MODEL_RE.search(text):
+        return "unsupported"
+    lines = text.strip().splitlines()
+    return lines[-1][:120] if lines else f"exit {proc.returncode}"
+
+
 def run_setup_token(ctx, claude_bin):
     if ctx.args.non_interactive:
         raise InstallError("the claude login token is missing or rejected; pass --oauth-token")
@@ -665,6 +704,9 @@ def install(ctx):
     updates["CLAUDE_BIN"] = claude_bin
     if "APPROVAL_MIN_TIER" not in ctx.env():  # an existing install: ask before anything that writes runs; an explicit value stays
         updates["APPROVAL_MIN_TIER"] = "1"
+    for key, value in (("CONTEXT_WARN_PCT", "70"), ("CONTEXT_ROTATE_PCT", "85"), ("COORDINATOR_MEMORY_MAX_KB", "64")):
+        if key not in ctx.env():  # an existing install gets the visibility defaults once; an explicit value (even 0) stays
+            updates[key] = value
     env_changed = write_env(ctx, updates)
     token_updates = step_token(ctx, claude_bin)
     if token_updates:
@@ -773,6 +815,15 @@ def run_checks(ctx):
         else:
             ok, detail = probe(ctx, claude_bin, token)
             add(ok, "claude login probe", detail)
+            if ok and (names := table_models(ctx)):  # only when the login works: otherwise every model would look broken
+                answers = {name: model_probe(ctx, claude_bin, token, name) for name in names}
+                gone = [name for name, answer in answers.items() if answer == "unsupported"]
+                unclear = {name: answer for name, answer in answers.items() if answer not in ("ok", "unsupported")}
+                add(not gone, "models.json: models this account can use",
+                    "cannot use " + ", ".join(gone) + " (calls fall back to the next model in the chain; edit models.json)"
+                    if gone else f"all {len(names)} answered", level=WARN, notify=True)
+                if unclear:
+                    add(False, "models.json: probe", "; ".join(f"{n}: {a}" for n, a in unclear.items()), level=WARN, notify=False)
 
     created = env.get("CLAUDE_CODE_OAUTH_TOKEN_CREATED", "")
     try:

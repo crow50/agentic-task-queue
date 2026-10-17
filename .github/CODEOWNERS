@@ -3,6 +3,8 @@
 # CODEOWNERS only *requests* review; to make it mandatory, turn on "Require
 # review from Code Owners" in a branch ruleset for main.
 /dispatcher.py                    @crow50
+/taskq_lib/                       @crow50
+/models.json                      @crow50
 /coordinator/CLAUDE.md.template   @crow50
 /scripts/                         @crow50
 /tests/                           @crow50

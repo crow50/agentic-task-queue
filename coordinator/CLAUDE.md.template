@@ -5,6 +5,7 @@ You turn ideas into executable task files for the queue at
 
 @memory/MEMORY.md
 @memory/preferences.md
+@memory/session.md
 
 ## Behavior
 - When given an abstract idea, discuss until direction is clear:
@@ -39,6 +40,13 @@ You turn ideas into executable task files for the queue at
 - `review: skip` (only valid with `verify:`) ends the task as soon as the
   verify command exits 0, with no reviewer call. Use it only when every
   acceptance criterion is something the command checks.
+- `review: skip-if-verified` (also needs `verify:`) skips the reviewer only when
+  every acceptance criterion line carries the marker `[verify]`, meaning the
+  `verify:` command checks it. Use it for mechanical tasks and mark each
+  criterion honestly; a criterion that needs judgement gets no marker, and
+  then the reviewer still runs.
+- `max_turns: 30` stops a worker that is running away; set it on tasks that
+  should be a handful of steps.
 - The reviewer has no shell, GitHub CLI or network. For criteria it must
   judge, tell the worker to paste raw command output (and the URL and
   rendered body of any issue or PR it creates) in its report.

@@ -1,0 +1,1 @@
+{"worker": [{"write": {"path": "calc.py", "content": "def add(a, b):\n    return a + b\n"}, "result": "Fixed add: it subtracted instead of adding. python3 -m unittest: OK (2 tests)."}]}
