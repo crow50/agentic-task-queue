@@ -32,6 +32,7 @@ Usage: python3 dispatcher.py                   (typically from cron every 15 min
 import difflib
 import fcntl
 import fnmatch
+import functools
 import hashlib
 import html
 import json
@@ -93,6 +94,8 @@ SEEN_FILE = STATE / "seen.json"  # problems already reported, so each is said on
 USAGE_LOG = LOGS / "usage.jsonl"
 LESSONS_LOG = LOGS / "lessons.jsonl"  # one line per failed attempt; the weekly improver learns from it
 FAILED_CALLS_LOG = LOGS / "failed-calls.log"
+ACTIONS_LOG = LOGS / "actions.log"  # one JSON line per cancel, retry, approve and reject: when, what, and where it came from
+ACTION_SOURCE = None  # the Telegram bridge sets this to "telegram"
 
 RATE_LIMIT_RE = re.compile(r"rate.?limit|\b429\b|overloaded|usage limit|quota", re.I)
 # Applied only to failed calls (non-zero exit or an error envelope), never to a
@@ -1675,6 +1678,37 @@ def hold_queue_lock(timeout=10.0):
         lock.close()
 
 
+def action_source():
+    if ACTION_SOURCE:
+        return ACTION_SOURCE
+    try:
+        return "cli, terminal" if sys.stdin.isatty() else "cli, no terminal"  # no terminal: the coordinator, cron or a script
+    except (ValueError, OSError):
+        return "cli, no terminal"
+
+
+def audited(action):
+    """Record every call of a (stem) -> (ok, message) command in logs/actions.log, whether it worked or not.
+
+    The command-line forms configure no logging, so before this a task could be cancelled, retried or approved
+    and nothing said by whom or when.
+    """
+    def decorate(command):
+        @functools.wraps(command)
+        def inner(stem, *args, **kwargs):
+            ok, message = command(stem, *args, **kwargs)
+            record = {"time": now_iso(), "action": action, "task": str(stem).strip().removesuffix(".md"), "ok": bool(ok),
+                      "source": action_source(), "message": redact_secrets(" ".join(str(message).split()))[:300]}
+            try:
+                append_locked(ACTIONS_LOG, json.dumps(record) + "\n")
+            except OSError as exc:  # bookkeeping must never fail the command
+                log.warning("Could not write %s: %s", ACTIONS_LOG.name, exc)
+            return ok, message
+        return inner
+    return decorate
+
+
+@audited("cancel")
 def cancel_task(stem):
     """Archive a queued task (and/or recurring template) to tasks/cancelled/.
 
@@ -1748,6 +1782,7 @@ def cancel_task(stem):
         return True, "\n".join(lines)
 
 
+@audited("retry")
 def retry_task(stem):
     """Move a failed or cancelled task back to pending/ with attempts reset.
 
@@ -1977,6 +2012,7 @@ def clean_stem(stem):
     return stem[:-3] if stem.endswith(".md") else stem
 
 
+@audited("approve")
 def approve_task(stem):
     """Approve a task waiting in proposed/: record it and move it to pending/. Returns (ok, message)."""
     stem = clean_stem(stem)
@@ -2009,6 +2045,7 @@ def approve_task(stem):
     return True, f"Approved {stem}: queued, it runs next."
 
 
+@audited("reject")
 def reject_task(stem):
     """Drop a task waiting in proposed/ into cancelled/. Returns (ok, message)."""
     stem = clean_stem(stem)

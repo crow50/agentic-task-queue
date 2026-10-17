@@ -55,6 +55,7 @@ from dispatcher import (
 )
 
 BASE = dispatcher.BASE
+dispatcher.ACTION_SOURCE = "telegram"  # cancels, retries and approvals made here are logged as coming from the chat
 COORD_DIR = BASE / "coordinator"
 STATE_FILE = COORD_DIR / "state.json"
 LOCKFILE = BASE / "coordinator.lock"
