@@ -1,6 +1,5 @@
 """Phase 8 Part B: taps on the buttons that alerts carry, the assistant's name, and the two example tasks the menu enqueues."""
 
-import json
 import subprocess
 import sys
 import unittest
